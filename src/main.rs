@@ -113,6 +113,7 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
     app.refresh_preview().await;
 
     let mut events = EventHandler::new(Duration::from_millis(250));
+    let mut prev_mouse_captured = true;
 
     // Main loop
     loop {
@@ -149,6 +150,16 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
             }
             Some(Event::Resize) => {}
             None => break,
+        }
+
+        // Toggle mouse capture when the flag changes
+        if app.mouse_captured != prev_mouse_captured {
+            if app.mouse_captured {
+                execute!(terminal.backend_mut(), EnableMouseCapture)?;
+            } else {
+                execute!(terminal.backend_mut(), DisableMouseCapture)?;
+            }
+            prev_mouse_captured = app.mouse_captured;
         }
     }
 

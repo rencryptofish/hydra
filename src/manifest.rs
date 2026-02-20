@@ -226,6 +226,30 @@ mod tests {
         assert_eq!(record.create_command(), "codex -c check_for_update_on_startup=false --yolo");
     }
 
+    #[test]
+    fn resume_command_custom_agent_returns_agent_type() {
+        let record = SessionRecord {
+            name: "s1".to_string(),
+            agent_type: "aider".to_string(),
+            agent_session_id: None,
+            cwd: "/tmp".to_string(),
+            failed_attempts: 0,
+        };
+        assert_eq!(record.resume_command(), "aider");
+    }
+
+    #[test]
+    fn create_command_custom_agent_returns_agent_type() {
+        let record = SessionRecord {
+            name: "s1".to_string(),
+            agent_type: "aider".to_string(),
+            agent_session_id: None,
+            cwd: "/tmp".to_string(),
+            failed_attempts: 0,
+        };
+        assert_eq!(record.create_command(), "aider");
+    }
+
     #[tokio::test]
     async fn roundtrip_manifest() {
         let dir = tempfile::tempdir().unwrap();

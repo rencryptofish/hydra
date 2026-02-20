@@ -2,10 +2,10 @@
 source: src/ui.rs
 expression: output
 ---
-┌ Sessions (1) ┐┌ worker-1 ────────────────────────────────────────────────────┐
-│── ●  Idle    ││preview                                                       │
-│>> ● worker-1 ││                                                              │
-│     This is a││                                                              │
+┌ Sessions (1) ┐┌ s1 ──────────────────────────────────────────────────────────┐
+│── ●  Idle    ││test output                                                   │
+│>> ● s1 [Claud││                                                              │
+│              ││                                                              │
 │              ││                                                              │
 │              ││                                                              │
 │              ││                                                              │
@@ -25,4 +25,4 @@ expression: output
 │              ││                                                              │
 │              ││                                                              │
 └──────────────┘└──────────────────────────────────────────────────────────────┘
- j/k: navigate  Enter: attach  n: new  d: delete  c: copy  q: quit
+ SELECT TEXT TO COPY  |  c: exit copy mode

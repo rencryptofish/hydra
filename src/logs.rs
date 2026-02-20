@@ -1964,6 +1964,103 @@ mod tests {
         assert_eq!(stats.tokens_in, 0, "should skip lines from other dates");
     }
 
+    #[test]
+    fn collect_jsonl_files_respects_depth_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a directory tree 6 levels deep (limit is 4)
+        let mut deep = dir.path().to_path_buf();
+        for i in 0..6 {
+            deep = deep.join(format!("level{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        // Place a jsonl file at depth 6 — should be ignored
+        std::fs::write(deep.join("deep.jsonl"), "ignored\n").unwrap();
+        // Also place one at depth 2 — should be found
+        let shallow = dir.path().join("level0").join("level1");
+        std::fs::write(shallow.join("shallow.jsonl"), "found\n").unwrap();
+
+        let mut files = Vec::new();
+        collect_jsonl_files(dir.path(), &mut files, 0);
+        assert_eq!(files.len(), 1, "only shallow file should be collected");
+        assert!(files[0].ends_with("shallow.jsonl"));
+    }
+
+    #[test]
+    fn global_stats_inner_none_base_dir_without_home_is_noop() {
+        // Set HOME to empty to test the None base_dir + HOME error path
+        let _lock = HOME_LOCK.lock().unwrap();
+        let orig_home = std::env::var("HOME").ok();
+        std::env::remove_var("HOME");
+
+        let mut stats = GlobalStats::default();
+        let today = "2026-01-01";
+        update_global_stats_inner(&mut stats, today, None);
+        assert_eq!(stats.tokens_in, 0, "should be noop when HOME is unset");
+
+        // Restore
+        if let Some(h) = orig_home {
+            std::env::set_var("HOME", h);
+        }
+    }
+
+    #[test]
+    fn update_session_stats_user_message_without_type_field_skipped() {
+        // A line that matches the user fast-path heuristic but has wrong JSON structure
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        // Has "user" and "timestamp" but type is not "user"
+        let line = r#"{"type":"system","role":"user","timestamp":"2026-01-15T10:00:00.000Z"}"#;
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+
+        let mut stats = SessionStats::default();
+        update_session_stats_from_path(&path, &mut stats);
+        assert!(stats.last_user_ts.is_none(), "should not set last_user_ts for non-user type");
+    }
+
+    #[test]
+    fn update_session_stats_assistant_message_without_usage_key_skipped() {
+        // A line that matches assistant fast-path heuristic but has no usage
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        // Contains "assistant" and "usage" in text, but type is "result"
+        let line = r#"{"type":"result","message":"assistant usage info"}"#;
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+
+        let mut stats = SessionStats::default();
+        update_session_stats_from_path(&path, &mut stats);
+        assert_eq!(stats.turns, 0);
+    }
+
+    #[test]
+    fn parse_uuid_from_lsof_output_valid() {
+        let output = "node  12345 user  txt  REG  /home/user/.claude/tasks/a1b2c3d4-e5f6-7890-abcd-ef1234567890/file.jsonl\n";
+        let result = parse_uuid_from_lsof_output(output);
+        assert_eq!(result.as_deref(), Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890"));
+    }
+
+    #[test]
+    fn parse_uuid_from_lsof_output_no_match() {
+        let output = "node  12345 user  txt  REG  /home/user/.config/something\n";
+        let result = parse_uuid_from_lsof_output(output);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_uuid_from_lsof_output_short_rest() {
+        // The path after .claude/tasks/ is shorter than 36 chars
+        let output = "node  12345 user  txt  REG  /home/.claude/tasks/short/file\n";
+        let result = parse_uuid_from_lsof_output(output);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_uuid_from_lsof_output_invalid_uuid() {
+        // 36 chars but not a valid UUID format
+        let output = "node  12345 user  txt  REG  /home/.claude/tasks/not-a-valid-uuid-at-all-really-nope/file\n";
+        let result = parse_uuid_from_lsof_output(output);
+        assert!(result.is_none());
+    }
+
     // ── read_last_assistant_message via temp files ──
 
     #[test]

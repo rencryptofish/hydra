@@ -283,7 +283,9 @@ pub async fn capture_pane(tmux_name: &str) -> Result<String> {
         return Ok(String::from("[session not available]"));
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let trimmed = raw.trim_end_matches('\n');
+    Ok(trimmed.to_string())
 }
 
 /// Capture the full scrollback buffer of a tmux session.

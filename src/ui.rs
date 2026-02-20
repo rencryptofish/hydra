@@ -383,7 +383,10 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
     let help_text = match app.mode {
-        Mode::Browse => "j/k: navigate  Enter: attach  n: new  d: delete  q: quit",
+        Mode::Browse if !app.mouse_captured => {
+            "SELECT TEXT TO COPY  |  c: exit copy mode"
+        }
+        Mode::Browse => "j/k: navigate  Enter: attach  n: new  d: delete  c: copy  q: quit",
         Mode::Attached => "Esc: detach  (keys forwarded to session)",
         Mode::NewSessionAgent => "j/k: select agent  Enter: confirm  Esc: cancel",
         Mode::ConfirmDelete => "y: confirm delete  Esc: cancel",
@@ -1096,5 +1099,21 @@ mod tests {
     fn truncate_chars_unicode() {
         assert_eq!(super::truncate_chars("café", 3), "caf");
         assert_eq!(super::truncate_chars("日本語テスト", 3), "日本語");
+    }
+
+    #[test]
+    fn browse_mode_copy_mode_help_bar() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = make_app();
+        app.sessions = vec![make_session("s1", AgentType::Claude)];
+        app.preview = "test output".to_string();
+        app.mouse_captured = false; // copy mode enabled
+
+        terminal.draw(|f| super::draw(f, &app)).unwrap();
+        let output = buffer_to_string(&terminal);
+
+        insta::assert_snapshot!(output);
     }
 }

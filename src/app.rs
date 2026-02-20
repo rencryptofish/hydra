@@ -57,6 +57,8 @@ pub struct App {
     /// Pending literal keys to send to tmux (tmux_name, text).
     /// Set by `handle_mouse` for forwarding clicks; consumed by the event loop.
     pub pending_literal_keys: Option<(String, String)>,
+    /// When false, mouse capture is disabled so the terminal handles text selection natively.
+    pub mouse_captured: bool,
 }
 
 impl App {
@@ -99,6 +101,7 @@ impl App {
             manager,
             preview_has_scrollback: false,
             pending_literal_keys: None,
+            mouse_captured: true,
         }
     }
 
@@ -659,18 +662,7 @@ impl App {
                     }
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
-                    let preview_inner = inner(preview);
-                    if preview_inner.contains(pos) {
-                        // Forward click to tmux pane so the agent can reposition its cursor.
-                        // Coordinates are 1-based for SGR mouse encoding.
-                        if let Some(session) = self.sessions.get(self.selected) {
-                            let x = (pos.x - preview_inner.x) + 1;
-                            let y = (pos.y - preview_inner.y) + 1;
-                            let press = format!("\x1b[<0;{x};{y}M");
-                            let release = format!("\x1b[<0;{x};{y}m");
-                            self.pending_literal_keys =
-                                Some((session.tmux_name.clone(), format!("{press}{release}")));
-                        }
+                    if inner(preview).contains(pos) {
                         // Reset scroll to bottom so user sees live output after clicking.
                         self.preview_scroll_offset = 0;
                     } else {
@@ -719,6 +711,7 @@ impl App {
             KeyCode::Enter => self.attach_selected(),
             KeyCode::Char('n') => self.start_new_session(),
             KeyCode::Char('d') => self.request_delete(),
+            KeyCode::Char('c') => self.mouse_captured = !self.mouse_captured,
             _ => {}
         }
     }
@@ -887,9 +880,15 @@ mod tests {
 
     // ── Mock and helpers ─────────────────────────────────────────────
 
+    /// Configurable mock that covers all SessionManager error/success paths.
+    /// Use builder methods to override specific behaviors; defaults return Ok.
     struct MockSessionManager {
         sessions: Vec<Session>,
         create_result: Result<String, String>,
+        list_result: Option<Result<Vec<Session>, String>>,
+        capture_result: Option<Result<String, String>>,
+        kill_result: Option<Result<(), String>>,
+        scrollback_result: Option<Result<String, String>>,
     }
 
     impl MockSessionManager {
@@ -897,20 +896,47 @@ mod tests {
             Self {
                 sessions: vec![],
                 create_result: Ok("mock-session".to_string()),
+                list_result: None,
+                capture_result: None,
+                kill_result: None,
+                scrollback_result: None,
             }
         }
         fn with_sessions(sessions: Vec<Session>) -> Self {
             Self {
                 sessions,
                 create_result: Ok("mock-session".to_string()),
+                list_result: None,
+                capture_result: None,
+                kill_result: None,
+                scrollback_result: None,
             }
+        }
+        fn with_list_error(mut self, msg: &str) -> Self {
+            self.list_result = Some(Err(msg.to_string()));
+            self
+        }
+        fn with_create_error(mut self, msg: &str) -> Self {
+            self.create_result = Err(msg.to_string());
+            self
+        }
+        fn with_capture_error(mut self, msg: &str) -> Self {
+            self.capture_result = Some(Err(msg.to_string()));
+            self
+        }
+        fn with_kill_error(mut self, msg: &str) -> Self {
+            self.kill_result = Some(Err(msg.to_string()));
+            self
         }
     }
 
     #[async_trait::async_trait]
     impl SessionManager for MockSessionManager {
         async fn list_sessions(&self, _project_id: &str) -> anyhow::Result<Vec<Session>> {
-            Ok(self.sessions.clone())
+            match &self.list_result {
+                Some(Err(msg)) => Err(anyhow::anyhow!("{}", msg)),
+                _ => Ok(self.sessions.clone()),
+            }
         }
         async fn create_session(
             &self,
@@ -923,16 +949,25 @@ mod tests {
             self.create_result.clone().map_err(|e| anyhow::anyhow!(e))
         }
         async fn capture_pane(&self, _tmux_name: &str) -> anyhow::Result<String> {
-            Ok("mock pane content".to_string())
+            match &self.capture_result {
+                Some(Err(msg)) => Err(anyhow::anyhow!("{}", msg)),
+                _ => Ok("mock pane content".to_string()),
+            }
         }
         async fn kill_session(&self, _tmux_name: &str) -> anyhow::Result<()> {
-            Ok(())
+            match &self.kill_result {
+                Some(Err(msg)) => Err(anyhow::anyhow!("{}", msg)),
+                _ => Ok(()),
+            }
         }
         async fn send_keys(&self, _tmux_name: &str, _key: &str) -> anyhow::Result<()> {
             Ok(())
         }
         async fn capture_pane_scrollback(&self, _tmux_name: &str) -> anyhow::Result<String> {
-            Ok("mock pane content".to_string())
+            match &self.scrollback_result {
+                Some(Err(msg)) => Err(anyhow::anyhow!("{}", msg)),
+                _ => Ok("mock pane content".to_string()),
+            }
         }
     }
 
@@ -975,6 +1010,53 @@ mod tests {
             status,
             task_elapsed: None,
             _alive: true,
+        }
+    }
+
+    // ── Shared inline mocks for tests that need call tracking ────────
+
+    /// Mock that records every `send_keys` call for verification.
+    struct TrackingManager {
+        sent_keys: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+    #[async_trait::async_trait]
+    impl SessionManager for TrackingManager {
+        async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> { Ok(vec![]) }
+        async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+        async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
+        async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn send_keys(&self, tmux_name: &str, key: &str) -> anyhow::Result<()> {
+            self.sent_keys.lock().unwrap().push((tmux_name.to_string(), key.to_string()));
+            Ok(())
+        }
+        async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
+    }
+
+    /// Mock that counts `capture_pane` and `capture_pane_scrollback` calls.
+    struct CaptureCounter {
+        sessions: Vec<Session>,
+        pane_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        scrollback_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl SessionManager for CaptureCounter {
+        async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> {
+            Ok(self.sessions.clone())
+        }
+        async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+        async fn capture_pane(&self, _: &str) -> anyhow::Result<String> {
+            self.pane_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("pane-capture".to_string())
+        }
+        async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> {
+            self.scrollback_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("scrollback-capture".to_string())
         }
     }
 
@@ -1738,27 +1820,11 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_sessions_error_sets_status_message() {
-        struct ErrorManager;
-        #[async_trait::async_trait]
-        impl SessionManager for ErrorManager {
-            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> {
-                Err(anyhow::anyhow!("tmux not running"))
-            }
-            async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
-                Ok(String::new())
-            }
-            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> {
-                Err(anyhow::anyhow!("capture failed"))
-            }
-            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-        }
-
+        let mock = MockSessionManager::new().with_list_error("tmux not running");
         let mut app = App::new_with_manager(
             "testid".to_string(),
             "/tmp/test".to_string(),
-            Box::new(ErrorManager),
+            Box::new(mock),
         );
         app.refresh_sessions().await;
         assert!(app.status_message.is_some());
@@ -1767,27 +1833,11 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_preview_error_shows_error_message() {
-        struct ErrorCapture;
-        #[async_trait::async_trait]
-        impl SessionManager for ErrorCapture {
-            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> { Ok(vec![]) }
-            async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
-                Ok(String::new())
-            }
-            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> {
-                Err(anyhow::anyhow!("capture failed"))
-            }
-            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> {
-                Err(anyhow::anyhow!("capture failed"))
-            }
-        }
-
+        let mock = MockSessionManager::new().with_capture_error("capture failed");
         let mut app = App::new_with_manager(
             "testid".to_string(),
             "/tmp/test".to_string(),
-            Box::new(ErrorCapture),
+            Box::new(mock),
         );
         app.sessions = vec![make_session("s1", AgentType::Claude)];
         app.refresh_preview().await;
@@ -1796,23 +1846,11 @@ mod tests {
 
     #[tokio::test]
     async fn confirm_new_session_error_sets_status_message() {
-        struct ErrorCreate;
-        #[async_trait::async_trait]
-        impl SessionManager for ErrorCreate {
-            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> { Ok(vec![]) }
-            async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
-                Err(anyhow::anyhow!("creation failed"))
-            }
-            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-        }
-
+        let mock = MockSessionManager::new().with_create_error("creation failed");
         let mut app = App::new_with_manager(
             "testid".to_string(),
             "/tmp/test".to_string(),
-            Box::new(ErrorCreate),
+            Box::new(mock),
         );
         app.mode = Mode::NewSessionAgent;
         app.confirm_new_session().await;
@@ -1822,25 +1860,11 @@ mod tests {
 
     #[tokio::test]
     async fn confirm_delete_error_sets_status_message() {
-        struct ErrorKill;
-        #[async_trait::async_trait]
-        impl SessionManager for ErrorKill {
-            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> { Ok(vec![]) }
-            async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
-                Ok(String::new())
-            }
-            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-            async fn kill_session(&self, _: &str) -> anyhow::Result<()> {
-                Err(anyhow::anyhow!("kill failed"))
-            }
-            async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-        }
-
+        let mock = MockSessionManager::new().with_kill_error("kill failed");
         let mut app = App::new_with_manager(
             "testid".to_string(),
             "/tmp/test".to_string(),
-            Box::new(ErrorKill),
+            Box::new(mock),
         );
         app.sessions = vec![make_session("s1", AgentType::Claude)];
         app.mode = Mode::ConfirmDelete;
@@ -2133,23 +2157,11 @@ mod tests {
         manifest.sessions.insert("alpha".to_string(), make_manifest_record("alpha", "claude"));
         crate::manifest::save_manifest(dir.path(), pid, &manifest).await.unwrap();
 
-        struct FailCreate;
-        #[async_trait::async_trait]
-        impl SessionManager for FailCreate {
-            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> { Ok(vec![]) }
-            async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
-                Err(anyhow::anyhow!("tmux error"))
-            }
-            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-        }
-
+        let mock = MockSessionManager::new().with_create_error("tmux error");
         let mut app = App::new_with_manager(
             pid.to_string(),
             "/tmp/test".to_string(),
-            Box::new(FailCreate),
+            Box::new(mock),
         );
         app.manifest_dir = dir.path().to_path_buf();
         app.revive_sessions().await;
@@ -2191,32 +2203,19 @@ mod tests {
     #[tokio::test]
     async fn refresh_sessions_exited_clears_task_timer() {
         // Create a manager that returns an Exited session
-        struct ExitedManager;
-        #[async_trait::async_trait]
-        impl SessionManager for ExitedManager {
-            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> {
-                Ok(vec![Session {
-                    name: "dead".to_string(),
-                    tmux_name: "hydra-testid-dead".to_string(),
-                    agent_type: AgentType::Claude,
-                    status: SessionStatus::Exited,
-                    task_elapsed: None,
-                    _alive: true,
-                }])
-            }
-            async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
-                Ok(String::new())
-            }
-            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-        }
-
+        let exited_session = vec![Session {
+            name: "dead".to_string(),
+            tmux_name: "hydra-testid-dead".to_string(),
+            agent_type: AgentType::Claude,
+            status: SessionStatus::Exited,
+            task_elapsed: None,
+            _alive: true,
+        }];
+        let mock = MockSessionManager::with_sessions(exited_session);
         let mut app = App::new_with_manager(
             "testid".to_string(),
             "/tmp/test".to_string(),
-            Box::new(ExitedManager),
+            Box::new(mock),
         );
 
         // Pre-set a task start to verify it gets cleaned up
@@ -2434,24 +2433,6 @@ mod tests {
     async fn attached_key_sends_to_tmux() {
         use std::sync::{Arc, Mutex};
 
-        struct TrackingManager {
-            sent_keys: Arc<Mutex<Vec<(String, String)>>>,
-        }
-        #[async_trait::async_trait]
-        impl SessionManager for TrackingManager {
-            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> { Ok(vec![]) }
-            async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
-                Ok(String::new())
-            }
-            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_keys(&self, tmux_name: &str, key: &str) -> anyhow::Result<()> {
-                self.sent_keys.lock().unwrap().push((tmux_name.to_string(), key.to_string()));
-                Ok(())
-            }
-            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-        }
-
         let sent_keys = Arc::new(Mutex::new(Vec::new()));
         let manager = TrackingManager { sent_keys: sent_keys.clone() };
 
@@ -2475,24 +2456,6 @@ mod tests {
     #[tokio::test]
     async fn attached_key_ctrl_c_sends_ctrl_key() {
         use std::sync::{Arc, Mutex};
-
-        struct TrackingManager {
-            sent_keys: Arc<Mutex<Vec<(String, String)>>>,
-        }
-        #[async_trait::async_trait]
-        impl SessionManager for TrackingManager {
-            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> { Ok(vec![]) }
-            async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
-                Ok(String::new())
-            }
-            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_keys(&self, tmux_name: &str, key: &str) -> anyhow::Result<()> {
-                self.sent_keys.lock().unwrap().push((tmux_name.to_string(), key.to_string()));
-                Ok(())
-            }
-            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-        }
 
         let sent_keys = Arc::new(Mutex::new(Vec::new()));
         let manager = TrackingManager { sent_keys: sent_keys.clone() };
@@ -2663,24 +2626,6 @@ mod tests {
         // should not panic or send anything
         use std::sync::{Arc, Mutex};
 
-        struct TrackingManager {
-            sent_keys: Arc<Mutex<Vec<(String, String)>>>,
-        }
-        #[async_trait::async_trait]
-        impl SessionManager for TrackingManager {
-            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> { Ok(vec![]) }
-            async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
-                Ok(String::new())
-            }
-            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_keys(&self, tmux_name: &str, key: &str) -> anyhow::Result<()> {
-                self.sent_keys.lock().unwrap().push((tmux_name.to_string(), key.to_string()));
-                Ok(())
-            }
-            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-        }
-
         let sent_keys = Arc::new(Mutex::new(Vec::new()));
         let manager = TrackingManager { sent_keys: sent_keys.clone() };
 
@@ -2806,16 +2751,13 @@ mod tests {
     }
 
     #[test]
-    fn mouse_attached_click_forwards_to_tmux() {
+    fn mouse_attached_click_does_not_forward_to_tmux() {
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
         app.mode = Mode::Attached;
         app.sidebar_area.set(Rect::new(0, 0, 24, 20));
-        // Preview at x=24, width=56, height=20 → inner starts at (25,1)
         app.preview_area.set(Rect::new(24, 0, 56, 20));
 
-        // Click at column=30, row=5 → inner x = 30-25 = 5, inner y = 5-1 = 4
-        // SGR coords are 1-based: x=6, y=5
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 30,
@@ -2823,10 +2765,8 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
 
-        let (tmux_name, text) = app.pending_literal_keys.take().expect("should queue literal keys");
-        assert_eq!(tmux_name, "hydra-testid-a");
-        assert!(text.contains("\x1b[<0;6;5M"), "should contain SGR press: {text:?}");
-        assert!(text.contains("\x1b[<0;6;5m"), "should contain SGR release: {text:?}");
+        assert!(app.pending_literal_keys.is_none(), "should not forward mouse clicks to agents");
+        assert_eq!(app.mode, Mode::Attached);
     }
 
     #[test]
@@ -3041,32 +2981,18 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_sessions_running_starts_task_timer() {
-        struct RunningManager;
-        #[async_trait::async_trait]
-        impl SessionManager for RunningManager {
-            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> {
-                Ok(vec![Session {
-                    name: "worker".to_string(),
-                    tmux_name: "hydra-testid-worker".to_string(),
-                    agent_type: AgentType::Claude,
-                    status: SessionStatus::Running,
-                    task_elapsed: None,
-                    _alive: true,
-                }])
-            }
-            async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
-                Ok(String::new())
-            }
-            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-        }
-
+        let running_sessions = vec![Session {
+            name: "worker".to_string(),
+            tmux_name: "hydra-testid-worker".to_string(),
+            agent_type: AgentType::Claude,
+            status: SessionStatus::Running,
+            task_elapsed: None,
+            _alive: true,
+        }];
         let mut app = App::new_with_manager(
             "testid".to_string(),
             "/tmp/test".to_string(),
-            Box::new(RunningManager),
+            Box::new(MockSessionManager::with_sessions(running_sessions)),
         );
         app.refresh_sessions().await;
 
@@ -3079,32 +3005,18 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_sessions_idle_recent_keeps_frozen_timer() {
-        struct IdleManager;
-        #[async_trait::async_trait]
-        impl SessionManager for IdleManager {
-            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> {
-                Ok(vec![Session {
-                    name: "worker".to_string(),
-                    tmux_name: "hydra-testid-worker".to_string(),
-                    agent_type: AgentType::Claude,
-                    status: SessionStatus::Idle,
-                    task_elapsed: None,
-                    _alive: true,
-                }])
-            }
-            async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
-                Ok(String::new())
-            }
-            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-        }
-
+        let idle_sessions = vec![Session {
+            name: "worker".to_string(),
+            tmux_name: "hydra-testid-worker".to_string(),
+            agent_type: AgentType::Claude,
+            status: SessionStatus::Idle,
+            task_elapsed: None,
+            _alive: true,
+        }];
         let mut app = App::new_with_manager(
             "testid".to_string(),
             "/tmp/test".to_string(),
-            Box::new(IdleManager),
+            Box::new(MockSessionManager::with_sessions(idle_sessions)),
         );
 
         let key = "hydra-testid-worker".to_string();
@@ -3418,39 +3330,6 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        struct CaptureCounter {
-            sessions: Vec<Session>,
-            pane_calls: Arc<AtomicUsize>,
-            scrollback_calls: Arc<AtomicUsize>,
-        }
-
-        #[async_trait::async_trait]
-        impl SessionManager for CaptureCounter {
-            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> {
-                Ok(self.sessions.clone())
-            }
-            async fn create_session(
-                &self,
-                _: &str,
-                _: &str,
-                _: &AgentType,
-                _: &str,
-                _: Option<&str>,
-            ) -> anyhow::Result<String> {
-                Ok(String::new())
-            }
-            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> {
-                self.pane_calls.fetch_add(1, Ordering::SeqCst);
-                Ok("pane-capture".to_string())
-            }
-            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> {
-                self.scrollback_calls.fetch_add(1, Ordering::SeqCst);
-                Ok("scrollback-capture".to_string())
-            }
-        }
-
         let sessions = vec![make_session("s1", AgentType::Claude)];
         let pane_calls = Arc::new(AtomicUsize::new(0));
         let scrollback_calls = Arc::new(AtomicUsize::new(0));
@@ -3486,39 +3365,6 @@ mod tests {
     async fn refresh_preview_scrollback_captured_once_while_scrolled() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
-
-        struct CaptureCounter {
-            sessions: Vec<Session>,
-            pane_calls: Arc<AtomicUsize>,
-            scrollback_calls: Arc<AtomicUsize>,
-        }
-
-        #[async_trait::async_trait]
-        impl SessionManager for CaptureCounter {
-            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> {
-                Ok(self.sessions.clone())
-            }
-            async fn create_session(
-                &self,
-                _: &str,
-                _: &str,
-                _: &AgentType,
-                _: &str,
-                _: Option<&str>,
-            ) -> anyhow::Result<String> {
-                Ok(String::new())
-            }
-            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> {
-                self.pane_calls.fetch_add(1, Ordering::SeqCst);
-                Ok("pane-capture".to_string())
-            }
-            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> {
-                self.scrollback_calls.fetch_add(1, Ordering::SeqCst);
-                Ok("scrollback-capture".to_string())
-            }
-        }
 
         let sessions = vec![make_session("s1", AgentType::Claude)];
         let pane_calls = Arc::new(AtomicUsize::new(0));
@@ -3624,19 +3470,38 @@ mod tests {
         assert!(app.pending_literal_keys.is_none());
     }
 
-    // ── Mouse down outside preview in Attached mode detaches ──
+    // ── Mouse events in Attached mode ──
 
     #[test]
-    fn mouse_down_outside_preview_detaches() {
+    fn mouse_right_click_outside_preview_detaches() {
         let sessions = vec![make_session("s1", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
         app.mode = Mode::Attached;
 
-        // Set up layout areas
         app.sidebar_area.set(Rect::new(0, 0, 30, 24));
         app.preview_area.set(Rect::new(30, 0, 50, 24));
 
-        // Mouse down in sidebar (outside preview) should detach
+        // Right-click in sidebar (outside preview) — triggers Down(_) catch-all
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 5,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        app.handle_mouse(mouse);
+        assert_eq!(app.mode, Mode::Browse, "right-click outside preview should detach");
+    }
+
+    #[test]
+    fn mouse_left_click_outside_preview_detaches() {
+        let sessions = vec![make_session("s1", AgentType::Claude)];
+        let mut app = test_app_with_sessions(sessions);
+        app.mode = Mode::Attached;
+
+        app.sidebar_area.set(Rect::new(0, 0, 30, 24));
+        app.preview_area.set(Rect::new(30, 0, 50, 24));
+
+        // Left-click in sidebar (outside preview inner) — triggers detach
         let mouse = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 5,
@@ -3644,7 +3509,48 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::NONE,
         };
         app.handle_mouse(mouse);
-        assert_eq!(app.mode, Mode::Browse, "mouse down outside preview should detach");
+        assert_eq!(app.mode, Mode::Browse, "left-click outside preview should detach");
+    }
+
+    #[test]
+    fn mouse_left_click_inside_preview_does_not_forward() {
+        let sessions = vec![make_session("s1", AgentType::Claude)];
+        let mut app = test_app_with_sessions(sessions);
+        app.mode = Mode::Attached;
+
+        app.sidebar_area.set(Rect::new(0, 0, 30, 24));
+        app.preview_area.set(Rect::new(30, 0, 50, 24));
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 40,  // inside inner preview
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        app.handle_mouse(mouse);
+        assert_eq!(app.mode, Mode::Attached, "left-click inside preview stays attached");
+        assert!(app.pending_literal_keys.is_none(), "should not forward mouse clicks to agents");
+        assert_eq!(app.preview_scroll_offset, 0, "should reset scroll to bottom");
+    }
+
+    #[test]
+    fn mouse_right_click_inside_preview_stays_attached() {
+        let sessions = vec![make_session("s1", AgentType::Claude)];
+        let mut app = test_app_with_sessions(sessions);
+        app.mode = Mode::Attached;
+
+        app.sidebar_area.set(Rect::new(0, 0, 30, 24));
+        app.preview_area.set(Rect::new(30, 0, 50, 24));
+
+        // Right-click inside preview inner — Down(_) catch-all, inner.contains(pos) = true → no detach
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 40,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        app.handle_mouse(mouse);
+        assert_eq!(app.mode, Mode::Attached, "right-click inside preview stays attached");
     }
 
     // ── log_elapsed used in Idle status when log says working ──
@@ -3713,6 +3619,85 @@ mod tests {
     #[test]
     fn max_diff_files_constant_is_200() {
         assert_eq!(super::MAX_DIFF_FILES, 200);
+    }
+
+    // ── confirm_new_session: manifest save warning ──────────────────
+
+    #[tokio::test]
+    async fn confirm_new_session_manifest_save_failure_shows_warning() {
+        // Use a path where the manifest dir is inside a file (not a dir) to force save error
+        let dir = tempfile::tempdir().unwrap();
+        let blocking_file = dir.path().join("blockerdir");
+        std::fs::write(&blocking_file, "I am a file, not a dir").unwrap();
+
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(MockSessionManager::new()),
+        );
+        // manifest_dir points to a file → mkdir_all will fail → add_session returns Err
+        app.manifest_dir = blocking_file;
+        app.mode = Mode::NewSessionAgent;
+        app.confirm_new_session().await;
+
+        assert_eq!(app.mode, Mode::Browse);
+        let msg = app.status_message.as_ref().unwrap();
+        assert!(msg.contains("Created session"), "should still report creation: {msg}");
+        assert!(msg.contains("warning: manifest save failed"), "should include warning: {msg}");
+    }
+
+    // ── confirm_delete: manifest removal warning ────────────────────
+
+    #[tokio::test]
+    async fn confirm_delete_manifest_removal_failure_shows_warning() {
+        // manifest_dir points to a file → manifest operations will fail
+        let dir = tempfile::tempdir().unwrap();
+        let blocking_file = dir.path().join("blockerdir");
+        std::fs::write(&blocking_file, "I am a file").unwrap();
+
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(MockSessionManager::new()),
+        );
+        app.manifest_dir = blocking_file;
+        app.sessions = vec![make_session("s1", AgentType::Claude)];
+        app.mode = Mode::ConfirmDelete;
+        app.confirm_delete().await;
+
+        assert_eq!(app.mode, Mode::Browse);
+        let msg = app.status_message.as_ref().unwrap();
+        assert!(msg.contains("Killed session"), "should report kill: {msg}");
+        assert!(msg.contains("warning: manifest update failed"), "should include warning: {msg}");
+    }
+
+    // ── Browse key 'c' toggles mouse_captured ──
+
+    #[test]
+    fn browse_key_c_toggles_mouse_capture() {
+        let mut app = test_app();
+        assert!(app.mouse_captured, "default should be true");
+        app.handle_browse_key(KeyCode::Char('c'));
+        assert!(!app.mouse_captured, "first 'c' should disable capture");
+        app.handle_browse_key(KeyCode::Char('c'));
+        assert!(app.mouse_captured, "second 'c' should re-enable capture");
+    }
+
+    // ── refresh_preview scrollback error shows error message ──
+
+    #[tokio::test]
+    async fn refresh_preview_scrollback_error_shows_error() {
+        let mut mock = MockSessionManager::new();
+        mock.scrollback_result = Some(Err("scrollback failed".to_string()));
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(mock),
+        );
+        app.sessions = vec![make_session("s1", AgentType::Claude)];
+        app.preview_scroll_offset = 5; // trigger scrollback path
+        app.refresh_preview().await;
+        assert_eq!(app.preview, "[unable to capture pane]");
     }
 
 }

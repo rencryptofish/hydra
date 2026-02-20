@@ -25,4 +25,4 @@ expression: output
 │  new_mo… new ││                                                              │
 │  ui.rs +30-5 ││                                                              │
 └──────────────┘└──────────────────────────────────────────────────────────────┘
- j/k: navigate  Enter: attach  n: new  d: delete  q: quit
+ j/k: navigate  Enter: attach  n: new  d: delete  c: copy  q: quit
