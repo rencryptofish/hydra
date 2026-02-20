@@ -16,7 +16,7 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 
 - **`src/main.rs`** — CLI parsing (clap), TUI event loop, key dispatch. Passes full `KeyEvent` (not just `KeyCode`) to handlers for modifier support.
 - **`src/app.rs`** — `App` state + `Mode` enum (Browse, Attached, NewSessionName, NewSessionAgent, ConfirmDelete). Owns `Box<dyn SessionManager>` for testability.
-- **`src/tmux.rs`** — `SessionManager` trait + `TmuxSessionManager` impl. All tmux subprocess calls live here. Also has `keycode_to_tmux()` for crossterm→tmux key mapping.
+- **`src/tmux.rs`** — `SessionManager` async trait (`#[async_trait]`) + `TmuxSessionManager` impl. All tmux subprocess calls use `tokio::process::Command` (non-blocking). Also has `keycode_to_tmux()` for crossterm→tmux key mapping.
 - **`src/session.rs`** — `Session`, `SessionStatus`, `AgentType` types. Pure data, no I/O.
 - **`src/ui.rs`** — All ratatui rendering. Snapshot-tested with `insta`.
 - **`src/logs.rs`** — Claude Code log file reader. Traces tmux pane PID → `lsof` → `.claude/tasks/<uuid>/` → JSONL log file. Extracts last assistant message per session.
@@ -24,7 +24,7 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 
 ## Key Patterns
 
-- **SessionManager trait**: All tmux interaction goes through `trait SessionManager` so tests can use mock/noop impls. `App::new_with_manager()` is the test constructor.
+- **SessionManager trait**: All tmux interaction goes through `#[async_trait] trait SessionManager: Send + Sync` so tests can use mock/noop impls. `App::new_with_manager()` is the test constructor. Async methods that call the manager must clone fields (e.g. `project_id`, `new_session_name`) before `.await` to avoid borrow conflicts across await points.
 - **Content-change detection**: Session status (Running/Idle/Exited) is determined by comparing `capture-pane` output between ticks, not `session_activity` (which only tracks client input, not pane output for detached sessions).
 - **Status indicator lights**: Each session shows a colored `●` dot in the sidebar:
   - **Green** = Idle (ready for input, pane content unchanged between ticks)
@@ -32,18 +32,19 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
   - **Yellow** = Exited (agent process ended, pane is dead)
   - Note: On first tick after launch, all non-exited sessions flash Red (no previous capture to compare). Stabilizes by second tick.
 - **Task elapsed timer**: Tracks per-session `Instant` timestamps in App. Running starts the clock; Idle <5s shows frozen duration (same task); Idle >5s clears it (new task).
-- **Embedded attach mode**: `Mode::Attached` forwards keystrokes via `tmux send-keys` instead of `tmux attach`. Preview border turns green, help bar updates. Esc returns to Browse.
+- **Embedded attach mode**: `Mode::Attached` forwards keystrokes via `tmux send-keys` instead of `tmux attach`. Preview border switches to thick green (`BorderType::Thick` + bold) for clear visual distinction. Esc returns to Browse.
 - **Last message display**: Sidebar shows the last Claude assistant message per session (dimmed second line, truncated to 50 chars). UUIDs are resolved once via PID→lsof and cached in `App.log_uuids`. Messages refresh every 20 ticks (~5s). Only reads last 200KB of JSONL for efficiency.
 - **Claude Code JSONL logs**: Located at `~/.claude/projects/<escaped-cwd>/<uuid>.jsonl`. Path escaping replaces `/` with `-` (e.g. `/Users/monkey/hydra` → `-Users-monkey-hydra`). Structure: `{"type": "assistant", "message": {"content": [{"text": "..."}]}}`. The UUID is discovered via `lsof -p <pane_pid>` looking for `.claude/tasks/<uuid>/` open file descriptors.
 - **remain-on-exit**: Set on session creation so exited agents stay visible with `Exited` status instead of vanishing.
-- **Agent type caching**: `TmuxSessionManager` caches `HYDRA_AGENT_TYPE` env var lookups in a `Mutex<HashMap>` to avoid repeated `tmux show-environment` calls on every tick.
+- **Agent type caching**: `TmuxSessionManager` caches `HYDRA_AGENT_TYPE` env var lookups in a `std::sync::Mutex<HashMap>` to avoid repeated `tmux show-environment` calls on every tick. Uses `std::sync::Mutex` (not tokio) since the lock is never held across `.await` points. Cache is also pre-populated on `create_session`.
+- **Async I/O**: All tmux subprocess calls use `tokio::process::Command` instead of `std::process::Command` to avoid blocking the event loop. Key press events trigger immediate `refresh_preview()` for responsive navigation (no waiting for next tick).
 
 ## Testing
 
 - **Unit tests**: `src/session.rs` (pure functions: project_id, name parsing, AgentType) and `src/app.rs` (state machine: mode transitions, navigation, create/delete flows)
 - **Snapshot tests**: `src/ui.rs` uses `insta::assert_snapshot!` with `ratatui::backend::TestBackend` (80x24). Run `cargo insta review` after intentional UI changes. Snapshots live in `src/snapshots/`.
 - **CLI tests**: `tests/cli_tests.rs` with `assert_cmd` — tests help, ls, arg validation, unknown commands
-- **Mock**: `MockSessionManager` in app tests (controllable return values), `NoopSessionManager` in UI tests — both implement full `SessionManager` trait
+- **Mock**: `MockSessionManager` in app tests (controllable return values), `NoopSessionManager` in UI tests — both implement full `SessionManager` trait with `#[async_trait]`. Tests calling async App methods (`refresh_sessions`, `refresh_preview`, `confirm_new_session`, `confirm_delete`) use `#[tokio::test]`.
 - When adding a new `SessionManager` method, update mock impls in BOTH `app.rs` and `ui.rs` test modules
 
 ## Conventions
