@@ -57,7 +57,15 @@ pub async fn save_manifest(
         tokio::fs::create_dir_all(parent).await?;
     }
     let json = serde_json::to_string_pretty(manifest)?;
-    let tmp_path = path.with_extension("json.tmp");
+    // Use a unique temp filename to avoid collisions between concurrent writes
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let tmp_name = format!(
+        "sessions.{}.{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+    );
+    let tmp_path = path.with_file_name(tmp_name);
     tokio::fs::write(&tmp_path, json).await?;
     tokio::fs::rename(&tmp_path, &path).await?;
     Ok(())
@@ -108,7 +116,7 @@ impl SessionRecord {
                     "claude --dangerously-skip-permissions".to_string()
                 }
             }
-            "codex" => "codex --yolo resume --last".to_string(),
+            "codex" => "codex -c check_for_update_on_startup=false --full-auto resume --last".to_string(),
             _ => self.agent_type.clone(),
         }
     }
@@ -124,7 +132,7 @@ impl SessionRecord {
                     "claude --dangerously-skip-permissions".to_string()
                 }
             }
-            "codex" => "codex --yolo".to_string(),
+            "codex" => "codex -c check_for_update_on_startup=false --full-auto".to_string(),
             _ => self.agent_type.clone(),
         }
     }
@@ -173,7 +181,7 @@ mod tests {
             cwd: "/tmp/test".to_string(),
             failed_attempts: 0,
         };
-        assert_eq!(record.resume_command(), "codex --yolo resume --last");
+        assert_eq!(record.resume_command(), "codex -c check_for_update_on_startup=false --full-auto resume --last");
     }
 
     #[test]
@@ -215,7 +223,7 @@ mod tests {
             cwd: "/tmp/test".to_string(),
             failed_attempts: 0,
         };
-        assert_eq!(record.create_command(), "codex --yolo");
+        assert_eq!(record.create_command(), "codex -c check_for_update_on_startup=false --full-auto");
     }
 
     #[tokio::test]
@@ -345,6 +353,84 @@ mod tests {
             dir.to_string_lossy().ends_with(".hydra"),
             "default_base_dir should end with .hydra, got: {}",
             dir.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_write_no_temp_file_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let pid = "atomic_test";
+
+        let mut manifest = Manifest::default();
+        manifest.sessions.insert(
+            "alpha".to_string(),
+            SessionRecord {
+                name: "alpha".to_string(),
+                agent_type: "claude".to_string(),
+                agent_session_id: None,
+                cwd: "/tmp".to_string(),
+                failed_attempts: 0,
+            },
+        );
+
+        save_manifest(base, pid, &manifest).await.unwrap();
+
+        // The final file should exist and be valid JSON
+        let path = manifest_path(base, pid);
+        let contents = tokio::fs::read_to_string(&path).await.unwrap();
+        let loaded: Manifest = serde_json::from_str(&contents).unwrap();
+        assert_eq!(loaded.sessions.len(), 1);
+
+        // The temp file should not exist after a successful write
+        let tmp_path = path.with_extension("json.tmp");
+        assert!(
+            !tmp_path.exists(),
+            "temp file should be renamed away, not left behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_saves_dont_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let pid = "concurrent_test";
+
+        // Pre-create the directory to avoid concurrent create_dir_all races
+        let manifest_dir = base.join(pid);
+        tokio::fs::create_dir_all(&manifest_dir).await.unwrap();
+
+        // Run several saves concurrently
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let base = base.clone();
+            let pid = pid.to_string();
+            handles.push(tokio::spawn(async move {
+                let mut manifest = Manifest::default();
+                manifest.sessions.insert(
+                    format!("session-{i}"),
+                    SessionRecord {
+                        name: format!("session-{i}"),
+                        agent_type: "claude".to_string(),
+                        agent_session_id: None,
+                        cwd: "/tmp".to_string(),
+                        failed_attempts: 0,
+                    },
+                );
+                save_manifest(&base, &pid, &manifest).await.unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // The file should contain valid JSON (one of the concurrent writes wins)
+        let path = manifest_path(&base, pid);
+        let contents = tokio::fs::read_to_string(&path).await.unwrap();
+        let loaded: Manifest = serde_json::from_str(&contents).unwrap();
+        assert!(
+            !loaded.sessions.is_empty(),
+            "manifest should contain at least one session from concurrent writes"
         );
     }
 }

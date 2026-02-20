@@ -12,7 +12,7 @@ impl AgentType {
     pub fn command(&self) -> &str {
         match self {
             AgentType::Claude => "claude --dangerously-skip-permissions",
-            AgentType::Codex => "codex --yolo",
+            AgentType::Codex => "codex -c check_for_update_on_startup=false --full-auto",
         }
     }
 
@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn agent_type_command_codex() {
-        assert_eq!(AgentType::Codex.command(), "codex --yolo");
+        assert_eq!(AgentType::Codex.command(), "codex -c check_for_update_on_startup=false --full-auto");
     }
 
     // ── AgentType::all tests ──────────────────────────────────────────

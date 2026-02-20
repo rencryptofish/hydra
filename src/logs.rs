@@ -38,6 +38,10 @@ pub struct SessionStats {
     /// Files in order of most recent edit (last = most recent).
     /// Deduplicated: each path appears at most once.
     pub recent_files: Vec<String>,
+    /// ISO 8601 timestamp of the most recent user message (task start).
+    pub last_user_ts: Option<String>,
+    /// ISO 8601 timestamp of the most recent assistant message (task end).
+    pub last_assistant_ts: Option<String>,
     pub read_offset: u64,
 }
 
@@ -56,6 +60,31 @@ impl SessionStats {
         self.files.len()
     }
 
+    /// Compute task elapsed duration from log timestamps.
+    /// Returns Some if the agent appears to be working (last user msg > last assistant msg,
+    /// or no assistant response yet). Returns None if idle or no data.
+    pub fn task_elapsed(&self) -> Option<std::time::Duration> {
+        let user_ts = parse_iso_timestamp(self.last_user_ts.as_deref()?)?;
+        let now = chrono::Utc::now();
+
+        match &self.last_assistant_ts {
+            Some(ast_str) => {
+                let ast_ts = parse_iso_timestamp(ast_str)?;
+                if user_ts > ast_ts {
+                    // User sent a message after the last assistant reply — agent is working
+                    Some((now - user_ts).to_std().unwrap_or_default())
+                } else {
+                    // Assistant replied after user — task complete, no elapsed
+                    None
+                }
+            }
+            None => {
+                // No assistant response yet — agent is working on first message
+                Some((now - user_ts).to_std().unwrap_or_default())
+            }
+        }
+    }
+
     /// Record a file touch, updating both the dedup set and recency order.
     pub fn touch_file(&mut self, path: String) {
         self.files.insert(path.clone());
@@ -65,6 +94,11 @@ impl SessionStats {
         }
         self.recent_files.push(path);
     }
+}
+
+/// Parse an ISO 8601 timestamp string into a chrono DateTime.
+fn parse_iso_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    s.parse::<chrono::DateTime<chrono::Utc>>().ok()
 }
 
 /// Format a token count compactly: 1234 → "1.2k", 1234567 → "1.2M"
@@ -142,10 +176,26 @@ fn update_session_stats_from_path(path: &std::path::Path, stats: &mut SessionSta
             continue;
         }
 
+        // Fast path: user messages — track timestamp for task-start timing
+        if line.contains("\"user\"") && line.contains("\"timestamp\"") && !line.contains("\"usage\"") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if v.get("type").and_then(|t| t.as_str()) == Some("user") {
+                    if let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()) {
+                        stats.last_user_ts = Some(ts.to_string());
+                    }
+                }
+            }
+            continue;
+        }
+
         // Fast path: assistant messages with usage (token counts + tool calls)
         if line.contains("\"assistant\"") && line.contains("\"usage\"") {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 if v.get("type").and_then(|t| t.as_str()) == Some("assistant") {
+                    // Track timestamp for task-end timing
+                    if let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()) {
+                        stats.last_assistant_ts = Some(ts.to_string());
+                    }
                     // Extract token usage
                     if let Some(usage) = v.get("message").and_then(|m| m.get("usage")) {
                         stats.turns += 1;
@@ -690,6 +740,78 @@ mod tests {
 
         // /src/main.rs was touched twice, so it should be last (most recent)
         assert_eq!(stats.recent_files, vec!["/src/app.rs", "/src/main.rs"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── task_elapsed tests ────────────────────────────────────────
+
+    #[test]
+    fn task_elapsed_no_timestamps() {
+        let stats = SessionStats::default();
+        assert!(stats.task_elapsed().is_none());
+    }
+
+    #[test]
+    fn task_elapsed_user_only_means_working() {
+        let mut stats = SessionStats::default();
+        // User sent a message 30 seconds ago, no response yet
+        let ts = (chrono::Utc::now() - chrono::Duration::seconds(30))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        stats.last_user_ts = Some(ts);
+
+        let elapsed = stats.task_elapsed().expect("should be working");
+        assert!(elapsed.as_secs() >= 29 && elapsed.as_secs() <= 31);
+    }
+
+    #[test]
+    fn task_elapsed_assistant_replied_means_idle() {
+        let mut stats = SessionStats::default();
+        let now = chrono::Utc::now();
+        stats.last_user_ts = Some(
+            (now - chrono::Duration::seconds(60))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+        stats.last_assistant_ts = Some(
+            (now - chrono::Duration::seconds(30))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+
+        assert!(stats.task_elapsed().is_none(), "assistant replied = task done");
+    }
+
+    #[test]
+    fn task_elapsed_new_user_msg_after_assistant() {
+        let mut stats = SessionStats::default();
+        let now = chrono::Utc::now();
+        // Assistant replied 60s ago, user sent new msg 10s ago
+        stats.last_assistant_ts = Some(
+            (now - chrono::Duration::seconds(60))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+        stats.last_user_ts = Some(
+            (now - chrono::Duration::seconds(10))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+
+        let elapsed = stats.task_elapsed().expect("new user msg = working");
+        assert!(elapsed.as_secs() >= 9 && elapsed.as_secs() <= 11);
+    }
+
+    #[test]
+    fn task_elapsed_from_jsonl_parsing() {
+        let path = write_tmp_jsonl("stats_timestamps", &[
+            r#"{"type":"user","timestamp":"2026-01-15T10:00:00.000Z","message":{"role":"user","content":"do something"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-15T10:00:30.000Z","message":{"role":"assistant","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"done"}]}}"#,
+            r#"{"type":"user","timestamp":"2026-01-15T10:01:00.000Z","message":{"role":"user","content":"now do this"}}"#,
+        ]);
+
+        let mut stats = SessionStats::default();
+        update_session_stats_from_path(&path, &mut stats);
+
+        assert_eq!(stats.last_user_ts.as_deref(), Some("2026-01-15T10:01:00.000Z"));
+        assert_eq!(stats.last_assistant_ts.as_deref(), Some("2026-01-15T10:00:30.000Z"));
+        // User message is after assistant → agent should be working
+        assert!(stats.task_elapsed().is_some());
         let _ = std::fs::remove_file(&path);
     }
 
