@@ -32,12 +32,14 @@ pub struct App {
     pub preview_area: Cell<Rect>,
     pub preview_scroll_offset: u16,
     prev_captures: HashMap<String, String>,
+    /// Consecutive ticks with unchanged pane content (for Running→Idle debounce).
+    idle_ticks: HashMap<String, u8>,
     task_starts: HashMap<String, Instant>,
     task_last_active: HashMap<String, Instant>,
     pub last_messages: HashMap<String, String>,
     pub session_stats: HashMap<String, SessionStats>,
-    /// Outstanding git diff: (insertions, deletions)
-    pub diff_stat: Option<(u32, u32)>,
+    /// Per-file git diff stats from `git diff --numstat`
+    pub diff_files: Vec<DiffFile>,
     log_uuids: HashMap<String, String>,
     message_tick: u8,
     pub manifest_dir: PathBuf,
@@ -68,11 +70,12 @@ impl App {
             preview_area: Cell::new(Rect::default()),
             preview_scroll_offset: 0,
             prev_captures: HashMap::new(),
+            idle_ticks: HashMap::new(),
             task_starts: HashMap::new(),
             task_last_active: HashMap::new(),
             last_messages: HashMap::new(),
             session_stats: HashMap::new(),
-            diff_stat: None,
+            diff_files: Vec::new(),
             log_uuids: HashMap::new(),
             message_tick: 0,
             manifest_dir: crate::manifest::default_base_dir(),
@@ -90,7 +93,9 @@ impl App {
                 for session in &mut sessions {
                     let name = session.tmux_name.clone();
 
-                    // Determine Running vs Idle by comparing pane content
+                    // Determine Running vs Idle by comparing pane content.
+                    // Debounce: require 3 consecutive unchanged ticks (~750ms) before
+                    // transitioning Running → Idle to prevent status flickering.
                     if session.status != SessionStatus::Exited {
                         let content = self
                             .manager
@@ -98,12 +103,21 @@ impl App {
                             .await
                             .unwrap_or_default();
                         let prev = self.prev_captures.get(&name);
-                        session.status = if prev.is_some_and(|p| p == &content) {
-                            SessionStatus::Idle
-                        } else {
-                            SessionStatus::Running
-                        };
+                        let unchanged = prev.is_some_and(|p| p == &content);
                         self.prev_captures.insert(name.clone(), content);
+
+                        if unchanged {
+                            let count = self.idle_ticks.entry(name.clone()).or_insert(0);
+                            *count = count.saturating_add(1);
+                            session.status = if *count >= 3 {
+                                SessionStatus::Idle
+                            } else {
+                                SessionStatus::Running
+                            };
+                        } else {
+                            self.idle_ticks.insert(name.clone(), 0);
+                            session.status = SessionStatus::Running;
+                        }
                     }
 
                     // Track task elapsed time
@@ -141,11 +155,9 @@ impl App {
                     .get(self.selected)
                     .map(|s| s.tmux_name.clone());
 
-                // Sort: Idle first, then Running, then Exited; alphabetical within each group
-                sessions.sort_by(|a, b| {
-                    a.status.sort_order().cmp(&b.status.sort_order())
-                        .then_with(|| a.name.cmp(&b.name))
-                });
+                // Sort alphabetically — status is shown by the colored dot, no need
+                // to reorder by status which causes the list to jump around.
+                sessions.sort_by(|a, b| a.name.cmp(&b.name));
 
                 self.sessions = sessions;
 
@@ -212,8 +224,8 @@ impl App {
             }
         }
 
-        // Refresh git diff stat
-        self.diff_stat = get_git_diff_stat(&self.cwd).await;
+        // Refresh per-file git diff stats
+        self.diff_files = get_git_diff_numstat(&self.cwd).await;
     }
 
     pub fn select_next(&mut self) {
@@ -555,43 +567,53 @@ impl App {
     }
 }
 
-/// Parse `git diff --shortstat` output into (insertions, deletions).
-fn parse_diff_shortstat(output: &str) -> Option<(u32, u32)> {
-    let trimmed = output.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let mut insertions = 0u32;
-    let mut deletions = 0u32;
-    for part in trimmed.split(',') {
-        let part = part.trim();
-        if part.contains("insertion") {
-            if let Some(n) = part.split_whitespace().next().and_then(|s| s.parse().ok()) {
-                insertions = n;
-            }
-        } else if part.contains("deletion") {
-            if let Some(n) = part.split_whitespace().next().and_then(|s| s.parse().ok()) {
-                deletions = n;
-            }
-        }
-    }
-    Some((insertions, deletions))
+/// A single file's diff stats from `git diff --numstat`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffFile {
+    pub path: String,
+    pub insertions: u32,
+    pub deletions: u32,
 }
 
-/// Get outstanding git diff size (insertions, deletions) for the working tree.
-async fn get_git_diff_stat(cwd: &str) -> Option<(u32, u32)> {
+/// Parse `git diff --numstat` output into per-file stats.
+/// Each line: `<insertions>\t<deletions>\t<path>`
+/// Binary files show `-\t-\t<path>` — we skip those.
+fn parse_diff_numstat(output: &str) -> Vec<DiffFile> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            let ins_str = parts.next()?;
+            let del_str = parts.next()?;
+            let path = parts.next()?.to_string();
+            if path.is_empty() {
+                return None;
+            }
+            let insertions = ins_str.parse().ok()?; // skips binary "-"
+            let deletions = del_str.parse().ok()?;
+            Some(DiffFile {
+                path,
+                insertions,
+                deletions,
+            })
+        })
+        .collect()
+}
+
+/// Get per-file git diff stats for the working tree.
+async fn get_git_diff_numstat(cwd: &str) -> Vec<DiffFile> {
     let output = tokio::process::Command::new("git")
-        .args(["diff", "--shortstat"])
+        .args(["diff", "--numstat"])
         .current_dir(cwd)
         .output()
-        .await
-        .ok()?;
+        .await;
 
-    if !output.status.success() {
-        return None;
+    match output {
+        Ok(o) if o.status.success() => {
+            parse_diff_numstat(&String::from_utf8_lossy(&o.stdout))
+        }
+        _ => Vec::new(),
     }
-
-    parse_diff_shortstat(&String::from_utf8_lossy(&output.stdout))
 }
 
 #[cfg(test)]
@@ -1039,30 +1061,30 @@ mod tests {
         assert_eq!(app.mode, Mode::Browse);
     }
 
-    // ── parse_diff_shortstat tests ──────────────────────────────────
+    // ── parse_diff_numstat tests ──────────────────────────────────
 
     #[test]
-    fn parse_diff_shortstat_both() {
-        let out = " 5 files changed, 120 insertions(+), 30 deletions(-)";
-        assert_eq!(super::parse_diff_shortstat(out), Some((120, 30)));
+    fn parse_diff_numstat_multiple_files() {
+        let out = "45\t12\tsrc/app.rs\n30\t5\tsrc/ui.rs\n3\t0\tREADME.md\n";
+        let files = super::parse_diff_numstat(out);
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0], super::DiffFile { path: "src/app.rs".into(), insertions: 45, deletions: 12 });
+        assert_eq!(files[1], super::DiffFile { path: "src/ui.rs".into(), insertions: 30, deletions: 5 });
+        assert_eq!(files[2], super::DiffFile { path: "README.md".into(), insertions: 3, deletions: 0 });
     }
 
     #[test]
-    fn parse_diff_shortstat_inserts_only() {
-        let out = " 2 files changed, 45 insertions(+)";
-        assert_eq!(super::parse_diff_shortstat(out), Some((45, 0)));
+    fn parse_diff_numstat_skips_binary() {
+        let out = "-\t-\timage.png\n10\t2\tsrc/main.rs\n";
+        let files = super::parse_diff_numstat(out);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/main.rs");
     }
 
     #[test]
-    fn parse_diff_shortstat_deletes_only() {
-        let out = " 1 file changed, 10 deletions(-)";
-        assert_eq!(super::parse_diff_shortstat(out), Some((0, 10)));
-    }
-
-    #[test]
-    fn parse_diff_shortstat_empty() {
-        assert_eq!(super::parse_diff_shortstat(""), None);
-        assert_eq!(super::parse_diff_shortstat("  \n  "), None);
+    fn parse_diff_numstat_empty() {
+        assert!(super::parse_diff_numstat("").is_empty());
+        assert!(super::parse_diff_numstat("\n").is_empty());
     }
 
     #[test]

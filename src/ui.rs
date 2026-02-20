@@ -52,19 +52,14 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     // Check if any session has stats to show
     let has_stats = app.session_stats.values().any(|st| st.turns > 0);
 
-    // Collect recent files across all sessions, merged by recency
-    let recent_files = if has_stats {
-        aggregate_recent_files(app)
-    } else {
-        vec![]
-    };
-
     let stats_height = if has_stats { 3 } else { 0 }; // 1 line + top/bottom border
-    let max_file_rows = 6;
-    let files_height = if recent_files.is_empty() {
+
+    let tree_lines = build_diff_tree_lines(&app.diff_files, area.width.saturating_sub(2) as usize);
+    let max_tree_rows: u16 = 8;
+    let tree_height = if tree_lines.is_empty() {
         0
     } else {
-        (recent_files.len() as u16).min(max_file_rows)
+        (tree_lines.len() as u16 + 2).min(max_tree_rows + 2) // +2 for top/bottom border
     };
 
     let sidebar_chunks = Layout::default()
@@ -72,13 +67,13 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         .constraints([
             Constraint::Min(1),
             Constraint::Length(stats_height),
-            Constraint::Length(files_height),
+            Constraint::Length(tree_height),
         ])
         .split(area);
 
     let list_area = sidebar_chunks[0];
     let stats_area = sidebar_chunks[1];
-    let files_area = sidebar_chunks[2];
+    let tree_area = sidebar_chunks[2];
 
     // Draw session list
     let items: Vec<ListItem> = app
@@ -139,59 +134,123 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         draw_stats(frame, app, stats_area);
     }
 
-    // Draw recent files
-    if !recent_files.is_empty() {
-        draw_recent_files(frame, &recent_files, files_area);
+    // Draw diff tree
+    if !tree_lines.is_empty() {
+        draw_diff_tree(frame, &tree_lines, tree_area);
     }
 }
 
-/// Merge recent files from all sessions into one list, most-recent-last.
-/// Each file appears once; if touched by multiple sessions, uses latest position.
-fn aggregate_recent_files(app: &App) -> Vec<String> {
-    let mut merged: Vec<String> = Vec::new();
-
-    // Iterate sessions in sorted key order for deterministic output
-    let mut keys: Vec<&String> = app.session_stats.keys().collect();
-    keys.sort();
-
-    for key in keys {
-        if let Some(stats) = app.session_stats.get(key) {
-            for f in &stats.recent_files {
-                if let Some(pos) = merged.iter().position(|x| x == f) {
-                    merged.remove(pos);
-                }
-                merged.push(f.clone());
-            }
-        }
+/// Build lines for a compact diff tree grouped by directory.
+/// Files sorted by path, grouped under directory headers.
+/// Output example:
+///   src/
+///    app.rs       +45-12
+///    ui.rs        +30-5
+///   README.md     +3
+fn build_diff_tree_lines<'a>(diff_files: &[crate::app::DiffFile], width: usize) -> Vec<Line<'a>> {
+    if diff_files.is_empty() {
+        return vec![];
     }
 
-    merged
-}
-
-fn draw_recent_files(frame: &mut Frame, files: &[String], area: Rect) {
     let dim = Style::default().fg(Color::DarkGray);
-    let inner_width = area.width.saturating_sub(1) as usize; // 1 char left margin
+    let green = Style::default().fg(Color::Green);
+    let red = Style::default().fg(Color::Red);
 
-    // Show most recent files last (bottom), take the tail that fits
-    let max_rows = area.height as usize;
-    let start = files.len().saturating_sub(max_rows);
+    let mut sorted: Vec<&crate::app::DiffFile> = diff_files.iter().collect();
+    sorted.sort_by(|a, b| a.path.cmp(&b.path));
 
-    let lines: Vec<Line> = files[start..]
-        .iter()
-        .map(|path| {
-            // Show basename, fallback to full path if no separator
-            let basename = path.rsplit('/').next().unwrap_or(path);
-            let display = if basename.len() > inner_width {
-                format!("{}", &basename[..inner_width])
-            } else {
-                format!(" {basename}")
-            };
-            Line::from(Span::styled(display, dim))
-        })
-        .collect();
+    let mut lines: Vec<Line> = Vec::new();
+    let mut current_dir: Option<&str> = None;
+    let inner_w = width.saturating_sub(1); // leave 1 char margin
 
-    let paragraph = Paragraph::new(lines);
-    frame.render_widget(paragraph, area);
+    for f in &sorted {
+        let (dir, basename) = match f.path.rfind('/') {
+            Some(i) => (Some(&f.path[..=i]), &f.path[i + 1..]),
+            None => (None, f.path.as_str()),
+        };
+
+        // Emit directory header if changed
+        let dir_str = dir.unwrap_or("");
+        let show_dir = match current_dir {
+            Some(prev) => prev != dir_str,
+            None => dir.is_some(),
+        };
+        if show_dir {
+            if let Some(d) = dir {
+                let display: String = if d.len() > inner_w {
+                    d[..inner_w].to_string()
+                } else {
+                    d.to_string()
+                };
+                lines.push(Line::from(Span::styled(format!(" {display}"), dim)));
+            }
+            current_dir = Some(dir_str);
+        }
+
+        // Build diff stat string
+        let stat = format_compact_diff(f.insertions, f.deletions);
+        let indent = if dir.is_some() { "  " } else { " " };
+
+        // Compute available space for filename
+        let stat_len = stat.chars().count();
+        let prefix_len = indent.len();
+        let available = inner_w.saturating_sub(prefix_len + stat_len + 1);
+
+        let name: String = if basename.len() > available && available > 3 {
+            format!("{}…", &basename[..available - 1])
+        } else if basename.len() > available {
+            basename[..available.min(basename.len())].to_string()
+        } else {
+            basename.to_string()
+        };
+
+        let padding = inner_w.saturating_sub(prefix_len + name.len() + stat_len);
+        let pad_str: String = " ".repeat(padding);
+
+        let mut spans = vec![
+            Span::styled(format!("{indent}{name}{pad_str}"), dim),
+        ];
+
+        // Color the stat: green for +, red for -
+        if f.insertions > 0 {
+            spans.push(Span::styled(format!("+{}", f.insertions), green));
+        }
+        if f.deletions > 0 {
+            spans.push(Span::styled(format!("-{}", f.deletions), red));
+        }
+
+        lines.push(Line::from(spans));
+    }
+
+    lines
+}
+
+/// Format compact diff: "+45-12", "+45", "-12"
+fn format_compact_diff(ins: u32, del: u32) -> String {
+    match (ins > 0, del > 0) {
+        (true, true) => format!("+{ins}-{del}"),
+        (true, false) => format!("+{ins}"),
+        (false, true) => format!("-{del}"),
+        (false, false) => String::new(),
+    }
+}
+
+fn draw_diff_tree(frame: &mut Frame, lines: &[Line], area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Changes ")
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Show the tail that fits (most relevant files at bottom)
+    let max_rows = inner.height as usize;
+    let start = lines.len().saturating_sub(max_rows);
+    let visible: Vec<Line> = lines[start..].to_vec();
+
+    let paragraph = Paragraph::new(visible);
+    frame.render_widget(paragraph, inner);
 }
 
 fn draw_stats(frame: &mut Frame, app: &App, area: Rect) {
@@ -209,33 +268,25 @@ fn draw_stats(frame: &mut Frame, app: &App, area: Rect) {
     let dim = Style::default().fg(Color::DarkGray);
     let val = Style::default().fg(Color::White);
 
+    // Total diff across all files
+    let total_diff: u32 = app.diff_files.iter().map(|f| f.insertions + f.deletions).sum();
+
     let mut spans = vec![
         Span::styled(format_cost(total_cost), Style::default().fg(Color::Green)),
         Span::styled(format!(" {}", format_tokens(total_tokens)), val),
         Span::styled(format!(" {}✎", total_edits), val),
     ];
 
-    // Git diff stat
-    if let Some((ins, del)) = app.diff_stat {
-        let diff_str = if ins > 0 && del > 0 {
-            format!(" +{ins}-{del}")
-        } else if ins > 0 {
-            format!(" +{ins}")
-        } else if del > 0 {
-            format!(" -{del}")
-        } else {
-            String::new()
-        };
-        if !diff_str.is_empty() {
-            spans.push(Span::styled(diff_str, dim));
-        }
+    if total_diff > 0 {
+        spans.push(Span::styled(format!(" Δ{total_diff}"), dim));
     }
 
     let line = Line::from(spans);
 
     let block = Block::default()
-        .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .borders(Borders::ALL)
+        .title(" Stats ")
+        .border_style(Style::default().fg(Color::Cyan));
 
     let paragraph = Paragraph::new(line).block(block);
     frame.render_widget(paragraph, area);
@@ -753,8 +804,12 @@ mod tests {
         stats2.touch_file("/src/ui.rs".to_string());
         app.session_stats.insert("hydra-testproj-worker-2".to_string(), stats2);
 
-        // Git diff stat
-        app.diff_stat = Some((45, 12));
+        // Per-file git diff stats
+        app.diff_files = vec![
+            crate::app::DiffFile { path: "src/app.rs".into(), insertions: 45, deletions: 12 },
+            crate::app::DiffFile { path: "src/ui.rs".into(), insertions: 30, deletions: 5 },
+            crate::app::DiffFile { path: "README.md".into(), insertions: 8, deletions: 0 },
+        ];
 
         terminal.draw(|f| super::draw(f, &app)).unwrap();
         let output = buffer_to_string(&terminal);
