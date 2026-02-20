@@ -132,22 +132,26 @@ impl App {
 
                     // Determine Running vs Idle by comparing pane content.
                     //
-                    // Two-layer detection:
-                    // 1. Log-based (authoritative): if the JSONL log shows a pending
-                    //    user message with no assistant reply, the agent is Running.
-                    //    If the assistant has replied, the agent is Idle.
-                    // 2. Pane-based (fallback): compare normalized pane content between
-                    //    ticks. Spinners/cursor noise are stripped before comparison.
+                    // Pane content is normalized (strip spinners, ANSI, trailing
+                    // whitespace) then compared against the previous tick.
+                    //
+                    // Log signal (`task_elapsed`) is used only to *accelerate*
+                    // Idle detection: when the log confirms the agent finished
+                    // (assistant replied), the idle threshold drops from 12 to 3
+                    // ticks. The log is never used to force Running — it updates
+                    // too infrequently (~5s) and stale data would keep sessions
+                    // stuck in Running after the agent finishes.
                     //
                     // Hysteresis thresholds (pane-based):
-                    //   Running → Idle: 12 consecutive unchanged ticks (~3s)
+                    //   Running → Idle: 12 ticks (~3s), or 3 ticks if log says idle
                     //   Idle → Running: 2 consecutive changed ticks (~500ms)
-                    // First capture (no previous): immediately set Running (new session).
-                    let log_working = self
+                    // First capture (no previous): immediately set Running.
+                    let log_idle = self
                         .session_stats
                         .get(&name)
-                        .and_then(|st| st.task_elapsed())
-                        .is_some();
+                        .map(|st| st.task_elapsed().is_none())
+                        .unwrap_or(false);
+                    let idle_threshold: u8 = if log_idle { 3 } else { 12 };
 
                     if let Some(content) = captures.get(&name) {
                         let normalized = normalize_capture(content);
@@ -164,15 +168,8 @@ impl App {
                             *count = count.saturating_add(1);
                             self.changed_ticks.insert(name.clone(), 0);
 
-                            if *count >= 12 {
+                            if *count >= idle_threshold {
                                 session.status = SessionStatus::Idle;
-                            } else if log_working {
-                                // Log says agent is still processing but pane hasn't
-                                // hit the idle threshold yet — keep Running. This avoids
-                                // premature Idle during agent "thinking" pauses, but
-                                // doesn't reset idle_ticks so the pane-based counter
-                                // can still accumulate as a fallback for stale stats.
-                                session.status = SessionStatus::Running;
                             }
                             // else: keep current status (hysteresis)
                         } else {
@@ -180,7 +177,7 @@ impl App {
                             *count = count.saturating_add(1);
                             self.idle_ticks.insert(name.clone(), 0);
 
-                            if *count >= 2 || log_working {
+                            if *count >= 2 {
                                 session.status = SessionStatus::Running;
                             }
                             // else: keep current status (don't flip to Running on a single blip)
@@ -3113,14 +3110,12 @@ mod tests {
         assert_eq!(result, "working");
     }
 
-    // ── log-based status override test ──────────────────────────────
+    // ── log-based idle acceleration tests ──────────────────────────
 
     #[tokio::test]
-    async fn refresh_sessions_log_working_keeps_running_before_idle_threshold() {
-        // When session_stats.task_elapsed() returns Some (agent is working),
-        // status should stay Running during the pane-based debounce window
-        // (idle_ticks < 12), but once idle_ticks >= 12, pane-based Idle wins
-        // over potentially stale log data.
+    async fn refresh_sessions_log_idle_accelerates_idle_detection() {
+        // When the log confirms the agent is idle (assistant replied),
+        // the idle threshold drops from 12 to 3 ticks for faster detection.
         let sessions = vec![make_session("s1", AgentType::Claude)];
         let mut app = App::new_with_manager(
             "testid".to_string(),
@@ -3128,34 +3123,367 @@ mod tests {
             Box::new(MockSessionManager::with_sessions(sessions)),
         );
 
-        // Inject session_stats with a pending user message (agent is working)
+        // Inject stats where assistant has replied (task_elapsed = None = idle)
         let mut stats = crate::logs::SessionStats::default();
-        let ts = (chrono::Utc::now() - chrono::Duration::seconds(5))
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        stats.last_user_ts = Some(ts);
-        app.session_stats.insert("hydra-testid-s1".to_string(), stats);
+        let now = chrono::Utc::now();
+        stats.last_user_ts = Some(
+            (now - chrono::Duration::seconds(30))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+        stats.last_assistant_ts = Some(
+            (now - chrono::Duration::seconds(10))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+        app.session_stats
+            .insert("hydra-testid-s1".to_string(), stats);
 
-        // First tick: first_capture, sets Running
+        // First tick: first_capture → Running
         app.refresh_sessions().await;
-        assert_eq!(app.sessions[0].status, SessionStatus::Running, "first tick = Running");
+        assert_eq!(app.sessions[0].status, SessionStatus::Running, "tick 1");
 
-        // Ticks 2-12: unchanged content, but log_working keeps it Running
-        for i in 2..=12 {
-            app.refresh_sessions().await;
-            assert_eq!(
-                app.sessions[0].status,
-                SessionStatus::Running,
-                "tick {i}: log_working should keep Running before idle threshold"
-            );
-        }
+        // Ticks 2-3: unchanged, but idle_ticks < 3
+        app.refresh_sessions().await;
+        assert_eq!(app.sessions[0].status, SessionStatus::Running, "tick 2");
+        app.refresh_sessions().await;
+        assert_eq!(app.sessions[0].status, SessionStatus::Running, "tick 3");
 
-        // Tick 13: idle_ticks reaches 12, pane-based Idle overrides stale log
+        // Tick 4: idle_ticks reaches 3, accelerated threshold met → Idle
         app.refresh_sessions().await;
         assert_eq!(
             app.sessions[0].status,
             SessionStatus::Idle,
-            "tick 13: pane-based Idle should override stale log data"
+            "tick 4: log_idle should accelerate to Idle at 3 ticks"
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_sessions_no_log_uses_full_threshold() {
+        // Without log data, the full 12-tick threshold applies.
+        let sessions = vec![make_session("s1", AgentType::Claude)];
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(MockSessionManager::with_sessions(sessions)),
+        );
+
+        // No session_stats → log_idle is false → threshold is 12
+
+        // First tick: first_capture → Running
+        app.refresh_sessions().await;
+        assert_eq!(app.sessions[0].status, SessionStatus::Running);
+
+        // At tick 4, should still be Running (threshold is 12, not 3)
+        for _ in 2..=4 {
+            app.refresh_sessions().await;
+        }
+        assert_eq!(
+            app.sessions[0].status,
+            SessionStatus::Running,
+            "tick 4: without log data, still Running (need 12 ticks)"
+        );
+
+        // At tick 13, should be Idle
+        for _ in 5..=13 {
+            app.refresh_sessions().await;
+        }
+        assert_eq!(app.sessions[0].status, SessionStatus::Idle, "tick 13: Idle after 12 unchanged");
+    }
+
+    // ── changed_ticks → Running transition (Idle→Running needs 2 changed ticks) ──
+
+    #[tokio::test]
+    async fn refresh_sessions_changed_content_triggers_running_after_two_ticks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // A manager that returns alternating capture content so content changes each tick
+        struct AlternatingManager {
+            sessions: Vec<Session>,
+            call_count: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl SessionManager for AlternatingManager {
+            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> {
+                Ok(self.sessions.clone())
+            }
+            async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> {
+                let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+                Ok(format!("output {n}"))
+            }
+            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
+            async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
+            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
+        }
+
+        let sessions = vec![make_session("s1", AgentType::Claude)];
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let manager = AlternatingManager {
+            sessions: sessions.clone(),
+            call_count: call_count.clone(),
+        };
+
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(manager),
+        );
+
+        // First tick: first_capture → Running
+        app.refresh_sessions().await;
+        assert_eq!(app.sessions[0].status, SessionStatus::Running, "tick 1: first capture = Running");
+
+        // Tick 2: content changed (output 0→output 1), changed_ticks=1, but < 2 → keep Running
+        app.refresh_sessions().await;
+        assert_eq!(app.sessions[0].status, SessionStatus::Running, "tick 2: 1 changed tick, keep current");
+
+        // Tick 3: content changed again, changed_ticks=2 → Running confirmed
+        app.refresh_sessions().await;
+        assert_eq!(app.sessions[0].status, SessionStatus::Running, "tick 3: 2 changed ticks → Running");
+    }
+
+    // ── changed_ticks resets idle_ticks and vice versa ──
+
+    #[tokio::test]
+    async fn refresh_sessions_changed_after_idle_resets_idle_ticks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Manager returns same content for first N calls, then starts changing
+        struct PhaseManager {
+            sessions: Vec<Session>,
+            call_count: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl SessionManager for PhaseManager {
+            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> {
+                Ok(self.sessions.clone())
+            }
+            async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> {
+                let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+                // First 14 calls return same content (to get to Idle),
+                // then alternate to trigger changed_ticks
+                if n < 14 {
+                    Ok("stable".to_string())
+                } else {
+                    Ok(format!("changing {n}"))
+                }
+            }
+            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
+            async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
+            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
+        }
+
+        let sessions = vec![make_session("s1", AgentType::Claude)];
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let manager = PhaseManager {
+            sessions: sessions.clone(),
+            call_count: call_count.clone(),
+        };
+
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(manager),
+        );
+
+        // Run 14 ticks to get to Idle (first capture = Running, then 12 unchanged = Idle)
+        for _ in 0..14 {
+            app.refresh_sessions().await;
+        }
+        assert_eq!(app.sessions[0].status, SessionStatus::Idle, "should be Idle after 14 ticks");
+
+        // Now content changes — 1st change: changed_ticks=1, keep Idle (hysteresis)
+        app.refresh_sessions().await;
+        assert_eq!(app.sessions[0].status, SessionStatus::Idle, "1 changed tick: still Idle");
+
+        // 2nd consecutive change: changed_ticks=2 → Running
+        app.refresh_sessions().await;
+        assert_eq!(app.sessions[0].status, SessionStatus::Running, "2 changed ticks: flips to Running");
+    }
+
+    // ── Preview skip optimization ──
+
+    #[tokio::test]
+    async fn refresh_preview_skips_when_idle_and_same_session() {
+        let sessions = vec![make_session("s1", AgentType::Claude)];
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(MockSessionManager::with_sessions(sessions.clone())),
+        );
+        app.sessions = sessions;
+
+        // First call — captures preview
+        app.refresh_preview().await;
+        assert_eq!(app.preview_session.as_deref(), Some("hydra-testid-s1"));
+        let first_preview = app.preview.clone();
+
+        // Simulate idle_ticks >= 1 for the session
+        app.idle_ticks.insert("hydra-testid-s1".to_string(), 1);
+
+        // Second call — should skip (same session, idle_ticks >= 1)
+        app.preview = "modified".to_string();
+        app.refresh_preview().await;
+        // If it skipped, preview remains "modified" (wasn't overwritten)
+        assert_eq!(app.preview, "modified", "should skip capture when idle and same session");
+
+        // Change selected session — should NOT skip
+        app.sessions.push(make_session("s2", AgentType::Claude));
+        app.selected = 1;
+        app.refresh_preview().await;
+        assert_eq!(app.preview_session.as_deref(), Some("hydra-testid-s2"));
+    }
+
+    // ── Preview skip does NOT skip when idle_ticks = 0 ──
+
+    #[tokio::test]
+    async fn refresh_preview_does_not_skip_when_idle_ticks_zero() {
+        let sessions = vec![make_session("s1", AgentType::Claude)];
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(MockSessionManager::with_sessions(sessions.clone())),
+        );
+        app.sessions = sessions;
+
+        app.refresh_preview().await;
+        // idle_ticks = 0 (default), same session
+        app.preview = "modified".to_string();
+        app.refresh_preview().await;
+        // Should NOT skip, so preview is overwritten
+        assert_ne!(app.preview, "modified", "should not skip when idle_ticks = 0");
+    }
+
+    // ── flush_pending_keys ──
+
+    #[tokio::test]
+    async fn flush_pending_keys_sends_and_clears() {
+        use std::sync::{Arc, Mutex};
+
+        struct LiteralTracker {
+            sent: Arc<Mutex<Vec<(String, String)>>>,
+        }
+        #[async_trait::async_trait]
+        impl SessionManager for LiteralTracker {
+            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> { Ok(vec![]) }
+            async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
+            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
+            async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
+            async fn send_keys_literal(&self, tmux_name: &str, text: &str) -> anyhow::Result<()> {
+                self.sent.lock().unwrap().push((tmux_name.to_string(), text.to_string()));
+                Ok(())
+            }
+            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
+        }
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let manager = LiteralTracker { sent: sent.clone() };
+
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(manager),
+        );
+
+        // Queue pending keys
+        app.pending_literal_keys = Some(("hydra-testid-s1".to_string(), "hello".to_string()));
+        app.flush_pending_keys().await;
+
+        let calls = sent.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "hydra-testid-s1");
+        assert_eq!(calls[0].1, "hello");
+        drop(calls);
+
+        // Should be cleared after flush
+        assert!(app.pending_literal_keys.is_none());
+    }
+
+    #[tokio::test]
+    async fn flush_pending_keys_noop_when_empty() {
+        let mut app = test_app();
+        // No pending keys — should not panic
+        app.flush_pending_keys().await;
+        assert!(app.pending_literal_keys.is_none());
+    }
+
+    // ── Mouse down outside preview in Attached mode detaches ──
+
+    #[test]
+    fn mouse_down_outside_preview_detaches() {
+        let sessions = vec![make_session("s1", AgentType::Claude)];
+        let mut app = test_app_with_sessions(sessions);
+        app.mode = Mode::Attached;
+
+        // Set up layout areas
+        app.sidebar_area.set(Rect::new(0, 0, 30, 24));
+        app.preview_area.set(Rect::new(30, 0, 50, 24));
+
+        // Mouse down in sidebar (outside preview) should detach
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        app.handle_mouse(mouse);
+        assert_eq!(app.mode, Mode::Browse, "mouse down outside preview should detach");
+    }
+
+    // ── log_elapsed used in Idle status when log says working ──
+
+    #[tokio::test]
+    async fn refresh_sessions_log_elapsed_used_in_idle_status() {
+        let sessions = vec![make_session("s1", AgentType::Claude)];
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(MockSessionManager::with_sessions(sessions)),
+        );
+
+        // Set up stats where user asked something recently but no assistant reply yet
+        // (task_elapsed() returns Some when last_user > last_assistant)
+        let mut stats = crate::logs::SessionStats::default();
+        let now = chrono::Utc::now();
+        stats.last_user_ts = Some(
+            (now - chrono::Duration::seconds(5))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+        // No assistant reply → task_elapsed() returns Some(duration)
+        app.session_stats
+            .insert("hydra-testid-s1".to_string(), stats);
+
+        // Run enough ticks to get to Idle (14 ticks: 1 first_capture + 12 unchanged + 1 to cross threshold)
+        // Because stats say log_idle=false (task_elapsed is Some), threshold is 12
+        for _ in 0..14 {
+            app.refresh_sessions().await;
+        }
+
+        // Session should be Idle now (pane is unchanged)
+        assert_eq!(app.sessions[0].status, SessionStatus::Idle);
+
+        // But since log_elapsed is Some, the task_elapsed should reflect log data
+        // (The session has task_elapsed = log_elapsed because the log says agent is working)
+        assert!(app.sessions[0].task_elapsed.is_some(), "log_elapsed should be used for Idle status");
+    }
+
+    // ── normalize_capture: ESC without bracket ──
+
+    #[test]
+    fn normalize_capture_bare_esc_skipped() {
+        // ESC not followed by '[' — should skip just the ESC
+        let input = "\x1bother text";
+        let result = super::normalize_capture(input);
+        assert_eq!(result, "other text");
     }
 
 }
