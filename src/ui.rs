@@ -95,7 +95,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     // `selected_visual_row` maps app.selected (session index) to the
     // visual row in the list (accounting for header items).
     let inner_width = list_area.width.saturating_sub(2) as usize; // inside border
-    let dim = Style::default().fg(Color::White);
+    let subtle = Style::default();
     let mut items: Vec<ListItem> = Vec::new();
     let mut selected_visual_row: usize = 0;
     let mut current_group: Option<u8> = None;
@@ -108,14 +108,13 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             let label = format!(" {} ", session.status);
             let dot_color = status_color(&session.status);
             let dashes_left = "── ";
-            let dashes_right_len = inner_width
-                .saturating_sub(dashes_left.len() + 2 + label.len()); // 2 for "● "
+            let dashes_right_len = inner_width.saturating_sub(dashes_left.len() + 2 + label.len()); // 2 for "● "
             let dashes_right: String = "─".repeat(dashes_right_len);
             let header_spans = vec![
-                Span::styled(dashes_left, dim),
+                Span::styled(dashes_left, subtle),
                 Span::styled("● ", Style::default().fg(dot_color)),
-                Span::styled(label, Style::default().fg(Color::White)),
-                Span::styled(dashes_right, dim),
+                Span::styled(label, Style::default()),
+                Span::styled(dashes_right, subtle),
             ];
             items.push(ListItem::new(Line::from(header_spans)));
         }
@@ -130,17 +129,20 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default()
         };
         let mut spans = vec![
             Span::styled(marker, name_style),
             Span::styled("● ", Style::default().fg(status_color(&session.status))),
-            Span::styled(format!("{} [{}]", session.name, session.agent_type), name_style),
+            Span::styled(
+                format!("{} [{}]", session.name, session.agent_type),
+                name_style,
+            ),
         ];
         if let Some(elapsed) = session.task_elapsed {
             spans.push(Span::styled(
                 format!(" {}", format_duration(elapsed)),
-                Style::default().fg(Color::White),
+                Style::default(),
             ));
         }
         let mut lines = vec![Line::from(spans)];
@@ -152,10 +154,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 format!("     {msg}")
             };
-            lines.push(Line::from(Span::styled(
-                display,
-                Style::default().fg(Color::White),
-            )));
+            lines.push(Line::from(Span::styled(display, Style::default())));
         }
         items.push(ListItem::new(lines));
     }
@@ -200,12 +199,14 @@ fn truncate_chars(s: &str, max: usize) -> String {
 ///    app.rs       +45-12
 ///    ui.rs        +30-5
 ///   README.md     +3
-pub fn build_diff_tree_lines(diff_files: &[crate::app::DiffFile], width: usize) -> Vec<Line<'static>> {
+pub fn build_diff_tree_lines(
+    diff_files: &[crate::app::DiffFile],
+    width: usize,
+) -> Vec<Line<'static>> {
     if diff_files.is_empty() {
         return vec![];
     }
 
-    let dim = Style::default().fg(Color::White);
     let green = Style::default().fg(Color::Green);
     let red = Style::default().fg(Color::Red);
     let cyan = Style::default().fg(Color::Cyan);
@@ -241,7 +242,10 @@ pub fn build_diff_tree_lines(diff_files: &[crate::app::DiffFile], width: usize) 
                 } else {
                     d.to_string()
                 };
-                lines.push(Line::from(Span::styled(format!(" {display}"), dim)));
+                lines.push(Line::from(Span::styled(
+                    format!(" {display}"),
+                    Style::default(),
+                )));
             }
             current_dir = Some(dir_str);
         }
@@ -274,9 +278,10 @@ pub fn build_diff_tree_lines(diff_files: &[crate::app::DiffFile], width: usize) 
         let padding = inner_w.saturating_sub(prefix_len + name_chars + stat_len);
         let pad_str: String = " ".repeat(padding);
 
-        let mut spans = vec![
-            Span::styled(format!("{indent}{name}{pad_str}"), Style::default().fg(Color::White)),
-        ];
+        let mut spans = vec![Span::styled(
+            format!("{indent}{name}{pad_str}"),
+            Style::default(),
+        )];
 
         if f.untracked {
             spans.push(Span::styled("new", cyan));
@@ -331,11 +336,14 @@ fn draw_stats(frame: &mut Frame, app: &App, area: Rect) {
     // Edits are hydra-specific (per-session)
     let total_edits: u16 = app.session_stats.values().map(|s| s.edits).sum();
 
-    let dim = Style::default().fg(Color::White);
-    let val = Style::default().fg(Color::White);
+    let val = Style::default();
 
     // Total diff across all files
-    let total_diff: u32 = app.diff_files.iter().map(|f| f.insertions + f.deletions).sum();
+    let total_diff: u32 = app
+        .diff_files
+        .iter()
+        .map(|f| f.insertions + f.deletions)
+        .sum();
 
     let mut spans = vec![
         Span::styled(format_cost(total_cost), Style::default().fg(Color::Green)),
@@ -344,7 +352,7 @@ fn draw_stats(frame: &mut Frame, app: &App, area: Rect) {
     ];
 
     if total_diff > 0 {
-        spans.push(Span::styled(format!(" Δ{total_diff}"), dim));
+        spans.push(Span::styled(format!(" Δ{total_diff}"), val));
     }
 
     let line = Line::from(spans);
@@ -365,18 +373,48 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
         " Preview ".to_string()
     };
 
-    let (border_style, border_type) = if app.mode == Mode::Attached {
-        (
-            Style::default()
-                .fg(Color::LightGreen)
-                .add_modifier(Modifier::BOLD),
-            BorderType::Double,
-        )
+    let mut preview_area = area;
+    let (border_style, border_type, border_title) = if app.mode == Mode::Attached {
+        let active_style = Style::default()
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD);
+
+        // Use three nested borders in attached mode so the active pane is obvious.
+        if area.width >= 7 && area.height >= 7 {
+            let attached_title = if let Some(session) = app.sessions.get(app.selected) {
+                format!(" {} [ATTACHED] ", session.name)
+            } else {
+                " Preview [ATTACHED] ".to_string()
+            };
+
+            frame.render_widget(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Thick)
+                    .title(attached_title)
+                    .border_style(active_style),
+                area,
+            );
+
+            let middle_area = inset_rect(area, 1);
+            frame.render_widget(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(active_style),
+                middle_area,
+            );
+
+            preview_area = inset_rect(area, 2);
+            (active_style, BorderType::Plain, String::new())
+        } else {
+            (active_style, BorderType::Double, title)
+        }
     } else {
-        (Style::default().fg(Color::Cyan), BorderType::Plain)
+        (Style::default().fg(Color::Cyan), BorderType::Plain, title)
     };
 
-    let inner_height = area.height.saturating_sub(2) as u16;
+    let inner_height = preview_area.height.saturating_sub(2);
     let total_lines = app.preview.lines().count() as u16;
     let max_scroll_offset = total_lines.saturating_sub(inner_height);
     let capped_offset = app.preview_scroll_offset.min(max_scroll_offset);
@@ -387,19 +425,17 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(border_type)
-                .title(title)
+                .title(border_title)
                 .border_style(border_style),
         )
         .scroll((scroll_y, 0));
 
-    frame.render_widget(preview, area);
+    frame.render_widget(preview, preview_area);
 }
 
 fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
     let help_text = match app.mode {
-        Mode::Browse if !app.mouse_captured => {
-            "SELECT TEXT TO COPY  |  c: exit copy mode"
-        }
+        Mode::Browse if !app.mouse_captured => "SELECT TEXT TO COPY  |  c: exit copy mode",
         Mode::Browse => "j/k: navigate  Enter: attach  n: new  d: delete  c: copy  q: quit",
         Mode::Attached => "Esc: detach  (keys forwarded to session)",
         Mode::NewSessionAgent => "j/k: select agent  Enter: confirm  Esc: cancel",
@@ -429,6 +465,16 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, width.min(area.width), height.min(area.height))
 }
 
+fn inset_rect(area: Rect, margin: u16) -> Rect {
+    let double = margin.saturating_mul(2);
+    Rect::new(
+        area.x.saturating_add(margin),
+        area.y.saturating_add(margin),
+        area.width.saturating_sub(double),
+        area.height.saturating_sub(double),
+    )
+}
+
 fn draw_agent_select(frame: &mut Frame, app: &App) {
     let agents = AgentType::all();
     let height = agents.len() as u16 + 2;
@@ -450,7 +496,7 @@ fn draw_agent_select(frame: &mut Frame, app: &App) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default()
             };
             ListItem::new(Line::from(Span::styled(label, style)))
         })
@@ -617,9 +663,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         let mut app = make_app();
-        app.sessions = vec![
-            make_session("doomed-session", AgentType::Claude),
-        ];
+        app.sessions = vec![make_session("doomed-session", AgentType::Claude)];
         app.selected = 0;
         app.mode = Mode::ConfirmDelete;
 
@@ -635,9 +679,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         let mut app = make_app();
-        app.sessions = vec![
-            make_session("active-session", AgentType::Claude),
-        ];
+        app.sessions = vec![make_session("active-session", AgentType::Claude)];
         app.selected = 0;
         app.mode = Mode::Attached;
         app.preview = "$ claude\nHello, how can I help?".to_string();
@@ -754,7 +796,10 @@ mod tests {
         app.sessions = vec![make_session("s1", AgentType::Claude)];
         app.selected = 0;
         // Create content taller than the preview area
-        app.preview = (0..50).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        app.preview = (0..50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         app.preview_scroll_offset = 10;
 
         terminal.draw(|f| super::draw(f, &app)).unwrap();
@@ -797,9 +842,18 @@ mod tests {
 
     #[test]
     fn status_color_maps_correctly() {
-        assert_eq!(super::status_color(&SessionStatus::Idle), ratatui::style::Color::Green);
-        assert_eq!(super::status_color(&SessionStatus::Running), ratatui::style::Color::Red);
-        assert_eq!(super::status_color(&SessionStatus::Exited), ratatui::style::Color::Yellow);
+        assert_eq!(
+            super::status_color(&SessionStatus::Idle),
+            ratatui::style::Color::Green
+        );
+        assert_eq!(
+            super::status_color(&SessionStatus::Running),
+            ratatui::style::Color::Red
+        );
+        assert_eq!(
+            super::status_color(&SessionStatus::Exited),
+            ratatui::style::Color::Yellow
+        );
     }
 
     #[test]
@@ -809,7 +863,7 @@ mod tests {
         assert_eq!(result.width, 40);
         assert_eq!(result.height, 10);
         assert_eq!(result.x, 20); // (80 - 40) / 2
-        assert_eq!(result.y, 7);  // (24 - 10) / 2
+        assert_eq!(result.y, 7); // (24 - 10) / 2
     }
 
     #[test]
@@ -882,8 +936,18 @@ mod tests {
     #[test]
     fn diff_tree_with_directory() {
         let files = vec![
-            crate::app::DiffFile { path: "src/app.rs".into(), insertions: 10, deletions: 2, untracked: false },
-            crate::app::DiffFile { path: "src/ui.rs".into(), insertions: 5, deletions: 0, untracked: false },
+            crate::app::DiffFile {
+                path: "src/app.rs".into(),
+                insertions: 10,
+                deletions: 2,
+                untracked: false,
+            },
+            crate::app::DiffFile {
+                path: "src/ui.rs".into(),
+                insertions: 5,
+                deletions: 0,
+                untracked: false,
+            },
         ];
         let lines = super::build_diff_tree_lines(&files, 40);
         // 1 directory header + 2 files
@@ -893,8 +957,18 @@ mod tests {
     #[test]
     fn diff_tree_multiple_directories() {
         let files = vec![
-            crate::app::DiffFile { path: "src/app.rs".into(), insertions: 1, deletions: 0, untracked: false },
-            crate::app::DiffFile { path: "tests/cli.rs".into(), insertions: 2, deletions: 1, untracked: false },
+            crate::app::DiffFile {
+                path: "src/app.rs".into(),
+                insertions: 1,
+                deletions: 0,
+                untracked: false,
+            },
+            crate::app::DiffFile {
+                path: "tests/cli.rs".into(),
+                insertions: 2,
+                deletions: 1,
+                untracked: false,
+            },
         ];
         let lines = super::build_diff_tree_lines(&files, 40);
         // 2 directory headers + 2 files
@@ -965,8 +1039,18 @@ mod tests {
     #[test]
     fn diff_tree_mixed_tracked_and_untracked() {
         let files = vec![
-            crate::app::DiffFile { path: "src/app.rs".into(), insertions: 10, deletions: 2, untracked: false },
-            crate::app::DiffFile { path: "src/new.rs".into(), insertions: 0, deletions: 0, untracked: true },
+            crate::app::DiffFile {
+                path: "src/app.rs".into(),
+                insertions: 10,
+                deletions: 2,
+                untracked: false,
+            },
+            crate::app::DiffFile {
+                path: "src/new.rs".into(),
+                insertions: 0,
+                deletions: 0,
+                untracked: true,
+            },
         ];
         let lines = super::build_diff_tree_lines(&files, 40);
         // 1 directory header + 2 files
@@ -993,9 +1077,12 @@ mod tests {
         app.session_stats
             .insert("hydra-testproj-worker-1".to_string(), stats);
 
-        app.diff_files = vec![
-            crate::app::DiffFile { path: "old.rs".into(), insertions: 0, deletions: 20, untracked: false },
-        ];
+        app.diff_files = vec![crate::app::DiffFile {
+            path: "old.rs".into(),
+            insertions: 0,
+            deletions: 20,
+            untracked: false,
+        }];
 
         terminal.draw(|f| super::draw(f, &app)).unwrap();
         let output = buffer_to_string(&terminal);
@@ -1009,9 +1096,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         let mut app = make_app();
-        app.sessions = vec![
-            make_session("worker-1", AgentType::Claude),
-        ];
+        app.sessions = vec![make_session("worker-1", AgentType::Claude)];
         app.selected = 0;
         app.preview = "some preview content".to_string();
 
@@ -1026,20 +1111,42 @@ mod tests {
         stats1.turns = 12;
         stats1.edits = 5;
         stats1.bash_cmds = 3;
-        app.session_stats.insert("hydra-testproj-worker-1".to_string(), stats1);
+        app.session_stats
+            .insert("hydra-testproj-worker-1".to_string(), stats1);
 
         let mut stats2 = crate::logs::SessionStats::default();
         stats2.turns = 8;
         stats2.edits = 3;
         stats2.bash_cmds = 2;
-        app.session_stats.insert("hydra-testproj-worker-2".to_string(), stats2);
+        app.session_stats
+            .insert("hydra-testproj-worker-2".to_string(), stats2);
 
         // Per-file git diff stats
         app.diff_files = vec![
-            crate::app::DiffFile { path: "src/app.rs".into(), insertions: 45, deletions: 12, untracked: false },
-            crate::app::DiffFile { path: "src/ui.rs".into(), insertions: 30, deletions: 5, untracked: false },
-            crate::app::DiffFile { path: "README.md".into(), insertions: 8, deletions: 0, untracked: false },
-            crate::app::DiffFile { path: "src/new_mod.rs".into(), insertions: 0, deletions: 0, untracked: true },
+            crate::app::DiffFile {
+                path: "src/app.rs".into(),
+                insertions: 45,
+                deletions: 12,
+                untracked: false,
+            },
+            crate::app::DiffFile {
+                path: "src/ui.rs".into(),
+                insertions: 30,
+                deletions: 5,
+                untracked: false,
+            },
+            crate::app::DiffFile {
+                path: "README.md".into(),
+                insertions: 8,
+                deletions: 0,
+                untracked: false,
+            },
+            crate::app::DiffFile {
+                path: "src/new_mod.rs".into(),
+                insertions: 0,
+                deletions: 0,
+                untracked: true,
+            },
         ];
 
         terminal.draw(|f| super::draw(f, &app)).unwrap();
@@ -1061,7 +1168,10 @@ mod tests {
         }];
         // Width narrow enough to force truncation
         let lines = super::build_diff_tree_lines(&files, 10);
-        assert!(!lines.is_empty(), "should produce lines for UTF-8 filenames");
+        assert!(
+            !lines.is_empty(),
+            "should produce lines for UTF-8 filenames"
+        );
     }
 
     #[test]

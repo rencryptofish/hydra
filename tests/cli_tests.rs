@@ -9,8 +9,7 @@ use predicates::prelude::*;
 fn test_ls_runs() {
     let mut cmd = Command::cargo_bin("hydra").unwrap();
     cmd.arg("ls");
-    cmd.assert()
-        .success();
+    cmd.assert().success();
 }
 
 /// Test that `hydra --help` shows usage information.
@@ -58,6 +57,5 @@ fn test_new_invalid_agent() {
 fn test_unknown_subcommand() {
     let mut cmd = Command::cargo_bin("hydra").unwrap();
     cmd.arg("foobar");
-    cmd.assert()
-        .failure();
+    cmd.assert().failure();
 }

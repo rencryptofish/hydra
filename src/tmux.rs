@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::process::Command;
@@ -73,13 +73,16 @@ impl TmuxSessionManager {
     }
 }
 
+fn prune_agent_cache(cache: &mut HashMap<String, AgentType>, live_sessions: &HashSet<String>) {
+    cache.retain(|tmux_name, _| live_sessions.contains(tmux_name));
+}
+
 #[async_trait::async_trait]
 impl SessionManager for TmuxSessionManager {
     async fn list_sessions(&self, project_id: &str) -> Result<Vec<Session>> {
-        let output = run_cmd_timeout(
-            Command::new("tmux").args(["list-sessions", "-F", "#{session_name}"]),
-        )
-        .await;
+        let output =
+            run_cmd_timeout(Command::new("tmux").args(["list-sessions", "-F", "#{session_name}"]))
+                .await;
 
         let output = match output {
             Ok(o) => o,
@@ -93,6 +96,15 @@ impl SessionManager for TmuxSessionManager {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let prefix = format!("hydra-{project_id}-");
+        let live_sessions: HashSet<String> = stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(|line| line.to_string())
+            .collect();
+
+        // Keep cache aligned with live tmux sessions to avoid unbounded growth.
+        prune_agent_cache(&mut self.agent_cache.lock().unwrap(), &live_sessions);
 
         // Pass 1: Parse session names and resolve agent types (cached, no subprocess)
         let mut parsed: Vec<(String, String, AgentType)> = Vec::new();
@@ -111,8 +123,7 @@ impl SessionManager for TmuxSessionManager {
                 match cached {
                     Some(a) => a,
                     None => {
-                        let agent =
-                            get_agent_type(tmux_name).await.unwrap_or(AgentType::Claude);
+                        let agent = get_agent_type(tmux_name).await.unwrap_or(AgentType::Claude);
                         self.agent_cache
                             .lock()
                             .unwrap()
@@ -126,7 +137,9 @@ impl SessionManager for TmuxSessionManager {
         }
 
         // Pass 2: Run all is_pane_dead checks in parallel
-        let dead_futures = parsed.iter().map(|(_, tmux_name, _)| is_pane_dead(tmux_name));
+        let dead_futures = parsed
+            .iter()
+            .map(|(_, tmux_name, _)| is_pane_dead(tmux_name));
         let dead_results = futures::future::join_all(dead_futures).await;
 
         let sessions = parsed
@@ -179,7 +192,9 @@ impl SessionManager for TmuxSessionManager {
     }
 
     async fn kill_session(&self, tmux_name: &str) -> Result<()> {
-        kill_session(tmux_name).await
+        kill_session(tmux_name).await?;
+        self.agent_cache.lock().unwrap().remove(tmux_name);
+        Ok(())
     }
 
     async fn send_keys(&self, tmux_name: &str, key: &str) -> Result<()> {
@@ -199,9 +214,13 @@ impl SessionManager for TmuxSessionManager {
 /// Returns `true` when the session can't be queried (gone/dead) — a session
 /// we can't reach is effectively dead rather than silently "Idle".
 async fn is_pane_dead(tmux_name: &str) -> bool {
-    let output = run_cmd_timeout(
-        Command::new("tmux").args(["list-panes", "-t", tmux_name, "-F", "#{pane_dead}"]),
-    )
+    let output = run_cmd_timeout(Command::new("tmux").args([
+        "list-panes",
+        "-t",
+        tmux_name,
+        "-F",
+        "#{pane_dead}",
+    ]))
     .await;
 
     match output {
@@ -215,9 +234,12 @@ async fn is_pane_dead(tmux_name: &str) -> bool {
 
 /// Read the HYDRA_AGENT_TYPE env var from the tmux session.
 async fn get_agent_type(tmux_name: &str) -> Option<AgentType> {
-    let output = run_cmd_timeout(
-        Command::new("tmux").args(["show-environment", "-t", tmux_name, "HYDRA_AGENT_TYPE"]),
-    )
+    let output = run_cmd_timeout(Command::new("tmux").args([
+        "show-environment",
+        "-t",
+        tmux_name,
+        "HYDRA_AGENT_TYPE",
+    ]))
     .await
     .ok()?;
 
@@ -256,9 +278,13 @@ pub async fn create_session(
     }
 
     // Keep pane alive after command exits so we can detect Exited status
-    let _ = run_status_timeout(
-        Command::new("tmux").args(["set-option", "-t", &tmux_name, "remain-on-exit", "on"]),
-    )
+    let _ = run_status_timeout(Command::new("tmux").args([
+        "set-option",
+        "-t",
+        &tmux_name,
+        "remain-on-exit",
+        "on",
+    ]))
     .await;
 
     // Store agent type as env var on the session
@@ -276,11 +302,10 @@ pub async fn create_session(
 
 /// Capture the current pane content of a tmux session.
 pub async fn capture_pane(tmux_name: &str) -> Result<String> {
-    let output = run_cmd_timeout(
-        Command::new("tmux").args(["capture-pane", "-t", tmux_name, "-p"]),
-    )
-    .await
-    .context("Failed to capture tmux pane")?;
+    let output =
+        run_cmd_timeout(Command::new("tmux").args(["capture-pane", "-t", tmux_name, "-p"]))
+            .await
+            .context("Failed to capture tmux pane")?;
 
     if !output.status.success() {
         return Ok(String::from("[session not available]"));
@@ -411,11 +436,9 @@ fn apply_tmux_modifiers(base: &str, modifiers: crossterm::event::KeyModifiers) -
 
 /// Kill a tmux session.
 pub async fn kill_session(tmux_name: &str) -> Result<()> {
-    let status = run_status_timeout(
-        Command::new("tmux").args(["kill-session", "-t", tmux_name]),
-    )
-    .await
-    .context("Failed to kill tmux session")?;
+    let status = run_status_timeout(Command::new("tmux").args(["kill-session", "-t", tmux_name]))
+        .await
+        .context("Failed to kill tmux session")?;
 
     if !status.success() {
         bail!("tmux kill-session failed for '{tmux_name}'");
@@ -433,76 +456,136 @@ mod tests {
 
     #[test]
     fn char_key_no_modifiers() {
-        assert_eq!(keycode_to_tmux(KeyCode::Char('a'), KeyModifiers::NONE), Some("a".into()));
+        assert_eq!(
+            keycode_to_tmux(KeyCode::Char('a'), KeyModifiers::NONE),
+            Some("a".into())
+        );
     }
 
     #[test]
     fn char_key_uppercase() {
-        assert_eq!(keycode_to_tmux(KeyCode::Char('A'), KeyModifiers::SHIFT), Some("A".into()));
+        assert_eq!(
+            keycode_to_tmux(KeyCode::Char('A'), KeyModifiers::SHIFT),
+            Some("A".into())
+        );
     }
 
     #[test]
     fn char_key_ctrl() {
-        assert_eq!(keycode_to_tmux(KeyCode::Char('c'), KeyModifiers::CONTROL), Some("C-c".into()));
+        assert_eq!(
+            keycode_to_tmux(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Some("C-c".into())
+        );
     }
 
     #[test]
     fn char_key_alt() {
-        assert_eq!(keycode_to_tmux(KeyCode::Char('x'), KeyModifiers::ALT), Some("M-x".into()));
+        assert_eq!(
+            keycode_to_tmux(KeyCode::Char('x'), KeyModifiers::ALT),
+            Some("M-x".into())
+        );
     }
 
     // ── keycode_to_tmux: special keys ────────────────────────────────
 
     #[test]
     fn enter_key() {
-        assert_eq!(keycode_to_tmux(KeyCode::Enter, KeyModifiers::NONE), Some("Enter".into()));
+        assert_eq!(
+            keycode_to_tmux(KeyCode::Enter, KeyModifiers::NONE),
+            Some("Enter".into())
+        );
     }
 
     #[test]
     fn backspace_key() {
-        assert_eq!(keycode_to_tmux(KeyCode::Backspace, KeyModifiers::NONE), Some("BSpace".into()));
+        assert_eq!(
+            keycode_to_tmux(KeyCode::Backspace, KeyModifiers::NONE),
+            Some("BSpace".into())
+        );
     }
 
     #[test]
     fn tab_key() {
-        assert_eq!(keycode_to_tmux(KeyCode::Tab, KeyModifiers::NONE), Some("Tab".into()));
+        assert_eq!(
+            keycode_to_tmux(KeyCode::Tab, KeyModifiers::NONE),
+            Some("Tab".into())
+        );
     }
 
     #[test]
     fn backtab_key() {
-        assert_eq!(keycode_to_tmux(KeyCode::BackTab, KeyModifiers::NONE), Some("BTab".into()));
+        assert_eq!(
+            keycode_to_tmux(KeyCode::BackTab, KeyModifiers::NONE),
+            Some("BTab".into())
+        );
     }
 
     #[test]
     fn arrow_keys() {
-        assert_eq!(keycode_to_tmux(KeyCode::Up, KeyModifiers::NONE), Some("Up".into()));
-        assert_eq!(keycode_to_tmux(KeyCode::Down, KeyModifiers::NONE), Some("Down".into()));
-        assert_eq!(keycode_to_tmux(KeyCode::Left, KeyModifiers::NONE), Some("Left".into()));
-        assert_eq!(keycode_to_tmux(KeyCode::Right, KeyModifiers::NONE), Some("Right".into()));
+        assert_eq!(
+            keycode_to_tmux(KeyCode::Up, KeyModifiers::NONE),
+            Some("Up".into())
+        );
+        assert_eq!(
+            keycode_to_tmux(KeyCode::Down, KeyModifiers::NONE),
+            Some("Down".into())
+        );
+        assert_eq!(
+            keycode_to_tmux(KeyCode::Left, KeyModifiers::NONE),
+            Some("Left".into())
+        );
+        assert_eq!(
+            keycode_to_tmux(KeyCode::Right, KeyModifiers::NONE),
+            Some("Right".into())
+        );
     }
 
     #[test]
     fn home_end_keys() {
-        assert_eq!(keycode_to_tmux(KeyCode::Home, KeyModifiers::NONE), Some("Home".into()));
-        assert_eq!(keycode_to_tmux(KeyCode::End, KeyModifiers::NONE), Some("End".into()));
+        assert_eq!(
+            keycode_to_tmux(KeyCode::Home, KeyModifiers::NONE),
+            Some("Home".into())
+        );
+        assert_eq!(
+            keycode_to_tmux(KeyCode::End, KeyModifiers::NONE),
+            Some("End".into())
+        );
     }
 
     #[test]
     fn page_up_down_keys() {
-        assert_eq!(keycode_to_tmux(KeyCode::PageUp, KeyModifiers::NONE), Some("PageUp".into()));
-        assert_eq!(keycode_to_tmux(KeyCode::PageDown, KeyModifiers::NONE), Some("PageDown".into()));
+        assert_eq!(
+            keycode_to_tmux(KeyCode::PageUp, KeyModifiers::NONE),
+            Some("PageUp".into())
+        );
+        assert_eq!(
+            keycode_to_tmux(KeyCode::PageDown, KeyModifiers::NONE),
+            Some("PageDown".into())
+        );
     }
 
     #[test]
     fn delete_insert_keys() {
-        assert_eq!(keycode_to_tmux(KeyCode::Delete, KeyModifiers::NONE), Some("DC".into()));
-        assert_eq!(keycode_to_tmux(KeyCode::Insert, KeyModifiers::NONE), Some("IC".into()));
+        assert_eq!(
+            keycode_to_tmux(KeyCode::Delete, KeyModifiers::NONE),
+            Some("DC".into())
+        );
+        assert_eq!(
+            keycode_to_tmux(KeyCode::Insert, KeyModifiers::NONE),
+            Some("IC".into())
+        );
     }
 
     #[test]
     fn function_keys() {
-        assert_eq!(keycode_to_tmux(KeyCode::F(1), KeyModifiers::NONE), Some("F1".into()));
-        assert_eq!(keycode_to_tmux(KeyCode::F(12), KeyModifiers::NONE), Some("F12".into()));
+        assert_eq!(
+            keycode_to_tmux(KeyCode::F(1), KeyModifiers::NONE),
+            Some("F1".into())
+        );
+        assert_eq!(
+            keycode_to_tmux(KeyCode::F(12), KeyModifiers::NONE),
+            Some("F12".into())
+        );
     }
 
     #[test]
@@ -514,17 +597,26 @@ mod tests {
 
     #[test]
     fn ctrl_arrow() {
-        assert_eq!(keycode_to_tmux(KeyCode::Up, KeyModifiers::CONTROL), Some("C-Up".into()));
+        assert_eq!(
+            keycode_to_tmux(KeyCode::Up, KeyModifiers::CONTROL),
+            Some("C-Up".into())
+        );
     }
 
     #[test]
     fn alt_arrow() {
-        assert_eq!(keycode_to_tmux(KeyCode::Left, KeyModifiers::ALT), Some("M-Left".into()));
+        assert_eq!(
+            keycode_to_tmux(KeyCode::Left, KeyModifiers::ALT),
+            Some("M-Left".into())
+        );
     }
 
     #[test]
     fn shift_arrow() {
-        assert_eq!(keycode_to_tmux(KeyCode::Right, KeyModifiers::SHIFT), Some("S-Right".into()));
+        assert_eq!(
+            keycode_to_tmux(KeyCode::Right, KeyModifiers::SHIFT),
+            Some("S-Right".into())
+        );
     }
 
     #[test]
@@ -563,7 +655,10 @@ mod tests {
 
     #[test]
     fn apply_ctrl_only() {
-        assert_eq!(apply_tmux_modifiers("Left", KeyModifiers::CONTROL), "C-Left");
+        assert_eq!(
+            apply_tmux_modifiers("Left", KeyModifiers::CONTROL),
+            "C-Left"
+        );
     }
 
     #[test]
@@ -580,5 +675,24 @@ mod tests {
         let mgr = TmuxSessionManager::new();
         let cache = mgr.agent_cache.lock().unwrap();
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn prune_agent_cache_removes_non_live_entries() {
+        let mut cache = HashMap::new();
+        cache.insert("hydra-a-one".to_string(), AgentType::Claude);
+        cache.insert("hydra-a-two".to_string(), AgentType::Codex);
+        cache.insert("hydra-a-stale".to_string(), AgentType::Claude);
+
+        let live: HashSet<String> = ["hydra-a-one", "hydra-a-two"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        prune_agent_cache(&mut cache, &live);
+
+        assert_eq!(cache.len(), 2);
+        assert!(cache.contains_key("hydra-a-one"));
+        assert!(cache.contains_key("hydra-a-two"));
+        assert!(!cache.contains_key("hydra-a-stale"));
     }
 }

@@ -112,7 +112,7 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
     app.refresh_sessions().await;
     app.refresh_preview().await;
 
-    let mut events = EventHandler::new(Duration::from_millis(250));
+    let mut events = EventHandler::new(Duration::from_millis(100));
     let mut prev_mouse_captured = true;
 
     // Draw initial frame before entering event loop
@@ -179,4 +179,3 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
 
     Ok(())
 }
-

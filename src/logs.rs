@@ -45,6 +45,10 @@ pub struct SessionStats {
     pub read_offset: u64,
 }
 
+/// Upper bound for per-session touched file history.
+/// Keeps enough history for real projects while preventing unbounded growth.
+const MAX_SESSION_TRACKED_FILES: usize = 4096;
+
 impl SessionStats {
     #[cfg(test)]
     pub fn cost_usd(&self) -> f64 {
@@ -87,11 +91,24 @@ impl SessionStats {
 
     /// Record a file touch, updating both the dedup set and recency order.
     pub fn touch_file(&mut self, path: String) {
-        self.files.insert(path.clone());
-        // Move to end (most recent) by removing old position
+        // Existing path: move it to the end (most recent).
         if let Some(pos) = self.recent_files.iter().position(|f| f == &path) {
             self.recent_files.remove(pos);
+            self.recent_files.push(path);
+            return;
         }
+
+        // New path: evict oldest entries when at capacity.
+        while self.recent_files.len() >= MAX_SESSION_TRACKED_FILES {
+            if let Some(evicted) = self.recent_files.first().cloned() {
+                self.recent_files.remove(0);
+                self.files.remove(&evicted);
+            } else {
+                break;
+            }
+        }
+
+        self.files.insert(path.clone());
         self.recent_files.push(path);
     }
 }
@@ -177,7 +194,10 @@ fn update_session_stats_from_path(path: &std::path::Path, stats: &mut SessionSta
         }
 
         // Fast path: user messages — track timestamp for task-start timing
-        if line.contains("\"user\"") && line.contains("\"timestamp\"") && !line.contains("\"usage\"") {
+        if line.contains("\"user\"")
+            && line.contains("\"timestamp\"")
+            && !line.contains("\"usage\"")
+        {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 if v.get("type").and_then(|t| t.as_str()) == Some("user") {
                     if let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()) {
@@ -261,17 +281,50 @@ fn update_session_stats_from_path(path: &std::path::Path, stats: &mut SessionSta
     stats.read_offset = file_len;
 }
 
-/// Machine-wide stats for today, aggregated across all Claude Code JSONL logs.
+const FILE_DISCOVERY_INTERVAL_SECS: i64 = 30;
+
+// Uses OpenAI's published GPT-5 Codex token pricing as an estimate.
+const CODEX_INPUT_USD_PER_MTOK: f64 = 1.25;
+const CODEX_OUTPUT_USD_PER_MTOK: f64 = 10.0;
+const CODEX_CACHE_READ_USD_PER_MTOK: f64 = 0.125;
+
+#[derive(Debug, Clone, Default)]
+struct CodexFileState {
+    read_offset: u64,
+    last_total_tokens: u64,
+    last_input_tokens: u64,
+    last_output_tokens: u64,
+    last_cached_input_tokens: u64,
+}
+
+/// Machine-wide stats for today, aggregated across Claude and Codex logs.
 /// Updated incrementally — only new bytes are parsed on each refresh.
 #[derive(Debug, Clone)]
 pub struct GlobalStats {
+    // Aggregate totals displayed in the UI.
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub tokens_cache_read: u64,
     pub tokens_cache_write: u64,
-    /// Per-file read offsets for incremental reading
+    // Provider breakdown used for cost calculations.
+    pub claude_tokens_in: u64,
+    pub claude_tokens_out: u64,
+    pub claude_tokens_cache_read: u64,
+    pub claude_tokens_cache_write: u64,
+    pub codex_tokens_in: u64,
+    pub codex_tokens_out: u64,
+    pub codex_tokens_cache_read: u64,
+    /// Per-file read offsets for incremental Claude log reading.
     file_offsets: HashMap<PathBuf, u64>,
-    /// Date string (YYYY-MM-DD) these stats are for; reset when date changes
+    /// Per-file incremental state for Codex token_count parsing.
+    codex_file_states: HashMap<PathBuf, CodexFileState>,
+    /// Cached file list to avoid recursive scans on every refresh.
+    known_claude_files: Vec<PathBuf>,
+    /// Cached file list to avoid recursive scans on every refresh.
+    known_codex_files: Vec<PathBuf>,
+    /// Unix timestamp of last recursive file discovery.
+    last_file_discovery_ts: i64,
+    /// Date string (YYYY-MM-DD) these stats are for; reset when date changes.
     date: String,
 }
 
@@ -282,25 +335,70 @@ impl Default for GlobalStats {
             tokens_out: 0,
             tokens_cache_read: 0,
             tokens_cache_write: 0,
+            claude_tokens_in: 0,
+            claude_tokens_out: 0,
+            claude_tokens_cache_read: 0,
+            claude_tokens_cache_write: 0,
+            codex_tokens_in: 0,
+            codex_tokens_out: 0,
+            codex_tokens_cache_read: 0,
             file_offsets: HashMap::new(),
+            codex_file_states: HashMap::new(),
+            known_claude_files: Vec::new(),
+            known_codex_files: Vec::new(),
+            last_file_discovery_ts: 0,
             date: String::new(),
         }
     }
 }
 
 impl GlobalStats {
-    /// Estimated cost in USD using Sonnet pricing.
-    /// Input: $3/MTok, Output: $15/MTok, Cache read: $0.30/MTok, Cache write: $3.75/MTok
+    /// Estimated cost in USD using provider-specific pricing.
+    /// Claude: Sonnet ($3 in / $15 out / $0.30 cache-read / $3.75 cache-write per MTok).
+    /// Codex: GPT-5 Codex estimate ($1.25 in / $10 out / $0.125 cache-read per MTok).
     pub fn cost_usd(&self) -> f64 {
-        let input = self.tokens_in as f64 * 3.0 / 1_000_000.0;
-        let output = self.tokens_out as f64 * 15.0 / 1_000_000.0;
-        let cache_read = self.tokens_cache_read as f64 * 0.30 / 1_000_000.0;
-        let cache_write = self.tokens_cache_write as f64 * 3.75 / 1_000_000.0;
-        input + output + cache_read + cache_write
+        let has_breakdown = self.claude_tokens_in > 0
+            || self.claude_tokens_out > 0
+            || self.claude_tokens_cache_read > 0
+            || self.claude_tokens_cache_write > 0
+            || self.codex_tokens_in > 0
+            || self.codex_tokens_out > 0
+            || self.codex_tokens_cache_read > 0;
+
+        // Backward compatibility for tests/older state that only set aggregate fields.
+        if !has_breakdown {
+            let input = self.tokens_in as f64 * 3.0 / 1_000_000.0;
+            let output = self.tokens_out as f64 * 15.0 / 1_000_000.0;
+            let cache_read = self.tokens_cache_read as f64 * 0.30 / 1_000_000.0;
+            let cache_write = self.tokens_cache_write as f64 * 3.75 / 1_000_000.0;
+            return input + output + cache_read + cache_write;
+        }
+
+        let claude_input = self.claude_tokens_in as f64 * 3.0 / 1_000_000.0;
+        let claude_output = self.claude_tokens_out as f64 * 15.0 / 1_000_000.0;
+        let claude_cache_read = self.claude_tokens_cache_read as f64 * 0.30 / 1_000_000.0;
+        let claude_cache_write = self.claude_tokens_cache_write as f64 * 3.75 / 1_000_000.0;
+
+        let codex_uncached_input_tokens = self
+            .codex_tokens_in
+            .saturating_sub(self.codex_tokens_cache_read);
+        let codex_input =
+            codex_uncached_input_tokens as f64 * CODEX_INPUT_USD_PER_MTOK / 1_000_000.0;
+        let codex_output = self.codex_tokens_out as f64 * CODEX_OUTPUT_USD_PER_MTOK / 1_000_000.0;
+        let codex_cache_read =
+            self.codex_tokens_cache_read as f64 * CODEX_CACHE_READ_USD_PER_MTOK / 1_000_000.0;
+
+        claude_input
+            + claude_output
+            + claude_cache_read
+            + claude_cache_write
+            + codex_input
+            + codex_output
+            + codex_cache_read
     }
 }
 
-/// Scan all `~/.claude/projects/*/*.jsonl` files and sum today's token usage.
+/// Scan Claude + Codex logs and sum today's token usage.
 /// Incremental: only reads new bytes per file after the first call.
 /// Resets at midnight (date change).
 pub fn update_global_stats(stats: &mut GlobalStats) {
@@ -312,7 +410,18 @@ pub fn update_global_stats(stats: &mut GlobalStats) {
         stats.tokens_out = 0;
         stats.tokens_cache_read = 0;
         stats.tokens_cache_write = 0;
+        stats.claude_tokens_in = 0;
+        stats.claude_tokens_out = 0;
+        stats.claude_tokens_cache_read = 0;
+        stats.claude_tokens_cache_write = 0;
+        stats.codex_tokens_in = 0;
+        stats.codex_tokens_out = 0;
+        stats.codex_tokens_cache_read = 0;
         stats.file_offsets.clear();
+        stats.codex_file_states.clear();
+        stats.known_claude_files.clear();
+        stats.known_codex_files.clear();
+        stats.last_file_discovery_ts = 0;
         stats.date = today.clone();
     }
 
@@ -325,87 +434,283 @@ fn update_global_stats_inner(
     today: &str,
     base_dir: Option<&std::path::Path>,
 ) {
-    let projects_dir = match base_dir {
-        Some(dir) => dir.to_path_buf(),
+    let (claude_projects_dir, codex_sessions_dir) = match base_dir {
+        Some(dir) => (dir.to_path_buf(), dir.join(".codex").join("sessions")),
         None => {
             let home = match std::env::var("HOME") {
                 Ok(h) => h,
                 Err(_) => return,
             };
-            PathBuf::from(&home).join(".claude").join("projects")
+            (
+                PathBuf::from(&home).join(".claude").join("projects"),
+                PathBuf::from(&home).join(".codex").join("sessions"),
+            )
         }
     };
 
-    // Collect all .jsonl files recursively (includes subagent logs
-    // under <project>/<uuid>/subagents/*.jsonl)
-    let mut jsonl_files = Vec::new();
-    collect_jsonl_files(&projects_dir, &mut jsonl_files, 0);
+    let now_ts = chrono::Utc::now().timestamp();
+    let needs_discovery = stats.last_file_discovery_ts == 0
+        || now_ts - stats.last_file_discovery_ts >= FILE_DISCOVERY_INTERVAL_SECS;
 
-    for path in jsonl_files {
-        let mut file = match std::fs::File::open(&path) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        let file_len = match file.metadata() {
-            Ok(m) => m.len(),
-            Err(_) => continue,
-        };
+    if needs_discovery {
+        let mut claude_files = Vec::new();
+        collect_jsonl_files(&claude_projects_dir, &mut claude_files, 0);
+        stats.known_claude_files = claude_files;
 
-        let offset = stats.file_offsets.get(&path).copied().unwrap_or(0);
-        if file_len <= offset {
+        let mut codex_files = Vec::new();
+        collect_jsonl_files(&codex_sessions_dir, &mut codex_files, 0);
+        stats.known_codex_files = codex_files;
+
+        let claude_file_set: HashSet<PathBuf> = stats.known_claude_files.iter().cloned().collect();
+        stats
+            .file_offsets
+            .retain(|p, _| claude_file_set.contains(p));
+
+        let codex_file_set: HashSet<PathBuf> = stats.known_codex_files.iter().cloned().collect();
+        stats
+            .codex_file_states
+            .retain(|p, _| codex_file_set.contains(p));
+
+        stats.last_file_discovery_ts = now_ts;
+    }
+
+    // Process Claude files incrementally.
+    let claude_files = stats.known_claude_files.clone();
+    for path in claude_files {
+        process_claude_global_file(&path, stats, today);
+    }
+
+    // Process Codex files incrementally.
+    let codex_files = stats.known_codex_files.clone();
+    for path in codex_files {
+        process_codex_global_file(&path, stats, today);
+    }
+}
+
+fn add_claude_usage(
+    stats: &mut GlobalStats,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+) {
+    stats.tokens_in += input_tokens;
+    stats.tokens_out += output_tokens;
+    stats.tokens_cache_read += cache_read_tokens;
+    stats.tokens_cache_write += cache_write_tokens;
+
+    stats.claude_tokens_in += input_tokens;
+    stats.claude_tokens_out += output_tokens;
+    stats.claude_tokens_cache_read += cache_read_tokens;
+    stats.claude_tokens_cache_write += cache_write_tokens;
+}
+
+fn add_codex_usage(
+    stats: &mut GlobalStats,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+) {
+    stats.tokens_in += input_tokens;
+    stats.tokens_out += output_tokens;
+    stats.tokens_cache_read += cache_read_tokens;
+
+    stats.codex_tokens_in += input_tokens;
+    stats.codex_tokens_out += output_tokens;
+    stats.codex_tokens_cache_read += cache_read_tokens;
+}
+
+fn process_claude_global_file(path: &PathBuf, stats: &mut GlobalStats, today: &str) {
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let file_len = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return,
+    };
+
+    let offset = stats.file_offsets.get(path).copied().unwrap_or(0);
+    if file_len <= offset {
+        return;
+    }
+
+    if offset > 0 && file.seek(SeekFrom::Start(offset)).is_err() {
+        return;
+    }
+
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return;
+    }
+    let text = String::from_utf8_lossy(&buf);
+
+    for line in text.lines() {
+        if line.len() < 10 {
             continue;
         }
-
-        if offset > 0 {
-            if file.seek(SeekFrom::Start(offset)).is_err() {
-                continue;
-            }
-        }
-
-        let mut buf = Vec::new();
-        if file.read_to_end(&mut buf).is_err() {
+        if !line.contains(today) || !line.contains("\"assistant\"") || !line.contains("\"usage\"") {
             continue;
         }
-        let text = String::from_utf8_lossy(&buf);
-
-        for line in text.lines() {
-            if line.len() < 10 {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
                 continue;
             }
-            // Fast path: only parse lines that have today's date, are assistant messages with usage
-            if !line.contains(today)
-                || !line.contains("\"assistant\"")
-                || !line.contains("\"usage\"")
-            {
-                continue;
-            }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
-                    continue;
-                }
-                if let Some(usage) = v.get("message").and_then(|m| m.get("usage")) {
-                    stats.tokens_in += usage
+            if let Some(usage) = v.get("message").and_then(|m| m.get("usage")) {
+                add_claude_usage(
+                    stats,
+                    usage
                         .get("input_tokens")
                         .and_then(|t| t.as_u64())
-                        .unwrap_or(0);
-                    stats.tokens_out += usage
+                        .unwrap_or(0),
+                    usage
                         .get("output_tokens")
                         .and_then(|t| t.as_u64())
-                        .unwrap_or(0);
-                    stats.tokens_cache_read += usage
+                        .unwrap_or(0),
+                    usage
                         .get("cache_read_input_tokens")
                         .and_then(|t| t.as_u64())
-                        .unwrap_or(0);
-                    stats.tokens_cache_write += usage
+                        .unwrap_or(0),
+                    usage
                         .get("cache_creation_input_tokens")
                         .and_then(|t| t.as_u64())
-                        .unwrap_or(0);
-                }
+                        .unwrap_or(0),
+                );
+            }
+        }
+    }
+
+    stats.file_offsets.insert(path.clone(), file_len);
+}
+
+fn process_codex_global_file(path: &PathBuf, stats: &mut GlobalStats, today: &str) {
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let file_len = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return,
+    };
+
+    let mut last_total_tokens = stats
+        .codex_file_states
+        .get(path)
+        .map(|s| s.last_total_tokens)
+        .unwrap_or(0);
+    let mut last_input_tokens = stats
+        .codex_file_states
+        .get(path)
+        .map(|s| s.last_input_tokens)
+        .unwrap_or(0);
+    let mut last_output_tokens = stats
+        .codex_file_states
+        .get(path)
+        .map(|s| s.last_output_tokens)
+        .unwrap_or(0);
+    let mut last_cached_input_tokens = stats
+        .codex_file_states
+        .get(path)
+        .map(|s| s.last_cached_input_tokens)
+        .unwrap_or(0);
+    let offset = stats
+        .codex_file_states
+        .get(path)
+        .map(|s| s.read_offset)
+        .unwrap_or(0);
+
+    if file_len <= offset {
+        return;
+    }
+
+    if offset > 0 && file.seek(SeekFrom::Start(offset)).is_err() {
+        return;
+    }
+
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return;
+    }
+    let text = String::from_utf8_lossy(&buf);
+
+    for line in text.lines() {
+        if line.len() < 20 {
+            continue;
+        }
+        if !line.contains("\"token_count\"") || !line.contains("\"total_token_usage\"") {
+            continue;
+        }
+
+        let v = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if v.get("type").and_then(|t| t.as_str()) != Some("event_msg") {
+            continue;
+        }
+        let payload = match v.get("payload") {
+            Some(p) => p,
+            None => continue,
+        };
+        if payload.get("type").and_then(|t| t.as_str()) != Some("token_count") {
+            continue;
+        }
+
+        let totals = match payload.get("info").and_then(|i| i.get("total_token_usage")) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        let total_input_tokens = totals
+            .get("input_tokens")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        let total_output_tokens = totals
+            .get("output_tokens")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        let total_cached_input_tokens = totals
+            .get("cached_input_tokens")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        let total_tokens = totals
+            .get("total_tokens")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(total_input_tokens.saturating_add(total_output_tokens));
+
+        let is_today = v
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .is_some_and(|ts| ts.starts_with(today));
+
+        if total_tokens > last_total_tokens {
+            if is_today {
+                let delta_input = total_input_tokens.saturating_sub(last_input_tokens);
+                let delta_output = total_output_tokens.saturating_sub(last_output_tokens);
+                let delta_cache_read =
+                    total_cached_input_tokens.saturating_sub(last_cached_input_tokens);
+                add_codex_usage(stats, delta_input, delta_output, delta_cache_read);
             }
         }
 
-        stats.file_offsets.insert(path, file_len);
+        // Always advance snapshot state; duplicate totals are ignored by the delta check above.
+        last_total_tokens = total_tokens;
+        last_input_tokens = total_input_tokens;
+        last_output_tokens = total_output_tokens;
+        last_cached_input_tokens = total_cached_input_tokens;
     }
+
+    stats.codex_file_states.insert(
+        path.clone(),
+        CodexFileState {
+            read_offset: file_len,
+            last_total_tokens,
+            last_input_tokens,
+            last_output_tokens,
+            last_cached_input_tokens,
+        },
+    );
 }
 
 /// Recursively collect all `.jsonl` files under a directory.
@@ -430,9 +735,13 @@ fn collect_jsonl_files(dir: &std::path::Path, out: &mut Vec<PathBuf>, depth: usi
 
 /// Get the pane PID for a tmux session.
 pub async fn get_pane_pid(tmux_name: &str) -> Option<u32> {
-    let output = run_cmd_timeout(
-        Command::new("tmux").args(["list-panes", "-t", tmux_name, "-F", "#{pane_pid}"]),
-    )
+    let output = run_cmd_timeout(Command::new("tmux").args([
+        "list-panes",
+        "-t",
+        tmux_name,
+        "-F",
+        "#{pane_pid}",
+    ]))
     .await
     .ok()?;
 
@@ -440,10 +749,7 @@ pub async fn get_pane_pid(tmux_name: &str) -> Option<u32> {
         return None;
     }
 
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .ok()
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
 /// Extract --session-id UUID from a command line string.
@@ -471,11 +777,10 @@ fn parse_session_id_from_cmdline(cmdline: &str) -> Option<String> {
 /// Extract --session-id from a process's command line arguments.
 /// This is the most reliable way to get the Claude session UUID.
 async fn resolve_uuid_from_cmdline(pid: u32) -> Option<String> {
-    let output = run_cmd_timeout(
-        Command::new("ps").args(["-p", &pid.to_string(), "-o", "command="]),
-    )
-    .await
-    .ok()?;
+    let output =
+        run_cmd_timeout(Command::new("ps").args(["-p", &pid.to_string(), "-o", "command="]))
+            .await
+            .ok()?;
 
     if !output.status.success() {
         return None;
@@ -501,10 +806,8 @@ async fn collect_descendant_pids(pid: u32) -> Vec<u32> {
             if all_pids.len() >= MAX_TREE_PIDS {
                 break;
             }
-            let output = run_cmd_timeout(
-                Command::new("pgrep").args(["-P", &parent.to_string()]),
-            )
-            .await;
+            let output =
+                run_cmd_timeout(Command::new("pgrep").args(["-P", &parent.to_string()])).await;
 
             if let Ok(output) = output {
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -664,6 +967,39 @@ mod tests {
     /// HOME is process-global, so parallel tests that set_var("HOME", ...) race.
     static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// RAII guard that saves HOME, sets it to a new value, and restores on drop.
+    /// Also acquires HOME_LOCK for thread safety.
+    struct HomeGuard {
+        orig: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl HomeGuard {
+        /// Save current HOME, set to new path, and acquire the HOME_LOCK.
+        fn set(path: &std::path::Path) -> Self {
+            let lock = HOME_LOCK.lock().unwrap();
+            let orig = std::env::var("HOME").ok();
+            std::env::set_var("HOME", path);
+            Self { orig, _lock: lock }
+        }
+
+        /// Save current HOME, remove it, and acquire the HOME_LOCK.
+        fn remove() -> Self {
+            let lock = HOME_LOCK.lock().unwrap();
+            let orig = std::env::var("HOME").ok();
+            std::env::remove_var("HOME");
+            Self { orig, _lock: lock }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            if let Some(h) = &self.orig {
+                std::env::set_var("HOME", h);
+            }
+        }
+    }
+
     // ── format_tokens tests ──────────────────────────────────────────
 
     #[test]
@@ -716,14 +1052,17 @@ mod tests {
     #[test]
     fn session_stats_cost_calculation() {
         let stats = SessionStats {
-            tokens_in: 1_000_000,  // $3.00
-            tokens_out: 100_000,   // $1.50
+            tokens_in: 1_000_000,        // $3.00
+            tokens_out: 100_000,         // $1.50
             tokens_cache_read: 500_000,  // $0.15
             tokens_cache_write: 200_000, // $0.75
             ..Default::default()
         };
         let cost = stats.cost_usd();
-        assert!((cost - 5.40).abs() < 0.01, "expected ~$5.40, got ${cost:.2}");
+        assert!(
+            (cost - 5.40).abs() < 0.01,
+            "expected ~$5.40, got ${cost:.2}"
+        );
     }
 
     // ── update_session_stats tests ───────────────────────────────────
@@ -742,10 +1081,13 @@ mod tests {
 
     #[test]
     fn update_session_stats_parses_tokens_and_turns() {
-        let path = write_tmp_jsonl("stats_tokens", &[
-            r#"{"type":"assistant","message":{"usage":{"input_tokens":1000,"output_tokens":200,"cache_read_input_tokens":500,"cache_creation_input_tokens":100},"content":[{"type":"text","text":"hello"}]}}"#,
-            r#"{"type":"assistant","message":{"usage":{"input_tokens":2000,"output_tokens":300,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"world"}]}}"#,
-        ]);
+        let path = write_tmp_jsonl(
+            "stats_tokens",
+            &[
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":1000,"output_tokens":200,"cache_read_input_tokens":500,"cache_creation_input_tokens":100},"content":[{"type":"text","text":"hello"}]}}"#,
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":2000,"output_tokens":300,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"world"}]}}"#,
+            ],
+        );
 
         let mut stats = SessionStats::default();
         update_session_stats_from_path(&path, &mut stats);
@@ -760,9 +1102,12 @@ mod tests {
 
     #[test]
     fn update_session_stats_counts_tools() {
-        let path = write_tmp_jsonl("stats_tools", &[
-            r#"{"type":"assistant","message":{"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"Edit","id":"t1","input":{}},{"type":"tool_use","name":"Bash","id":"t2","input":{}},{"type":"tool_use","name":"Write","id":"t3","input":{}}]}}"#,
-        ]);
+        let path = write_tmp_jsonl(
+            "stats_tools",
+            &[
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"Edit","id":"t1","input":{}},{"type":"tool_use","name":"Bash","id":"t2","input":{}},{"type":"tool_use","name":"Write","id":"t3","input":{}}]}}"#,
+            ],
+        );
 
         let mut stats = SessionStats::default();
         update_session_stats_from_path(&path, &mut stats);
@@ -774,10 +1119,13 @@ mod tests {
 
     #[test]
     fn update_session_stats_tracks_files() {
-        let path = write_tmp_jsonl("stats_files", &[
-            r#"{"type":"user","toolUseResult":{"filenames":["/src/main.rs","/src/app.rs"]}}"#,
-            r#"{"type":"user","toolUseResult":{"filenames":["/src/main.rs"]}}"#,
-        ]);
+        let path = write_tmp_jsonl(
+            "stats_files",
+            &[
+                r#"{"type":"user","toolUseResult":{"filenames":["/src/main.rs","/src/app.rs"]}}"#,
+                r#"{"type":"user","toolUseResult":{"filenames":["/src/main.rs"]}}"#,
+            ],
+        );
 
         let mut stats = SessionStats::default();
         update_session_stats_from_path(&path, &mut stats);
@@ -808,7 +1156,10 @@ mod tests {
         assert!(offset_after_first > 0);
 
         // Append more data
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         writeln!(f, r#"{{"type":"assistant","message":{{"usage":{{"input_tokens":200,"output_tokens":100,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"second"}}]}}}}"#).unwrap();
         drop(f);
 
@@ -833,11 +1184,14 @@ mod tests {
 
     #[test]
     fn stats_skips_short_lines() {
-        let path = write_tmp_jsonl("stats_short", &[
-            "short",  // < 10 chars, should be skipped
-            "",       // empty, should be skipped
-            r#"{"type":"assistant","message":{"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
-        ]);
+        let path = write_tmp_jsonl(
+            "stats_short",
+            &[
+                "short", // < 10 chars, should be skipped
+                "",      // empty, should be skipped
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
+            ],
+        );
 
         let mut stats = SessionStats::default();
         update_session_stats_from_path(&path, &mut stats);
@@ -847,9 +1201,12 @@ mod tests {
 
     #[test]
     fn stats_unknown_tool_name_ignored() {
-        let path = write_tmp_jsonl("stats_unknown_tool", &[
-            r#"{"type":"assistant","message":{"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"UnknownTool","id":"t1","input":{}}]}}"#,
-        ]);
+        let path = write_tmp_jsonl(
+            "stats_unknown_tool",
+            &[
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"UnknownTool","id":"t1","input":{}}]}}"#,
+            ],
+        );
 
         let mut stats = SessionStats::default();
         update_session_stats_from_path(&path, &mut stats);
@@ -861,10 +1218,13 @@ mod tests {
 
     #[test]
     fn stats_assistant_without_usage_not_counted() {
-        let path = write_tmp_jsonl("stats_no_usage", &[
-            // "assistant" in line but no "usage" — won't match fast path
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"no usage field here"}]}}"#,
-        ]);
+        let path = write_tmp_jsonl(
+            "stats_no_usage",
+            &[
+                // "assistant" in line but no "usage" — won't match fast path
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"no usage field here"}]}}"#,
+            ],
+        );
 
         let mut stats = SessionStats::default();
         update_session_stats_from_path(&path, &mut stats);
@@ -896,11 +1256,50 @@ mod tests {
     }
 
     #[test]
+    fn touch_file_caps_history_size() {
+        let mut stats = SessionStats::default();
+        let total = MAX_SESSION_TRACKED_FILES + 50;
+        for i in 0..total {
+            stats.touch_file(format!("/file-{i}.rs"));
+        }
+
+        assert_eq!(stats.files.len(), MAX_SESSION_TRACKED_FILES);
+        assert_eq!(stats.recent_files.len(), MAX_SESSION_TRACKED_FILES);
+        assert!(
+            !stats.files.contains("/file-0.rs"),
+            "oldest files should be evicted at capacity"
+        );
+        assert!(
+            stats.files.contains(&format!("/file-{}.rs", total - 1)),
+            "newest file should remain tracked"
+        );
+    }
+
+    #[test]
+    fn touch_file_retouch_at_capacity_keeps_size_bounded() {
+        let mut stats = SessionStats::default();
+        for i in 0..MAX_SESSION_TRACKED_FILES {
+            stats.touch_file(format!("/file-{i}.rs"));
+        }
+
+        stats.touch_file("/file-0.rs".to_string());
+        assert_eq!(stats.files.len(), MAX_SESSION_TRACKED_FILES);
+        assert_eq!(stats.recent_files.len(), MAX_SESSION_TRACKED_FILES);
+        assert_eq!(
+            stats.recent_files.last().map(|s| s.as_str()),
+            Some("/file-0.rs")
+        );
+    }
+
+    #[test]
     fn update_session_stats_populates_recent_files() {
-        let path = write_tmp_jsonl("stats_recent", &[
-            r#"{"type":"user","toolUseResult":{"filenames":["/src/main.rs","/src/app.rs"]}}"#,
-            r#"{"type":"user","toolUseResult":{"filenames":["/src/main.rs"]}}"#,
-        ]);
+        let path = write_tmp_jsonl(
+            "stats_recent",
+            &[
+                r#"{"type":"user","toolUseResult":{"filenames":["/src/main.rs","/src/app.rs"]}}"#,
+                r#"{"type":"user","toolUseResult":{"filenames":["/src/main.rs"]}}"#,
+            ],
+        );
 
         let mut stats = SessionStats::default();
         update_session_stats_from_path(&path, &mut stats);
@@ -943,7 +1342,10 @@ mod tests {
                 .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         );
 
-        assert!(stats.task_elapsed().is_none(), "assistant replied = task done");
+        assert!(
+            stats.task_elapsed().is_none(),
+            "assistant replied = task done"
+        );
     }
 
     #[test]
@@ -966,17 +1368,26 @@ mod tests {
 
     #[test]
     fn task_elapsed_from_jsonl_parsing() {
-        let path = write_tmp_jsonl("stats_timestamps", &[
-            r#"{"type":"user","timestamp":"2026-01-15T10:00:00.000Z","message":{"role":"user","content":"do something"}}"#,
-            r#"{"type":"assistant","timestamp":"2026-01-15T10:00:30.000Z","message":{"role":"assistant","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"done"}]}}"#,
-            r#"{"type":"user","timestamp":"2026-01-15T10:01:00.000Z","message":{"role":"user","content":"now do this"}}"#,
-        ]);
+        let path = write_tmp_jsonl(
+            "stats_timestamps",
+            &[
+                r#"{"type":"user","timestamp":"2026-01-15T10:00:00.000Z","message":{"role":"user","content":"do something"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-01-15T10:00:30.000Z","message":{"role":"assistant","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"done"}]}}"#,
+                r#"{"type":"user","timestamp":"2026-01-15T10:01:00.000Z","message":{"role":"user","content":"now do this"}}"#,
+            ],
+        );
 
         let mut stats = SessionStats::default();
         update_session_stats_from_path(&path, &mut stats);
 
-        assert_eq!(stats.last_user_ts.as_deref(), Some("2026-01-15T10:01:00.000Z"));
-        assert_eq!(stats.last_assistant_ts.as_deref(), Some("2026-01-15T10:00:30.000Z"));
+        assert_eq!(
+            stats.last_user_ts.as_deref(),
+            Some("2026-01-15T10:01:00.000Z")
+        );
+        assert_eq!(
+            stats.last_assistant_ts.as_deref(),
+            Some("2026-01-15T10:00:30.000Z")
+        );
         // User message is after assistant → agent should be working
         assert!(stats.task_elapsed().is_some());
         let _ = std::fs::remove_file(&path);
@@ -1080,7 +1491,10 @@ mod tests {
 
     #[test]
     fn escape_project_path_basic() {
-        assert_eq!(escape_project_path("/Users/monkey/hydra"), "-Users-monkey-hydra");
+        assert_eq!(
+            escape_project_path("/Users/monkey/hydra"),
+            "-Users-monkey-hydra"
+        );
     }
 
     #[test]
@@ -1345,11 +1759,7 @@ mod tests {
 
         let mut f = std::fs::File::create(&log_file).unwrap();
         // Empty content array — no text items
-        writeln!(
-            f,
-            r#"{{"type":"assistant","message":{{"content":[]}}}}"#
-        )
-        .unwrap();
+        writeln!(f, r#"{{"type":"assistant","message":{{"content":[]}}}}"#).unwrap();
 
         let _lock = HOME_LOCK.lock().unwrap();
         let orig_home = std::env::var("HOME").ok();
@@ -1370,9 +1780,11 @@ mod tests {
     fn update_session_stats_via_home_env() {
         use std::io::Write;
 
-        let tmp_dir = std::env::temp_dir().join("hydra_test_stats_home");
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::set(dir.path());
+
         let escaped = escape_project_path("/tmp/stats-home-project");
-        let projects_dir = tmp_dir.join(".claude").join("projects").join(&escaped);
+        let projects_dir = dir.path().join(".claude").join("projects").join(&escaped);
         std::fs::create_dir_all(&projects_dir).unwrap();
 
         let uuid = "aabbccdd-1122-3344-5566-778899aabbcc";
@@ -1381,34 +1793,23 @@ mod tests {
         writeln!(f, r#"{{"type":"assistant","message":{{"usage":{{"input_tokens":500,"output_tokens":100,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"done"}}]}}}}"#).unwrap();
         drop(f);
 
-        let _lock = HOME_LOCK.lock().unwrap();
-        let orig_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &tmp_dir);
-
         let mut stats = SessionStats::default();
         update_session_stats("/tmp/stats-home-project", uuid, &mut stats);
         assert_eq!(stats.turns, 1);
         assert_eq!(stats.tokens_in, 500);
-
-        if let Some(home) = orig_home {
-            std::env::set_var("HOME", home);
-        }
-        let _ = std::fs::remove_dir_all(&tmp_dir.join(".claude"));
     }
 
     #[test]
     fn update_session_stats_missing_home_is_noop() {
-        let _lock = HOME_LOCK.lock().unwrap();
-        let orig_home = std::env::var("HOME").ok();
-        std::env::remove_var("HOME");
+        let _guard = HomeGuard::remove();
 
         let mut stats = SessionStats::default();
-        update_session_stats("/tmp/whatever", "some-uuid-value-here-1234567890ab", &mut stats);
+        update_session_stats(
+            "/tmp/whatever",
+            "some-uuid-value-here-1234567890ab",
+            &mut stats,
+        );
         assert_eq!(stats.turns, 0, "missing HOME should be no-op");
-
-        if let Some(home) = orig_home {
-            std::env::set_var("HOME", home);
-        }
     }
 
     // ── parse_iso_timestamp tests ─────────────────────────────────
@@ -1432,9 +1833,10 @@ mod tests {
     fn stats_user_message_without_timestamp_field() {
         // User message that contains "user" but no "timestamp" key —
         // should not match the timestamp fast path
-        let path = write_tmp_jsonl("stats_user_no_ts", &[
-            r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
-        ]);
+        let path = write_tmp_jsonl(
+            "stats_user_no_ts",
+            &[r#"{"type":"user","message":{"role":"user","content":"hi"}}"#],
+        );
 
         let mut stats = SessionStats::default();
         update_session_stats_from_path(&path, &mut stats);
@@ -1446,9 +1848,12 @@ mod tests {
     fn stats_user_message_with_usage_skips_user_fast_path() {
         // A line with both "user" and "timestamp" AND "usage" should
         // not match the user timestamp fast path (line 181 condition)
-        let path = write_tmp_jsonl("stats_user_usage", &[
-            r#"{"type":"user","timestamp":"2026-01-15T10:00:00.000Z","usage":{"input_tokens":100},"message":{"content":"hi"}}"#,
-        ]);
+        let path = write_tmp_jsonl(
+            "stats_user_usage",
+            &[
+                r#"{"type":"user","timestamp":"2026-01-15T10:00:00.000Z","usage":{"input_tokens":100},"message":{"content":"hi"}}"#,
+            ],
+        );
 
         let mut stats = SessionStats::default();
         update_session_stats_from_path(&path, &mut stats);
@@ -1459,21 +1864,30 @@ mod tests {
 
     #[test]
     fn stats_assistant_timestamp_tracked() {
-        let path = write_tmp_jsonl("stats_ast_ts", &[
-            r#"{"type":"assistant","timestamp":"2026-01-15T10:00:30.000Z","message":{"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
-        ]);
+        let path = write_tmp_jsonl(
+            "stats_ast_ts",
+            &[
+                r#"{"type":"assistant","timestamp":"2026-01-15T10:00:30.000Z","message":{"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
+            ],
+        );
 
         let mut stats = SessionStats::default();
         update_session_stats_from_path(&path, &mut stats);
-        assert_eq!(stats.last_assistant_ts.as_deref(), Some("2026-01-15T10:00:30.000Z"));
+        assert_eq!(
+            stats.last_assistant_ts.as_deref(),
+            Some("2026-01-15T10:00:30.000Z")
+        );
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn stats_assistant_without_timestamp_field() {
-        let path = write_tmp_jsonl("stats_ast_no_ts", &[
-            r#"{"type":"assistant","message":{"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
-        ]);
+        let path = write_tmp_jsonl(
+            "stats_ast_no_ts",
+            &[
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
+            ],
+        );
 
         let mut stats = SessionStats::default();
         update_session_stats_from_path(&path, &mut stats);
@@ -1485,9 +1899,10 @@ mod tests {
     #[test]
     fn stats_tool_result_without_filenames() {
         // toolUseResult without filenames array — should not crash
-        let path = write_tmp_jsonl("stats_tool_no_files", &[
-            r#"{"type":"user","toolUseResult":{"content":"some result"}}"#,
-        ]);
+        let path = write_tmp_jsonl(
+            "stats_tool_no_files",
+            &[r#"{"type":"user","toolUseResult":{"content":"some result"}}"#],
+        );
 
         let mut stats = SessionStats::default();
         update_session_stats_from_path(&path, &mut stats);
@@ -1498,9 +1913,10 @@ mod tests {
     #[test]
     fn stats_tool_result_with_non_string_filename() {
         // filenames array with non-string entries — should skip gracefully
-        let path = write_tmp_jsonl("stats_tool_bad_fname", &[
-            r#"{"type":"user","toolUseResult":{"filenames":["/valid.rs", 123, null]}}"#,
-        ]);
+        let path = write_tmp_jsonl(
+            "stats_tool_bad_fname",
+            &[r#"{"type":"user","toolUseResult":{"filenames":["/valid.rs", 123, null]}}"#],
+        );
 
         let mut stats = SessionStats::default();
         update_session_stats_from_path(&path, &mut stats);
@@ -1511,10 +1927,13 @@ mod tests {
     #[test]
     fn stats_malformed_json_line_skipped() {
         // Valid assistant + malformed line — should not interfere
-        let path = write_tmp_jsonl("stats_malformed", &[
-            r#"{"type":"assistant","message":{"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
-            r#"{"type":"assistant","usage" this is broken json"#,
-        ]);
+        let path = write_tmp_jsonl(
+            "stats_malformed",
+            &[
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
+                r#"{"type":"assistant","usage" this is broken json"#,
+            ],
+        );
 
         let mut stats = SessionStats::default();
         update_session_stats_from_path(&path, &mut stats);
@@ -1526,13 +1945,16 @@ mod tests {
     fn stats_mixed_message_types_full_coverage() {
         // A comprehensive test with user timestamps, assistant timestamps,
         // tool use results, and file tracking
-        let path = write_tmp_jsonl("stats_mixed_full", &[
-            r#"{"type":"user","timestamp":"2026-01-15T10:00:00.000Z","message":{"role":"user","content":"start"}}"#,
-            r#"{"type":"assistant","timestamp":"2026-01-15T10:00:15.000Z","message":{"usage":{"input_tokens":1000,"output_tokens":200,"cache_read_input_tokens":50,"cache_creation_input_tokens":25},"content":[{"type":"text","text":"thinking..."},{"type":"tool_use","name":"Edit","id":"t1","input":{}},{"type":"tool_use","name":"Bash","id":"t2","input":{}}]}}"#,
-            r#"{"filenames":["/src/main.rs"],"toolUseResult":{"filenames":["/src/main.rs"]}}"#,
-            r#"{"type":"user","timestamp":"2026-01-15T10:01:00.000Z","message":{"role":"user","content":"next task"}}"#,
-            r#"{"type":"assistant","timestamp":"2026-01-15T10:01:30.000Z","message":{"usage":{"input_tokens":500,"output_tokens":100,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"Write","id":"t3","input":{}}]}}"#,
-        ]);
+        let path = write_tmp_jsonl(
+            "stats_mixed_full",
+            &[
+                r#"{"type":"user","timestamp":"2026-01-15T10:00:00.000Z","message":{"role":"user","content":"start"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-01-15T10:00:15.000Z","message":{"usage":{"input_tokens":1000,"output_tokens":200,"cache_read_input_tokens":50,"cache_creation_input_tokens":25},"content":[{"type":"text","text":"thinking..."},{"type":"tool_use","name":"Edit","id":"t1","input":{}},{"type":"tool_use","name":"Bash","id":"t2","input":{}}]}}"#,
+                r#"{"filenames":["/src/main.rs"],"toolUseResult":{"filenames":["/src/main.rs"]}}"#,
+                r#"{"type":"user","timestamp":"2026-01-15T10:01:00.000Z","message":{"role":"user","content":"next task"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-01-15T10:01:30.000Z","message":{"usage":{"input_tokens":500,"output_tokens":100,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"Write","id":"t3","input":{}}]}}"#,
+            ],
+        );
 
         let mut stats = SessionStats::default();
         update_session_stats_from_path(&path, &mut stats);
@@ -1545,14 +1967,21 @@ mod tests {
         assert_eq!(stats.edits, 2, "Edit + Write = 2");
         assert_eq!(stats.bash_cmds, 1);
         assert_eq!(stats.file_count(), 1);
-        assert_eq!(stats.last_user_ts.as_deref(), Some("2026-01-15T10:01:00.000Z"));
-        assert_eq!(stats.last_assistant_ts.as_deref(), Some("2026-01-15T10:01:30.000Z"));
+        assert_eq!(
+            stats.last_user_ts.as_deref(),
+            Some("2026-01-15T10:01:00.000Z")
+        );
+        assert_eq!(
+            stats.last_assistant_ts.as_deref(),
+            Some("2026-01-15T10:01:30.000Z")
+        );
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn parse_lsof_uuid_too_short_after_tasks() {
-        let output = "claude  12345  user  txt  REG  1,20  123  /Users/test/.claude/tasks/short/file";
+        let output =
+            "claude  12345  user  txt  REG  1,20  123  /Users/test/.claude/tasks/short/file";
         assert_eq!(parse_uuid_from_lsof_output(output), None);
     }
 
@@ -1571,11 +2000,13 @@ mod tests {
             tokens_out: 100_000,
             tokens_cache_read: 500_000,
             tokens_cache_write: 200_000,
-            file_offsets: HashMap::new(),
-            date: String::new(),
+            ..Default::default()
         };
         let cost = stats.cost_usd();
-        assert!((cost - 5.40).abs() < 0.01, "expected ~$5.40, got ${cost:.2}");
+        assert!(
+            (cost - 5.40).abs() < 0.01,
+            "expected ~$5.40, got ${cost:.2}"
+        );
     }
 
     #[test]
@@ -1584,6 +2015,35 @@ mod tests {
         assert_eq!(stats.tokens_in, 0);
         assert_eq!(stats.tokens_out, 0);
         assert!((stats.cost_usd() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn global_stats_cost_calculation_with_codex_breakdown() {
+        let stats = GlobalStats {
+            codex_tokens_in: 1_000_000,
+            codex_tokens_out: 100_000,
+            codex_tokens_cache_read: 200_000,
+            ..Default::default()
+        };
+        let cost = stats.cost_usd();
+        assert!(
+            (cost - 2.025).abs() < 0.01,
+            "expected ~$2.03, got ${cost:.2}"
+        );
+    }
+
+    #[test]
+    fn global_stats_codex_cost_saturates_when_cache_exceeds_input() {
+        let stats = GlobalStats {
+            codex_tokens_in: 100,
+            codex_tokens_out: 0,
+            codex_tokens_cache_read: 200,
+            ..Default::default()
+        };
+        let cost = stats.cost_usd();
+        // Uncached input should saturate at 0, so only cached pricing applies.
+        let expected = 200.0 * CODEX_CACHE_READ_USD_PER_MTOK / 1_000_000.0;
+        assert!((cost - expected).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1763,8 +2223,90 @@ mod tests {
         stats.date = today.clone();
         update_global_stats_inner(&mut stats, &today, Some(tmp.path()));
 
-        assert_eq!(stats.tokens_in, 300, "should include both direct and subagent entries");
+        assert_eq!(
+            stats.tokens_in, 300,
+            "should include both direct and subagent entries"
+        );
         assert_eq!(stats.tokens_out, 130);
+    }
+
+    #[test]
+    fn update_global_stats_parses_codex_token_count_incrementally() {
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        let codex_dir = tmp
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("02")
+            .join("20");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let log = codex_dir.join("rollout.jsonl");
+
+        let mut f = std::fs::File::create(&log).unwrap();
+        // Baseline from an older date.
+        writeln!(
+            f,
+            r#"{{"timestamp":"2020-01-01T23:59:59Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":90,"cached_input_tokens":0,"output_tokens":10,"total_tokens":100}}}}}}}}"#
+        )
+        .unwrap();
+        // First token_count for today.
+        writeln!(
+            f,
+            r#"{{"timestamp":"{today}T10:00:00Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":150,"cached_input_tokens":20,"output_tokens":10,"total_tokens":160}}}}}}}}"#
+        )
+        .unwrap();
+        // Duplicate snapshot (should be ignored by delta logic).
+        writeln!(
+            f,
+            r#"{{"timestamp":"{today}T10:00:01Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":150,"cached_input_tokens":20,"output_tokens":10,"total_tokens":160}}}}}}}}"#
+        )
+        .unwrap();
+        // Second token_count for today.
+        writeln!(
+            f,
+            r#"{{"timestamp":"{today}T10:01:00Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":230,"cached_input_tokens":40,"output_tokens":30,"total_tokens":260}}}}}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let mut stats = GlobalStats::default();
+        stats.date = today.clone();
+        update_global_stats_inner(&mut stats, &today, Some(tmp.path()));
+
+        assert_eq!(stats.codex_tokens_in, 140);
+        assert_eq!(stats.codex_tokens_out, 20);
+        assert_eq!(stats.codex_tokens_cache_read, 40);
+        assert_eq!(
+            stats.tokens_in, 140,
+            "aggregate totals should include codex"
+        );
+        assert_eq!(
+            stats.tokens_out, 20,
+            "aggregate totals should include codex"
+        );
+        assert_eq!(
+            stats.tokens_cache_read, 40,
+            "aggregate totals should include codex"
+        );
+
+        // Append one more today snapshot and verify incremental accumulation.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        writeln!(
+            f,
+            r#"{{"timestamp":"{today}T10:02:00Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":260,"cached_input_tokens":50,"output_tokens":40,"total_tokens":300}}}}}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        update_global_stats_inner(&mut stats, &today, Some(tmp.path()));
+        assert_eq!(stats.codex_tokens_in, 170);
+        assert_eq!(stats.codex_tokens_out, 30);
+        assert_eq!(stats.codex_tokens_cache_read, 50);
     }
 
     // ── update_session_stats_from_path: assistant tool_use counting ──
@@ -1819,7 +2361,10 @@ mod tests {
 
         // Append second batch
         let line2 = r#"{"type":"assistant","timestamp":"2025-01-01T00:01:00Z","message":{"usage":{"input_tokens":200,"output_tokens":100},"content":[]}}"#;
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         use std::io::Write;
         writeln!(file, "{line2}").unwrap();
 
@@ -1924,7 +2469,10 @@ mod tests {
         let line2 = format!(
             r#"{{"type":"assistant","timestamp":"{today}T13:00:00Z","message":{{"usage":{{"input_tokens":200,"output_tokens":100}},"content":[]}}}}"#,
         );
-        let mut file = std::fs::OpenOptions::new().append(true).open(&jsonl_path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&jsonl_path)
+            .unwrap();
         use std::io::Write;
         writeln!(file, "{line2}").unwrap();
 
@@ -1987,20 +2535,12 @@ mod tests {
 
     #[test]
     fn global_stats_inner_none_base_dir_without_home_is_noop() {
-        // Set HOME to empty to test the None base_dir + HOME error path
-        let _lock = HOME_LOCK.lock().unwrap();
-        let orig_home = std::env::var("HOME").ok();
-        std::env::remove_var("HOME");
+        let _guard = HomeGuard::remove();
 
         let mut stats = GlobalStats::default();
         let today = "2026-01-01";
         update_global_stats_inner(&mut stats, today, None);
         assert_eq!(stats.tokens_in, 0, "should be noop when HOME is unset");
-
-        // Restore
-        if let Some(h) = orig_home {
-            std::env::set_var("HOME", h);
-        }
     }
 
     #[test]
@@ -2014,7 +2554,10 @@ mod tests {
 
         let mut stats = SessionStats::default();
         update_session_stats_from_path(&path, &mut stats);
-        assert!(stats.last_user_ts.is_none(), "should not set last_user_ts for non-user type");
+        assert!(
+            stats.last_user_ts.is_none(),
+            "should not set last_user_ts for non-user type"
+        );
     }
 
     #[test]
@@ -2035,7 +2578,10 @@ mod tests {
     fn parse_uuid_from_lsof_output_valid() {
         let output = "node  12345 user  txt  REG  /home/user/.claude/tasks/a1b2c3d4-e5f6-7890-abcd-ef1234567890/file.jsonl\n";
         let result = parse_uuid_from_lsof_output(output);
-        assert_eq!(result.as_deref(), Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890"));
+        assert_eq!(
+            result.as_deref(),
+            Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+        );
     }
 
     #[test]
@@ -2063,9 +2609,8 @@ mod tests {
 
     #[test]
     fn update_global_stats_outer_covers_today_and_delegates() {
-        let _lock = HOME_LOCK.lock().unwrap();
-        let orig_home = std::env::var("HOME").ok();
         let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::set(dir.path());
 
         // Create a projects dir with a jsonl file for today
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -2076,28 +2621,20 @@ mod tests {
         );
         std::fs::write(projects_dir.join("s.jsonl"), format!("{line}\n")).unwrap();
 
-        std::env::set_var("HOME", dir.path());
         let mut stats = GlobalStats::default();
         update_global_stats(&mut stats);
 
-        assert_eq!(stats.tokens_in, 100, "should read tokens from HOME-based path");
+        assert_eq!(
+            stats.tokens_in, 100,
+            "should read tokens from HOME-based path"
+        );
         assert_eq!(stats.date, today, "should set today's date");
-
-        if let Some(h) = orig_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
     }
 
     #[test]
     fn update_global_stats_outer_resets_on_date_change() {
-        let _lock = HOME_LOCK.lock().unwrap();
-        let orig_home = std::env::var("HOME").ok();
         let dir = tempfile::tempdir().unwrap();
-
-        // No projects dir needed — we just want to test the reset logic
-        std::env::set_var("HOME", dir.path());
+        let _guard = HomeGuard::set(dir.path());
 
         let mut stats = GlobalStats::default();
         stats.date = "1999-01-01".to_string(); // old date
@@ -2110,45 +2647,48 @@ mod tests {
 
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         assert_eq!(stats.date, today, "date should be updated to today");
-        assert_eq!(stats.tokens_in, 0, "tokens_in should be reset on date change");
-        assert_eq!(stats.tokens_out, 0, "tokens_out should be reset on date change");
-
-        if let Some(h) = orig_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
+        assert_eq!(
+            stats.tokens_in, 0,
+            "tokens_in should be reset on date change"
+        );
+        assert_eq!(
+            stats.tokens_out, 0,
+            "tokens_out should be reset on date change"
+        );
     }
 
     #[test]
     fn global_stats_inner_false_positive_assistant_line_skipped() {
-        // A line that contains "assistant" and "usage" text but has wrong type
+        // Line passes ALL quick filters (contains today's date, "assistant" as
+        // a JSON key, and "usage") but the top-level type is NOT "assistant",
+        // so it must be rejected at the JSON type check (line 383-384).
         let dir = tempfile::tempdir().unwrap();
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
         let subdir = dir.path().join("proj");
         std::fs::create_dir_all(&subdir).unwrap();
+        // "assistant" appears as a key name (passes contains check),
+        // "usage" appears as a key, and today's date is in the timestamp.
         let line = format!(
-            r#"{{"type":"system","text":"assistant usage stats for {today}","message":{{"usage":{{"input_tokens":999}}}}}}"#,
+            r#"{{"type":"system","assistant":"yes","usage":"yes","timestamp":"{today}","message":{{"usage":{{"input_tokens":999}}}}}}"#,
         );
         std::fs::write(subdir.join("s.jsonl"), format!("{line}\n")).unwrap();
 
         let mut stats = GlobalStats::default();
         stats.date = today.clone();
         update_global_stats_inner(&mut stats, &today, Some(dir.path()));
-        assert_eq!(stats.tokens_in, 0, "should skip lines where type != assistant");
+        assert_eq!(
+            stats.tokens_in, 0,
+            "should skip lines where type != assistant"
+        );
     }
 
     // ── read_last_assistant_message via temp files ──
 
     #[test]
     fn read_last_assistant_message_returns_text() {
-        let _lock = HOME_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let orig_home = std::env::var("HOME").ok();
-
-        // Set HOME to temp dir
-        std::env::set_var("HOME", dir.path());
+        let _guard = HomeGuard::set(dir.path());
 
         let cwd = "/test/project";
         let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -2158,45 +2698,35 @@ mod tests {
 
         let jsonl_path = jsonl_dir.join(format!("{uuid}.jsonl"));
         let content = concat!(
-            r#"{"type":"user","message":{"content":[{"text":"hello"}]}}"#, "\n",
-            r#"{"type":"assistant","message":{"content":[{"text":"Hi there!"},{"text":"How can I help?"}]}}"#, "\n",
-            r#"{"type":"user","message":{"content":[{"text":"bye"}]}}"#, "\n",
-            r#"{"type":"assistant","message":{"content":[{"text":"Goodbye!"}]}}"#, "\n",
+            r#"{"type":"user","message":{"content":[{"text":"hello"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"text":"Hi there!"},{"text":"How can I help?"}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"text":"bye"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"text":"Goodbye!"}]}}"#,
+            "\n",
         );
         std::fs::write(&jsonl_path, content).unwrap();
 
         let result = read_last_assistant_message(cwd, uuid);
         assert_eq!(result, Some("Goodbye!".to_string()));
-
-        // Restore HOME
-        match orig_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
     fn read_last_assistant_message_missing_file_returns_none() {
-        let _lock = HOME_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let orig_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", dir.path());
+        let _guard = HomeGuard::set(dir.path());
 
-        let result = read_last_assistant_message("/nonexistent", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        let result =
+            read_last_assistant_message("/nonexistent", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
         assert_eq!(result, None);
-
-        match orig_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
     fn read_last_assistant_message_multi_part_content() {
-        let _lock = HOME_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let orig_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", dir.path());
+        let _guard = HomeGuard::set(dir.path());
 
         let cwd = "/test/multi";
         let uuid = "11111111-2222-3333-4444-555555555555";
@@ -2210,11 +2740,6 @@ mod tests {
 
         let result = read_last_assistant_message(cwd, uuid);
         assert_eq!(result, Some("Part one. Part two.".to_string()));
-
-        match orig_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     // ── parse_session_id_from_cmdline ──
@@ -2223,14 +2748,20 @@ mod tests {
     fn parse_session_id_space_form() {
         let cmdline = "node claude --session-id aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee --other";
         let result = parse_session_id_from_cmdline(cmdline);
-        assert_eq!(result, Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string()));
+        assert_eq!(
+            result,
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string())
+        );
     }
 
     #[test]
     fn parse_session_id_equals_form() {
         let cmdline = "node claude --session-id=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee --other";
         let result = parse_session_id_from_cmdline(cmdline);
-        assert_eq!(result, Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string()));
+        assert_eq!(
+            result,
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string())
+        );
     }
 
     #[test]
@@ -2288,11 +2819,249 @@ mod tests {
         assert_eq!(parse_uuid_from_lsof_output(output), None);
     }
 
+    // ── update_global_stats_inner: no-new-bytes (incremental skip) ──
+
+    #[test]
+    fn global_stats_inner_no_new_bytes_skips_reread() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        let subdir = dir.path().join("proj");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let line = format!(
+            r#"{{"type":"assistant","timestamp":"{today}T10:00:00Z","message":{{"usage":{{"input_tokens":50,"output_tokens":10}},"content":[]}}}}"#,
+        );
+        std::fs::write(subdir.join("log.jsonl"), format!("{line}\n")).unwrap();
+
+        let mut stats = GlobalStats::default();
+        stats.date = today.clone();
+        update_global_stats_inner(&mut stats, &today, Some(dir.path()));
+        assert_eq!(stats.tokens_in, 50);
+
+        // Second call without changes — should hit file_len <= offset path
+        update_global_stats_inner(&mut stats, &today, Some(dir.path()));
+        assert_eq!(stats.tokens_in, 50, "should not re-count on unchanged file");
+    }
+
+    // ── update_global_stats_inner: short lines skipped ──
+
+    #[test]
+    fn global_stats_inner_short_lines_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        let subdir = dir.path().join("proj");
+        std::fs::create_dir_all(&subdir).unwrap();
+        // Short lines (<10 chars) should be skipped
+        std::fs::write(subdir.join("log.jsonl"), "short\n{}\n\n").unwrap();
+
+        let mut stats = GlobalStats::default();
+        stats.date = today.clone();
+        update_global_stats_inner(&mut stats, &today, Some(dir.path()));
+        assert_eq!(stats.tokens_in, 0, "short lines should not parse");
+    }
+
+    // ── update_global_stats_inner: file open error ──
+
+    #[test]
+    fn global_stats_inner_unreadable_file_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        // Create a subdir with a symlink to a nonexistent file
+        let subdir = dir.path().join("proj");
+        std::fs::create_dir_all(&subdir).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/nonexistent/path", subdir.join("bad.jsonl")).unwrap();
+        }
+
+        let mut stats = GlobalStats::default();
+        stats.date = today.clone();
+        // Should not panic — the broken symlink triggers Err on File::open
+        update_global_stats_inner(&mut stats, &today, Some(dir.path()));
+        assert_eq!(stats.tokens_in, 0);
+    }
+
+    // ── update_session_stats: unknown tool name hits default arm ──
+
+    #[test]
+    fn update_session_stats_unknown_tool_name_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        // tool_use with an unrecognized tool name
+        let line = r#"{"type":"assistant","message":{"usage":{"input_tokens":10,"output_tokens":5},"content":[{"type":"tool_use","name":"UnknownTool","input":{}}]}}"#;
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+
+        let mut stats = SessionStats::default();
+        update_session_stats_from_path(&path, &mut stats);
+        assert_eq!(stats.turns, 1, "should still count the turn");
+        assert_eq!(stats.edits, 0, "unknown tool should not count as edit");
+        assert_eq!(stats.bash_cmds, 0, "unknown tool should not count as bash");
+    }
+
+    // ── read_last_assistant_message: non-assistant lines only ──
+
+    #[test]
+    fn read_last_assistant_message_no_assistant_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::set(dir.path());
+
+        let cwd = "/test/noassist";
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let escaped = escape_project_path(cwd);
+        let jsonl_dir = dir.path().join(".claude").join("projects").join(&escaped);
+        std::fs::create_dir_all(&jsonl_dir).unwrap();
+
+        // Only user messages, no assistant messages
+        let content = concat!(
+            r#"{"type":"user","message":{"content":[{"text":"hello"}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"text":"bye"}]}}"#,
+            "\n",
+        );
+        std::fs::write(jsonl_dir.join(format!("{uuid}.jsonl")), content).unwrap();
+
+        let result = read_last_assistant_message(cwd, uuid);
+        assert_eq!(result, None, "no assistant messages should return None");
+    }
+
+    // ── read_last_assistant_message: malformed JSON line ──
+
+    #[test]
+    fn read_last_assistant_message_malformed_json_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::set(dir.path());
+
+        let cwd = "/test/malformed";
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let escaped = escape_project_path(cwd);
+        let jsonl_dir = dir.path().join(".claude").join("projects").join(&escaped);
+        std::fs::create_dir_all(&jsonl_dir).unwrap();
+
+        // Malformed line with "assistant" keyword, followed by a valid assistant message
+        let content = concat!(
+            r#"{"type":"assistant" BROKEN JSON"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"text":"Valid msg"}]}}"#,
+            "\n",
+        );
+        std::fs::write(jsonl_dir.join(format!("{uuid}.jsonl")), content).unwrap();
+
+        let result = read_last_assistant_message(cwd, uuid);
+        assert_eq!(
+            result,
+            Some("Valid msg".to_string()),
+            "should skip malformed and return valid"
+        );
+    }
+
+    // ── read_last_assistant_message: false positive (type != assistant) ──
+
+    #[test]
+    fn read_last_assistant_message_non_assistant_type_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::set(dir.path());
+
+        let cwd = "/test/falsepos";
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let escaped = escape_project_path(cwd);
+        let jsonl_dir = dir.path().join(".claude").join("projects").join(&escaped);
+        std::fs::create_dir_all(&jsonl_dir).unwrap();
+
+        // Line passes the quick filter (contains "assistant" as a JSON key)
+        // but has type != "assistant", hitting the continue at the type check
+        let content = concat!(
+            r#"{"type":"system","assistant":"yes","message":{"content":[{"text":"should not appear"}]}}"#,
+            "\n",
+        );
+        std::fs::write(jsonl_dir.join(format!("{uuid}.jsonl")), content).unwrap();
+
+        let result = read_last_assistant_message(cwd, uuid);
+        assert_eq!(result, None, "non-assistant type should be skipped");
+    }
+
+    // ── read_last_assistant_message: content with no text items ──
+
+    #[test]
+    fn read_last_assistant_message_no_text_content_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::set(dir.path());
+
+        let cwd = "/test/notext";
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let escaped = escape_project_path(cwd);
+        let jsonl_dir = dir.path().join(".claude").join("projects").join(&escaped);
+        std::fs::create_dir_all(&jsonl_dir).unwrap();
+
+        // Assistant message with only tool_use, no text
+        let content = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{}}]}}"#;
+        std::fs::write(
+            jsonl_dir.join(format!("{uuid}.jsonl")),
+            format!("{content}\n"),
+        )
+        .unwrap();
+
+        let result = read_last_assistant_message(cwd, uuid);
+        assert_eq!(
+            result, None,
+            "assistant with no text content should return None"
+        );
+    }
+
+    // ── update_session_stats: incremental seek path ──
+
+    #[test]
+    fn update_session_stats_from_path_incremental_seek() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+
+        // Write initial content
+        let line1 = r#"{"type":"assistant","message":{"usage":{"input_tokens":10,"output_tokens":5},"content":[]}}"#;
+        std::fs::write(&path, format!("{line1}\n")).unwrap();
+
+        let mut stats = SessionStats::default();
+        update_session_stats_from_path(&path, &mut stats);
+        assert_eq!(stats.turns, 1);
+
+        // Append more and read again — exercises the seek path (offset > 0)
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let line2 = r#"{"type":"assistant","message":{"usage":{"input_tokens":20,"output_tokens":10},"content":[]}}"#;
+        writeln!(file, "{line2}").unwrap();
+
+        update_session_stats_from_path(&path, &mut stats);
+        assert_eq!(stats.turns, 2);
+        assert_eq!(stats.tokens_in, 30);
+    }
+
+    // ── update_session_stats: tool_use with multiple tool types including unknown ──
+
+    #[test]
+    fn update_session_stats_mixed_tool_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let line = r#"{"type":"assistant","message":{"usage":{"input_tokens":10,"output_tokens":5},"content":[{"type":"tool_use","name":"Write","input":{}},{"type":"tool_use","name":"Bash","input":{}},{"type":"tool_use","name":"Read","input":{}},{"type":"tool_use","name":"Edit","input":{}}]}}"#;
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+
+        let mut stats = SessionStats::default();
+        update_session_stats_from_path(&path, &mut stats);
+        assert_eq!(stats.edits, 2, "Write + Edit = 2 edits");
+        assert_eq!(stats.bash_cmds, 1, "1 Bash command");
+        // Read and other tools don't increment any counter
+    }
+
     // ── escape_project_path ──
 
     #[test]
     fn escape_project_path_replaces_slashes() {
-        assert_eq!(escape_project_path("/Users/me/project"), "-Users-me-project");
+        assert_eq!(
+            escape_project_path("/Users/me/project"),
+            "-Users-me-project"
+        );
         assert_eq!(escape_project_path("no-slashes"), "no-slashes");
     }
 }

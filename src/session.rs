@@ -37,7 +37,9 @@ impl std::str::FromStr for AgentType {
         match s.to_lowercase().as_str() {
             "claude" => Ok(AgentType::Claude),
             "codex" => Ok(AgentType::Codex),
-            _ => Err(anyhow::anyhow!("Unknown agent type: {s}. Use 'claude' or 'codex'.")),
+            _ => Err(anyhow::anyhow!(
+                "Unknown agent type: {s}. Use 'claude' or 'codex'."
+            )),
         }
     }
 }
@@ -220,12 +222,18 @@ mod tests {
 
     #[test]
     fn agent_type_command_claude() {
-        assert_eq!(AgentType::Claude.command(), "claude --dangerously-skip-permissions");
+        assert_eq!(
+            AgentType::Claude.command(),
+            "claude --dangerously-skip-permissions"
+        );
     }
 
     #[test]
     fn agent_type_command_codex() {
-        assert_eq!(AgentType::Codex.command(), "codex -c check_for_update_on_startup=false --yolo");
+        assert_eq!(
+            AgentType::Codex.command(),
+            "codex -c check_for_update_on_startup=false --yolo"
+        );
     }
 
     // ── AgentType::all tests ──────────────────────────────────────────
@@ -384,10 +392,13 @@ mod tests {
             SessionStatus::Idle,
         ];
         statuses.sort_by_key(|s| s.sort_order());
-        assert_eq!(statuses, vec![
-            SessionStatus::Idle,
-            SessionStatus::Running,
-            SessionStatus::Exited,
-        ]);
+        assert_eq!(
+            statuses,
+            vec![
+                SessionStatus::Idle,
+                SessionStatus::Running,
+                SessionStatus::Exited,
+            ]
+        );
     }
 }

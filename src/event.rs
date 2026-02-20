@@ -3,6 +3,10 @@ use futures::{Stream, StreamExt};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// Bounded event queue capacity.
+/// Large enough to buffer bursty input while preventing unbounded memory growth.
+const EVENT_CHANNEL_CAPACITY: usize = 2048;
+
 #[derive(Debug)]
 pub enum Event {
     Key(KeyEvent),
@@ -12,7 +16,7 @@ pub enum Event {
 }
 
 pub struct EventHandler {
-    rx: mpsc::UnboundedReceiver<Event>,
+    rx: mpsc::Receiver<Event>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -27,7 +31,7 @@ impl EventHandler {
     where
         S: Stream<Item = Result<CrosstermEvent, std::io::Error>> + Send + Unpin + 'static,
     {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
         let task = tokio::spawn(async move {
             let mut reader = stream;
@@ -36,24 +40,26 @@ impl EventHandler {
             loop {
                 tokio::select! {
                     _ = tick.tick() => {
-                        if tx.send(Event::Tick).is_err() {
-                            break;
+                        // Coalesce ticks when the queue is full.
+                        match tx.try_send(Event::Tick) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
                         }
                     }
                     event = reader.next() => {
                         match event {
                             Some(Ok(CrosstermEvent::Key(key))) => {
-                                if tx.send(Event::Key(key)).is_err() {
+                                if tx.send(Event::Key(key)).await.is_err() {
                                     break;
                                 }
                             }
                             Some(Ok(CrosstermEvent::Mouse(mouse))) => {
-                                if tx.send(Event::Mouse(mouse)).is_err() {
+                                if tx.send(Event::Mouse(mouse)).await.is_err() {
                                     break;
                                 }
                             }
                             Some(Ok(CrosstermEvent::Resize(_, _))) => {
-                                if tx.send(Event::Resize).is_err() {
+                                if tx.send(Event::Resize).await.is_err() {
                                     break;
                                 }
                             }

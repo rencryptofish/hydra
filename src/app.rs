@@ -151,9 +151,7 @@ impl App {
                     // Carry forward previous status so hysteresis "keep current" works.
                     // list_sessions() returns fresh Session objects; without this, the
                     // default status would defeat the debounce logic.
-                    if let Some(prev_session) =
-                        self.sessions.iter().find(|s| s.tmux_name == name)
-                    {
+                    if let Some(prev_session) = self.sessions.iter().find(|s| s.tmux_name == name) {
                         if session.status != SessionStatus::Exited {
                             session.status = prev_session.status.clone();
                         }
@@ -172,21 +170,20 @@ impl App {
                     // stuck in Running after the agent finishes.
                     //
                     // Hysteresis thresholds (pane-based):
-                    //   Running → Idle: 12 ticks (~3s), or 3 ticks if log says idle
-                    //   Idle → Running: 2 consecutive changed ticks (~500ms)
+                    //   Running → Idle: 30 ticks (~3s), or 8 ticks if log says idle
+                    //   Idle → Running: 5 consecutive changed ticks (~500ms)
                     // First capture (no previous): immediately set Running.
                     let log_idle = self
                         .session_stats
                         .get(&name)
                         .map(|st| st.task_elapsed().is_none())
                         .unwrap_or(false);
-                    let idle_threshold: u8 = if log_idle { 3 } else { 12 };
+                    let idle_threshold: u8 = if log_idle { 8 } else { 30 };
 
                     if let Some(content) = captures.get(&name) {
                         let raw_prev = self.raw_captures.get(&name);
                         let first_capture = raw_prev.is_none();
-                        let raw_unchanged =
-                            !first_capture && raw_prev.unwrap() == content;
+                        let raw_unchanged = !first_capture && raw_prev.unwrap() == content;
                         self.raw_captures.insert(name.clone(), content.clone());
 
                         // If raw content is identical, skip normalization entirely.
@@ -218,7 +215,7 @@ impl App {
                             *count = count.saturating_add(1);
                             self.idle_ticks.insert(name.clone(), 0);
 
-                            if *count >= 2 {
+                            if *count >= 5 {
                                 session.status = SessionStatus::Running;
                             }
                             // else: keep current status (don't flip to Running on a single blip)
@@ -398,8 +395,8 @@ impl App {
         }
 
         self.message_tick = self.message_tick.wrapping_add(1);
-        // Run every 20 ticks (~5 seconds at 250ms interval)
-        if self.message_tick % 20 != 0 {
+        // Run every 50 ticks (~5 seconds at 100ms interval)
+        if self.message_tick % 50 != 0 {
             return;
         }
 
@@ -409,8 +406,7 @@ impl App {
         }
 
         // Clone data for background task
-        let tmux_names: Vec<String> =
-            self.sessions.iter().map(|s| s.tmux_name.clone()).collect();
+        let tmux_names: Vec<String> = self.sessions.iter().map(|s| s.tmux_name.clone()).collect();
         let log_uuids = self.log_uuids.clone();
         let session_stats = self.session_stats.clone();
         let global_stats = self.global_stats.clone();
@@ -420,14 +416,9 @@ impl App {
         self.bg_refresh_rx = Some(rx);
 
         tokio::spawn(async move {
-            let result = compute_message_refresh(
-                tmux_names,
-                log_uuids,
-                session_stats,
-                global_stats,
-                cwd,
-            )
-            .await;
+            let result =
+                compute_message_refresh(tmux_names, log_uuids, session_stats, global_stats, cwd)
+                    .await;
             let _ = tx.send(result);
         });
     }
@@ -497,9 +488,7 @@ impl App {
         match result {
             Ok(_) => {
                 let mut msg = format!("Created session '{}' with {}", name, agent);
-                if let Err(e) =
-                    crate::manifest::add_session(&manifest_dir, &pid, record).await
-                {
+                if let Err(e) = crate::manifest::add_session(&manifest_dir, &pid, record).await {
                     msg.push_str(&format!(" (warning: manifest save failed: {e})"));
                 }
                 self.status_message = Some(msg);
@@ -664,12 +653,12 @@ impl App {
                                 }
                                 cumulative += 1;
                             }
-                            let item_height =
-                                if self.last_messages.contains_key(&session.tmux_name) {
-                                    2
-                                } else {
-                                    1
-                                };
+                            let item_height = if self.last_messages.contains_key(&session.tmux_name)
+                            {
+                                2
+                            } else {
+                                1
+                            };
                             if row_offset < cumulative + item_height {
                                 target_idx = Some(i);
                                 break;
@@ -943,9 +932,7 @@ async fn get_git_diff_numstat(cwd: &str) -> Vec<DiffFile> {
         };
 
     let mut files = match diff_out {
-        Ok(o) if o.status.success() => {
-            parse_diff_numstat(&String::from_utf8_lossy(&o.stdout))
-        }
+        Ok(o) if o.status.success() => parse_diff_numstat(&String::from_utf8_lossy(&o.stdout)),
         _ => Vec::new(),
     };
 
@@ -1066,7 +1053,9 @@ mod tests {
             self.create_result.clone().map_err(|e| anyhow::anyhow!(e))
         }
         async fn capture_pane(&self, _tmux_name: &str) -> anyhow::Result<String> {
-            let n = self.capture_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let n = self
+                .capture_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             match &self.capture_result {
                 Some(Err(msg)) => Err(anyhow::anyhow!("{}", msg)),
                 _ => {
@@ -1085,15 +1074,22 @@ mod tests {
             }
         }
         async fn send_keys(&self, tmux_name: &str, key: &str) -> anyhow::Result<()> {
-            self.sent_keys.lock().unwrap().push((tmux_name.to_string(), key.to_string()));
+            self.sent_keys
+                .lock()
+                .unwrap()
+                .push((tmux_name.to_string(), key.to_string()));
             Ok(())
         }
         async fn send_keys_literal(&self, tmux_name: &str, text: &str) -> anyhow::Result<()> {
-            self.sent_literals.lock().unwrap().push((tmux_name.to_string(), text.to_string()));
+            self.sent_literals
+                .lock()
+                .unwrap()
+                .push((tmux_name.to_string(), text.to_string()));
             Ok(())
         }
         async fn capture_pane_scrollback(&self, _tmux_name: &str) -> anyhow::Result<String> {
-            self.scrollback_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.scrollback_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             match &self.scrollback_result {
                 Some(Err(msg)) => Err(anyhow::anyhow!("{}", msg)),
                 _ => Ok("mock pane content".to_string()),
@@ -1155,7 +1151,10 @@ mod tests {
         let mut app = test_app_with_sessions(sessions);
         app.selected = 2; // last item
         app.select_next();
-        assert_eq!(app.selected, 0, "select_next should wrap from last to first");
+        assert_eq!(
+            app.selected, 0,
+            "select_next should wrap from last to first"
+        );
     }
 
     #[test]
@@ -1168,7 +1167,10 @@ mod tests {
         let mut app = test_app_with_sessions(sessions);
         app.selected = 0; // first item
         app.select_prev();
-        assert_eq!(app.selected, 2, "select_prev should wrap from first to last");
+        assert_eq!(
+            app.selected, 2,
+            "select_prev should wrap from first to last"
+        );
     }
 
     #[test]
@@ -1391,7 +1393,10 @@ mod tests {
         );
         assert!(app.status_message.is_some());
         assert!(
-            app.status_message.as_ref().unwrap().contains("Created session 'alpha'"),
+            app.status_message
+                .as_ref()
+                .unwrap()
+                .contains("Created session 'alpha'"),
             "should auto-generate name 'alpha': got {:?}",
             app.status_message
         );
@@ -1417,7 +1422,10 @@ mod tests {
         );
         assert!(app.status_message.is_some());
         assert!(
-            app.status_message.as_ref().unwrap().contains("Killed session"),
+            app.status_message
+                .as_ref()
+                .unwrap()
+                .contains("Killed session"),
             "status should indicate session was killed: got {:?}",
             app.status_message
         );
@@ -1490,9 +1498,33 @@ mod tests {
         let out = "45\t12\tsrc/app.rs\n30\t5\tsrc/ui.rs\n3\t0\tREADME.md\n";
         let files = super::parse_diff_numstat(out);
         assert_eq!(files.len(), 3);
-        assert_eq!(files[0], super::DiffFile { path: "src/app.rs".into(), insertions: 45, deletions: 12, untracked: false });
-        assert_eq!(files[1], super::DiffFile { path: "src/ui.rs".into(), insertions: 30, deletions: 5, untracked: false });
-        assert_eq!(files[2], super::DiffFile { path: "README.md".into(), insertions: 3, deletions: 0, untracked: false });
+        assert_eq!(
+            files[0],
+            super::DiffFile {
+                path: "src/app.rs".into(),
+                insertions: 45,
+                deletions: 12,
+                untracked: false
+            }
+        );
+        assert_eq!(
+            files[1],
+            super::DiffFile {
+                path: "src/ui.rs".into(),
+                insertions: 30,
+                deletions: 5,
+                untracked: false
+            }
+        );
+        assert_eq!(
+            files[2],
+            super::DiffFile {
+                path: "README.md".into(),
+                insertions: 3,
+                deletions: 0,
+                untracked: false
+            }
+        );
     }
 
     #[test]
@@ -1674,7 +1706,6 @@ mod tests {
 
     #[test]
     fn mouse_click_sidebar_selects_session() {
-
         let sessions = vec![
             make_session("a", AgentType::Claude),
             make_session("b", AgentType::Claude),
@@ -1692,12 +1723,14 @@ mod tests {
             row: 3,
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
-        assert_eq!(app.selected, 1, "clicking second row should select session 1");
+        assert_eq!(
+            app.selected, 1,
+            "clicking second row should select session 1"
+        );
     }
 
     #[test]
     fn mouse_click_sidebar_status_header_does_not_change_selection() {
-
         let sessions = vec![
             make_session_with_status("a", AgentType::Claude, SessionStatus::Idle),
             make_session_with_status("b", AgentType::Claude, SessionStatus::Running),
@@ -1719,7 +1752,6 @@ mod tests {
 
     #[test]
     fn mouse_click_sidebar_with_multiple_status_groups() {
-
         let sessions = vec![
             make_session_with_status("a", AgentType::Claude, SessionStatus::Idle),
             make_session_with_status("b", AgentType::Claude, SessionStatus::Running),
@@ -1742,7 +1774,6 @@ mod tests {
 
     #[test]
     fn mouse_click_preview_attaches() {
-
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
         app.sidebar_area.set(Rect::new(0, 0, 24, 20));
@@ -1760,7 +1791,6 @@ mod tests {
 
     #[test]
     fn mouse_scroll_up_preview_scrolls() {
-
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
         app.sidebar_area.set(Rect::new(0, 0, 24, 20));
@@ -1777,7 +1807,6 @@ mod tests {
 
     #[test]
     fn mouse_scroll_down_preview_scrolls() {
-
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
         app.sidebar_area.set(Rect::new(0, 0, 24, 20));
@@ -1795,7 +1824,6 @@ mod tests {
 
     #[test]
     fn mouse_scroll_sidebar_navigates() {
-
         let sessions = vec![
             make_session("a", AgentType::Claude),
             make_session("b", AgentType::Claude),
@@ -1826,7 +1854,6 @@ mod tests {
 
     #[test]
     fn mouse_attached_click_outside_detaches() {
-
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
         app.mode = Mode::Attached;
@@ -1845,7 +1872,6 @@ mod tests {
 
     #[test]
     fn mouse_attached_scroll_up_in_preview() {
-
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
         app.mode = Mode::Attached;
@@ -1864,7 +1890,6 @@ mod tests {
 
     #[test]
     fn mouse_attached_scroll_down_in_preview() {
-
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
         app.mode = Mode::Attached;
@@ -1883,7 +1908,6 @@ mod tests {
 
     #[test]
     fn mouse_other_mode_is_noop() {
-
         let mut app = test_app();
         app.mode = Mode::ConfirmDelete;
         app.sidebar_area.set(Rect::new(0, 0, 24, 20));
@@ -1911,7 +1935,11 @@ mod tests {
         );
         app.refresh_sessions().await;
         assert!(app.status_message.is_some());
-        assert!(app.status_message.as_ref().unwrap().contains("Error listing sessions"));
+        assert!(app
+            .status_message
+            .as_ref()
+            .unwrap()
+            .contains("Error listing sessions"));
     }
 
     #[tokio::test]
@@ -1938,7 +1966,11 @@ mod tests {
         app.mode = Mode::NewSessionAgent;
         app.confirm_new_session().await;
         assert_eq!(app.mode, Mode::Browse);
-        assert!(app.status_message.as_ref().unwrap().contains("Failed to create session"));
+        assert!(app
+            .status_message
+            .as_ref()
+            .unwrap()
+            .contains("Failed to create session"));
     }
 
     #[tokio::test]
@@ -1953,7 +1985,11 @@ mod tests {
         app.mode = Mode::ConfirmDelete;
         app.confirm_delete().await;
         assert_eq!(app.mode, Mode::Browse);
-        assert!(app.status_message.as_ref().unwrap().contains("Failed to kill session"));
+        assert!(app
+            .status_message
+            .as_ref()
+            .unwrap()
+            .contains("Failed to kill session"));
     }
 
     #[tokio::test]
@@ -1994,16 +2030,28 @@ mod tests {
             Box::new(MockSessionManager::with_sessions(sessions)),
         );
         app.refresh_sessions().await;
-        assert_eq!(app.sessions[0].status, SessionStatus::Running, "first tick = Running (first capture)");
+        assert_eq!(
+            app.sessions[0].status,
+            SessionStatus::Running,
+            "first tick = Running (first capture)"
+        );
 
-        // With debouncing, need 12 consecutive unchanged ticks (~3s) to become Idle
-        for i in 2..=12 {
+        // With debouncing, need 30 consecutive unchanged ticks (~3s) to become Idle
+        for i in 2..=30 {
             app.refresh_sessions().await;
-            assert_eq!(app.sessions[0].status, SessionStatus::Running, "tick {i} still Running");
+            assert_eq!(
+                app.sessions[0].status,
+                SessionStatus::Running,
+                "tick {i} still Running"
+            );
         }
-        // 13th tick: 12 consecutive unchanged → Idle
+        // 31st tick: 30 consecutive unchanged → Idle
         app.refresh_sessions().await;
-        assert_eq!(app.sessions[0].status, SessionStatus::Idle, "tick 13 = Idle (12 consecutive unchanged)");
+        assert_eq!(
+            app.sessions[0].status,
+            SessionStatus::Idle,
+            "tick 31 = Idle (30 consecutive unchanged)"
+        );
     }
 
     #[tokio::test]
@@ -2046,11 +2094,14 @@ mod tests {
         // After alphabetical sort, "alpha" is 0 and "bravo" is 1
         // Selection should follow "bravo" to its new index
         let selected_name = &app.sessions[app.selected].name;
-        assert_eq!(selected_name, "bravo", "selection should follow session across sort");
+        assert_eq!(
+            selected_name, "bravo",
+            "selection should follow session across sort"
+        );
     }
 
     #[tokio::test]
-    async fn refresh_messages_only_runs_every_20_ticks() {
+    async fn refresh_messages_only_runs_every_50_ticks() {
         let mut app = test_app();
         // message_tick starts at 0, first call increments to 1
         app.refresh_messages();
@@ -2062,7 +2113,6 @@ mod tests {
 
     #[test]
     fn mouse_click_sidebar_with_two_line_items() {
-
         let sessions = vec![
             make_session("a", AgentType::Claude),
             make_session("b", AgentType::Claude),
@@ -2071,7 +2121,8 @@ mod tests {
         app.sidebar_area.set(Rect::new(0, 0, 24, 20));
         app.preview_area.set(Rect::new(24, 0, 56, 20));
         // First session has a message (2 lines), second doesn't (1 line)
-        app.last_messages.insert("hydra-testid-a".to_string(), "some msg".to_string());
+        app.last_messages
+            .insert("hydra-testid-a".to_string(), "some msg".to_string());
 
         // Rows: header, a, a-msg, b. Session b is at y=4.
         app.handle_mouse(MouseEvent {
@@ -2087,7 +2138,6 @@ mod tests {
 
     #[test]
     fn mouse_click_tiny_sidebar_no_panic() {
-
         let mut app = test_app();
         // Sidebar too small (width < 2)
         app.sidebar_area.set(Rect::new(0, 0, 1, 1));
@@ -2104,7 +2154,6 @@ mod tests {
 
     #[test]
     fn mouse_move_is_noop() {
-
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
         app.sidebar_area.set(Rect::new(0, 0, 24, 20));
@@ -2167,8 +2216,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pid = "testid";
         let mut manifest = crate::manifest::Manifest::default();
-        manifest.sessions.insert("alpha".to_string(), make_manifest_record("alpha", "claude"));
-        crate::manifest::save_manifest(dir.path(), pid, &manifest).await.unwrap();
+        manifest
+            .sessions
+            .insert("alpha".to_string(), make_manifest_record("alpha", "claude"));
+        crate::manifest::save_manifest(dir.path(), pid, &manifest)
+            .await
+            .unwrap();
 
         let mut app = App::new_with_manager(
             pid.to_string(),
@@ -2180,7 +2233,10 @@ mod tests {
 
         assert!(app.status_message.is_some());
         let msg = app.status_message.as_ref().unwrap();
-        assert!(msg.contains("Revived 1"), "should revive 1 session, got: {msg}");
+        assert!(
+            msg.contains("Revived 1"),
+            "should revive 1 session, got: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -2188,8 +2244,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pid = "testid";
         let mut manifest = crate::manifest::Manifest::default();
-        manifest.sessions.insert("alpha".to_string(), make_manifest_record("alpha", "claude"));
-        crate::manifest::save_manifest(dir.path(), pid, &manifest).await.unwrap();
+        manifest
+            .sessions
+            .insert("alpha".to_string(), make_manifest_record("alpha", "claude"));
+        crate::manifest::save_manifest(dir.path(), pid, &manifest)
+            .await
+            .unwrap();
 
         let sessions = vec![Session {
             name: "alpha".to_string(),
@@ -2216,8 +2276,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pid = "testid";
         let mut manifest = crate::manifest::Manifest::default();
-        manifest.sessions.insert("bad".to_string(), make_manifest_record("bad", "unknown_agent"));
-        crate::manifest::save_manifest(dir.path(), pid, &manifest).await.unwrap();
+        manifest.sessions.insert(
+            "bad".to_string(),
+            make_manifest_record("bad", "unknown_agent"),
+        );
+        crate::manifest::save_manifest(dir.path(), pid, &manifest)
+            .await
+            .unwrap();
 
         let mut app = App::new_with_manager(
             pid.to_string(),
@@ -2229,7 +2294,10 @@ mod tests {
 
         assert!(app.status_message.is_some());
         let msg = app.status_message.as_ref().unwrap();
-        assert!(msg.contains("failed 1"), "should report 1 failed, got: {msg}");
+        assert!(
+            msg.contains("failed 1"),
+            "should report 1 failed, got: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -2237,15 +2305,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pid = "testid";
         let mut manifest = crate::manifest::Manifest::default();
-        manifest.sessions.insert("alpha".to_string(), make_manifest_record("alpha", "claude"));
-        crate::manifest::save_manifest(dir.path(), pid, &manifest).await.unwrap();
+        manifest
+            .sessions
+            .insert("alpha".to_string(), make_manifest_record("alpha", "claude"));
+        crate::manifest::save_manifest(dir.path(), pid, &manifest)
+            .await
+            .unwrap();
 
         let mock = MockSessionManager::new().with_create_error("tmux error");
-        let mut app = App::new_with_manager(
-            pid.to_string(),
-            "/tmp/test".to_string(),
-            Box::new(mock),
-        );
+        let mut app =
+            App::new_with_manager(pid.to_string(), "/tmp/test".to_string(), Box::new(mock));
         app.manifest_dir = dir.path().to_path_buf();
         app.revive_sessions().await;
 
@@ -2263,7 +2332,9 @@ mod tests {
         // Set failed_attempts to one below the threshold
         record.failed_attempts = crate::manifest::MAX_FAILED_ATTEMPTS - 1;
         manifest.sessions.insert("doomed".to_string(), record);
-        crate::manifest::save_manifest(dir.path(), pid, &manifest).await.unwrap();
+        crate::manifest::save_manifest(dir.path(), pid, &manifest)
+            .await
+            .unwrap();
 
         let mut app = App::new_with_manager(
             pid.to_string(),
@@ -2302,8 +2373,10 @@ mod tests {
         );
 
         // Pre-set a task start to verify it gets cleaned up
-        app.task_starts.insert("hydra-testid-dead".to_string(), std::time::Instant::now());
-        app.task_last_active.insert("hydra-testid-dead".to_string(), std::time::Instant::now());
+        app.task_starts
+            .insert("hydra-testid-dead".to_string(), std::time::Instant::now());
+        app.task_last_active
+            .insert("hydra-testid-dead".to_string(), std::time::Instant::now());
 
         app.refresh_sessions().await;
         assert_eq!(app.sessions[0].status, SessionStatus::Exited);
@@ -2328,8 +2401,8 @@ mod tests {
             Box::new(MockSessionManager::with_sessions(sessions)),
         );
 
-        // Run enough ticks to stabilize at Idle (1 first-capture + 12 unchanged = 13)
-        for _ in 0..13 {
+        // Run enough ticks to stabilize at Idle (1 first-capture + 30 unchanged = 31)
+        for _ in 0..31 {
             app.refresh_sessions().await;
         }
         assert_eq!(app.sessions[0].status, SessionStatus::Idle);
@@ -2554,7 +2627,11 @@ mod tests {
         app.mode = Mode::Attached;
 
         // Send Ctrl+C
-        app.handle_attached_key(make_key_with_mods(KeyCode::Char('c'), KeyModifiers::CONTROL)).await;
+        app.handle_attached_key(make_key_with_mods(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        ))
+        .await;
 
         let keys = sent_keys.lock().unwrap();
         assert_eq!(keys.len(), 1);
@@ -2732,7 +2809,6 @@ mod tests {
 
     #[test]
     fn mouse_click_already_selected_session_stays() {
-
         let sessions = vec![
             make_session("a", AgentType::Claude),
             make_session("b", AgentType::Claude),
@@ -2757,7 +2833,6 @@ mod tests {
 
     #[test]
     fn mouse_attached_scroll_outside_preview_is_noop() {
-
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
         app.mode = Mode::Attached;
@@ -2771,7 +2846,10 @@ mod tests {
             row: 5,
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
-        assert_eq!(app.preview_scroll_offset, 0, "scroll outside preview should be noop");
+        assert_eq!(
+            app.preview_scroll_offset, 0,
+            "scroll outside preview should be noop"
+        );
         assert_eq!(app.mode, Mode::Attached);
     }
 
@@ -2800,12 +2878,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_messages_runs_on_20th_tick() {
+    async fn refresh_messages_runs_on_50th_tick() {
         let mut app = test_app();
-        // Start at tick 19 so the next call (tick 20) triggers the inner loop
-        app.message_tick = 19;
+        // Start at tick 49 so the next call (tick 50) triggers the inner loop
+        app.message_tick = 49;
         app.refresh_messages();
-        assert_eq!(app.message_tick, 20);
+        assert_eq!(app.message_tick, 50);
         // No panic and no sessions to process — this just covers the tick check
     }
 
@@ -2822,7 +2900,9 @@ mod tests {
             global_stats: crate::logs::GlobalStats::default(),
             diff_files: vec![],
         };
-        result.last_messages.insert("test-session".to_string(), "hello world".to_string());
+        result
+            .last_messages
+            .insert("test-session".to_string(), "hello world".to_string());
         tx.send(result).ok(); // ignore error (can't unwrap without Debug on the error type)
 
         app.bg_refresh_rx = Some(rx);
@@ -2845,7 +2925,10 @@ mod tests {
         app.bg_refresh_rx = Some(rx);
         app.refresh_messages();
 
-        assert!(app.bg_refresh_rx.is_some(), "should put receiver back when task is still running");
+        assert!(
+            app.bg_refresh_rx.is_some(),
+            "should put receiver back when task is still running"
+        );
         drop(tx); // cleanup
     }
 
@@ -2859,7 +2942,10 @@ mod tests {
         app.bg_refresh_rx = Some(rx);
         app.refresh_messages();
 
-        assert!(app.bg_refresh_rx.is_none(), "should clear channel when task was dropped");
+        assert!(
+            app.bg_refresh_rx.is_none(),
+            "should clear channel when task was dropped"
+        );
     }
 
     #[tokio::test]
@@ -2874,7 +2960,10 @@ mod tests {
         app.refresh_messages();
         assert_eq!(app.message_tick, 20);
         // bg_refresh_rx should still be set (the pending one, not a new one)
-        assert!(app.bg_refresh_rx.is_some(), "should not start new bg task when one is running");
+        assert!(
+            app.bg_refresh_rx.is_some(),
+            "should not start new bg task when one is running"
+        );
         drop(_tx);
     }
 
@@ -2888,7 +2977,6 @@ mod tests {
 
     #[test]
     fn mouse_attached_click_inside_preview_stays_attached() {
-
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
         app.mode = Mode::Attached;
@@ -2902,7 +2990,11 @@ mod tests {
             row: 5,
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
-        assert_eq!(app.mode, Mode::Attached, "clicking inside preview should stay attached");
+        assert_eq!(
+            app.mode,
+            Mode::Attached,
+            "clicking inside preview should stay attached"
+        );
     }
 
     #[test]
@@ -2920,7 +3012,10 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
 
-        assert!(app.pending_literal_keys.is_none(), "should not forward mouse clicks to agents");
+        assert!(
+            app.pending_literal_keys.is_none(),
+            "should not forward mouse clicks to agents"
+        );
         assert_eq!(app.mode, Mode::Attached);
     }
 
@@ -2940,12 +3035,14 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
 
-        assert_eq!(app.preview_scroll_offset, 0, "click should reset scroll to bottom");
+        assert_eq!(
+            app.preview_scroll_offset, 0,
+            "click should reset scroll to bottom"
+        );
     }
 
     #[test]
     fn mouse_attached_other_event_is_noop() {
-
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
         app.mode = Mode::Attached;
@@ -2974,7 +3071,10 @@ mod tests {
         app.selected = 5; // out-of-bounds for an empty list
         app.refresh_sessions().await;
         assert!(app.sessions.is_empty());
-        assert_eq!(app.selected, 0, "selected should reset to 0 when sessions list is empty");
+        assert_eq!(
+            app.selected, 0,
+            "selected should reset to 0 when sessions list is empty"
+        );
     }
 
     // ── Resilience: HashMap pruning removes stale keys ──────────────
@@ -2996,24 +3096,52 @@ mod tests {
         app.task_starts.insert(stale.clone(), Instant::now());
         app.task_last_active.insert(stale.clone(), Instant::now());
         app.last_messages.insert(stale.clone(), "msg".into());
-        app.session_stats.insert(stale.clone(), SessionStats::default());
+        app.session_stats
+            .insert(stale.clone(), SessionStats::default());
         app.log_uuids.insert(stale.clone(), "uuid".into());
 
         app.refresh_sessions().await;
 
         // Live session key should still exist in prev_captures (inserted during refresh)
         let live = "hydra-testid-alpha".to_string();
-        assert!(app.prev_captures.contains_key(&live), "live key should remain");
+        assert!(
+            app.prev_captures.contains_key(&live),
+            "live key should remain"
+        );
 
         // Stale key should be pruned from all maps
-        assert!(!app.prev_captures.contains_key(&stale), "stale prev_captures should be pruned");
-        assert!(!app.idle_ticks.contains_key(&stale), "stale idle_ticks should be pruned");
-        assert!(!app.changed_ticks.contains_key(&stale), "stale changed_ticks should be pruned");
-        assert!(!app.task_starts.contains_key(&stale), "stale task_starts should be pruned");
-        assert!(!app.task_last_active.contains_key(&stale), "stale task_last_active should be pruned");
-        assert!(!app.last_messages.contains_key(&stale), "stale last_messages should be pruned");
-        assert!(!app.session_stats.contains_key(&stale), "stale session_stats should be pruned");
-        assert!(!app.log_uuids.contains_key(&stale), "stale log_uuids should be pruned");
+        assert!(
+            !app.prev_captures.contains_key(&stale),
+            "stale prev_captures should be pruned"
+        );
+        assert!(
+            !app.idle_ticks.contains_key(&stale),
+            "stale idle_ticks should be pruned"
+        );
+        assert!(
+            !app.changed_ticks.contains_key(&stale),
+            "stale changed_ticks should be pruned"
+        );
+        assert!(
+            !app.task_starts.contains_key(&stale),
+            "stale task_starts should be pruned"
+        );
+        assert!(
+            !app.task_last_active.contains_key(&stale),
+            "stale task_last_active should be pruned"
+        );
+        assert!(
+            !app.last_messages.contains_key(&stale),
+            "stale last_messages should be pruned"
+        );
+        assert!(
+            !app.session_stats.contains_key(&stale),
+            "stale session_stats should be pruned"
+        );
+        assert!(
+            !app.log_uuids.contains_key(&stale),
+            "stale log_uuids should be pruned"
+        );
     }
 
     // ── Revival: success resets failed_attempts ──────────────────
@@ -3026,7 +3154,9 @@ mod tests {
         let mut record = make_manifest_record("alpha", "claude");
         record.failed_attempts = 2; // Previously failed twice
         manifest.sessions.insert("alpha".to_string(), record);
-        crate::manifest::save_manifest(dir.path(), pid, &manifest).await.unwrap();
+        crate::manifest::save_manifest(dir.path(), pid, &manifest)
+            .await
+            .unwrap();
 
         let mut app = App::new_with_manager(
             pid.to_string(),
@@ -3061,11 +3191,18 @@ mod tests {
         app.confirm_new_session().await;
 
         assert_eq!(app.mode, Mode::Browse);
-        assert!(app.status_message.as_ref().unwrap().contains("Created session"));
+        assert!(app
+            .status_message
+            .as_ref()
+            .unwrap()
+            .contains("Created session"));
 
         // Verify manifest was saved (name is auto-generated)
         let loaded = crate::manifest::load_manifest(dir.path(), pid).await;
-        assert!(!loaded.sessions.is_empty(), "manifest should have the new session");
+        assert!(
+            !loaded.sessions.is_empty(),
+            "manifest should have the new session"
+        );
     }
 
     // ── confirm_delete success path ──────────────────────────────
@@ -3077,8 +3214,12 @@ mod tests {
 
         // Pre-populate manifest with a session
         let mut manifest = crate::manifest::Manifest::default();
-        manifest.sessions.insert("s1".to_string(), make_manifest_record("s1", "claude"));
-        crate::manifest::save_manifest(dir.path(), pid, &manifest).await.unwrap();
+        manifest
+            .sessions
+            .insert("s1".to_string(), make_manifest_record("s1", "claude"));
+        crate::manifest::save_manifest(dir.path(), pid, &manifest)
+            .await
+            .unwrap();
 
         let sessions = vec![make_session("s1", AgentType::Claude)];
         let mut app = App::new_with_manager(
@@ -3092,11 +3233,18 @@ mod tests {
         app.confirm_delete().await;
 
         assert_eq!(app.mode, Mode::Browse);
-        assert!(app.status_message.as_ref().unwrap().contains("Killed session"));
+        assert!(app
+            .status_message
+            .as_ref()
+            .unwrap()
+            .contains("Killed session"));
 
         // Verify manifest entry was removed
         let loaded = crate::manifest::load_manifest(dir.path(), pid).await;
-        assert!(!loaded.sessions.contains_key("s1"), "session should be removed from manifest");
+        assert!(
+            !loaded.sessions.contains_key("s1"),
+            "session should be removed from manifest"
+        );
     }
 
     // ── Mouse: scroll in preview scrolls viewport ────────────────
@@ -3152,8 +3300,14 @@ mod tests {
         app.refresh_sessions().await;
 
         let key = "hydra-testid-worker";
-        assert!(app.task_starts.contains_key(key), "Running session should start task timer");
-        assert!(app.task_last_active.contains_key(key), "Running session should set last_active");
+        assert!(
+            app.task_starts.contains_key(key),
+            "Running session should start task timer"
+        );
+        assert!(
+            app.task_last_active.contains_key(key),
+            "Running session should set last_active"
+        );
     }
 
     // ── Task timer: Idle with recent activity keeps frozen timer ──
@@ -3183,9 +3337,15 @@ mod tests {
         app.refresh_sessions().await;
 
         // Timer should still be set (within 5s window)
-        assert!(app.task_starts.contains_key(&key), "recent idle should keep task timer");
+        assert!(
+            app.task_starts.contains_key(&key),
+            "recent idle should keep task timer"
+        );
         // Session should have a task_elapsed value
-        assert!(app.sessions[0].task_elapsed.is_some(), "idle within 5s should show frozen timer");
+        assert!(
+            app.sessions[0].task_elapsed.is_some(),
+            "idle within 5s should show frozen timer"
+        );
     }
 
     // ── normalize_capture tests ─────────────────────────────────────
@@ -3237,7 +3397,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_sessions_log_idle_accelerates_idle_detection() {
         // When the log confirms the agent is idle (assistant replied),
-        // the idle threshold drops from 12 to 3 ticks for faster detection.
+        // the idle threshold drops from 30 to 8 ticks for faster detection.
         let sessions = vec![make_session("s1", AgentType::Claude)];
         let mut app = App::new_with_manager(
             "testid".to_string(),
@@ -3263,24 +3423,24 @@ mod tests {
         app.refresh_sessions().await;
         assert_eq!(app.sessions[0].status, SessionStatus::Running, "tick 1");
 
-        // Ticks 2-3: unchanged, but idle_ticks < 3
-        app.refresh_sessions().await;
-        assert_eq!(app.sessions[0].status, SessionStatus::Running, "tick 2");
-        app.refresh_sessions().await;
-        assert_eq!(app.sessions[0].status, SessionStatus::Running, "tick 3");
+        // Ticks 2-8: unchanged, but idle_ticks < 8
+        for i in 2..=8 {
+            app.refresh_sessions().await;
+            assert_eq!(app.sessions[0].status, SessionStatus::Running, "tick {i}");
+        }
 
-        // Tick 4: idle_ticks reaches 3, accelerated threshold met → Idle
+        // Tick 9: idle_ticks reaches 8, accelerated threshold met → Idle
         app.refresh_sessions().await;
         assert_eq!(
             app.sessions[0].status,
             SessionStatus::Idle,
-            "tick 4: log_idle should accelerate to Idle at 3 ticks"
+            "tick 9: log_idle should accelerate to Idle at 8 ticks"
         );
     }
 
     #[tokio::test]
     async fn refresh_sessions_no_log_uses_full_threshold() {
-        // Without log data, the full 12-tick threshold applies.
+        // Without log data, the full 30-tick threshold applies.
         let sessions = vec![make_session("s1", AgentType::Claude)];
         let mut app = App::new_with_manager(
             "testid".to_string(),
@@ -3288,36 +3448,40 @@ mod tests {
             Box::new(MockSessionManager::with_sessions(sessions)),
         );
 
-        // No session_stats → log_idle is false → threshold is 12
+        // No session_stats → log_idle is false → threshold is 30
 
         // First tick: first_capture → Running
         app.refresh_sessions().await;
         assert_eq!(app.sessions[0].status, SessionStatus::Running);
 
-        // At tick 4, should still be Running (threshold is 12, not 3)
-        for _ in 2..=4 {
+        // At tick 9, should still be Running (threshold is 30, not 8)
+        for _ in 2..=9 {
             app.refresh_sessions().await;
         }
         assert_eq!(
             app.sessions[0].status,
             SessionStatus::Running,
-            "tick 4: without log data, still Running (need 12 ticks)"
+            "tick 9: without log data, still Running (need 30 ticks)"
         );
 
-        // At tick 13, should be Idle
-        for _ in 5..=13 {
+        // At tick 31, should be Idle
+        for _ in 10..=31 {
             app.refresh_sessions().await;
         }
-        assert_eq!(app.sessions[0].status, SessionStatus::Idle, "tick 13: Idle after 12 unchanged");
+        assert_eq!(
+            app.sessions[0].status,
+            SessionStatus::Idle,
+            "tick 31: Idle after 30 unchanged"
+        );
     }
 
-    // ── changed_ticks → Running transition (Idle→Running needs 2 changed ticks) ──
+    // ── changed_ticks → Running transition (Idle→Running needs 5 changed ticks) ──
 
     #[tokio::test]
-    async fn refresh_sessions_changed_content_triggers_running_after_two_ticks() {
+    async fn refresh_sessions_changed_content_triggers_running_after_five_ticks() {
         let sessions = vec![make_session("s1", AgentType::Claude)];
-        let manager = MockSessionManager::with_sessions(sessions)
-            .with_capture_fn(|n| format!("output {n}"));
+        let manager =
+            MockSessionManager::with_sessions(sessions).with_capture_fn(|n| format!("output {n}"));
 
         let mut app = App::new_with_manager(
             "testid".to_string(),
@@ -3327,15 +3491,29 @@ mod tests {
 
         // First tick: first_capture → Running
         app.refresh_sessions().await;
-        assert_eq!(app.sessions[0].status, SessionStatus::Running, "tick 1: first capture = Running");
+        assert_eq!(
+            app.sessions[0].status,
+            SessionStatus::Running,
+            "tick 1: first capture = Running"
+        );
 
-        // Tick 2: content changed (output 0→output 1), changed_ticks=1, but < 2 → keep Running
-        app.refresh_sessions().await;
-        assert_eq!(app.sessions[0].status, SessionStatus::Running, "tick 2: 1 changed tick, keep current");
+        // Ticks 2-5: content changed, changed_ticks < 5 → keep Running (already Running from first capture)
+        for i in 2..=5 {
+            app.refresh_sessions().await;
+            assert_eq!(
+                app.sessions[0].status,
+                SessionStatus::Running,
+                "tick {i}: keep current"
+            );
+        }
 
-        // Tick 3: content changed again, changed_ticks=2 → Running confirmed
+        // Tick 6: content changed again, changed_ticks=5 → Running confirmed
         app.refresh_sessions().await;
-        assert_eq!(app.sessions[0].status, SessionStatus::Running, "tick 3: 2 changed ticks → Running");
+        assert_eq!(
+            app.sessions[0].status,
+            SessionStatus::Running,
+            "tick 6: 5 changed ticks → Running"
+        );
     }
 
     // ── changed_ticks resets idle_ticks and vice versa ──
@@ -3343,10 +3521,10 @@ mod tests {
     #[tokio::test]
     async fn refresh_sessions_changed_after_idle_resets_idle_ticks() {
         let sessions = vec![make_session("s1", AgentType::Claude)];
-        // First 14 calls return same content (to get to Idle),
+        // First 32 calls return same content (to get to Idle),
         // then alternate to trigger changed_ticks
         let manager = MockSessionManager::with_sessions(sessions).with_capture_fn(|n| {
-            if n < 14 {
+            if n < 32 {
                 "stable".to_string()
             } else {
                 format!("changing {n}")
@@ -3359,19 +3537,33 @@ mod tests {
             Box::new(manager),
         );
 
-        // Run 14 ticks to get to Idle (first capture = Running, then 12 unchanged = Idle)
-        for _ in 0..14 {
+        // Run 32 ticks to get to Idle (first capture = Running, then 30 unchanged = Idle)
+        for _ in 0..32 {
             app.refresh_sessions().await;
         }
-        assert_eq!(app.sessions[0].status, SessionStatus::Idle, "should be Idle after 14 ticks");
+        assert_eq!(
+            app.sessions[0].status,
+            SessionStatus::Idle,
+            "should be Idle after 32 ticks"
+        );
 
-        // Now content changes — 1st change: changed_ticks=1, keep Idle (hysteresis)
-        app.refresh_sessions().await;
-        assert_eq!(app.sessions[0].status, SessionStatus::Idle, "1 changed tick: still Idle");
+        // Now content changes — ticks 1-4: changed_ticks < 5, keep Idle (hysteresis)
+        for _ in 0..4 {
+            app.refresh_sessions().await;
+        }
+        assert_eq!(
+            app.sessions[0].status,
+            SessionStatus::Idle,
+            "4 changed ticks: still Idle"
+        );
 
-        // 2nd consecutive change: changed_ticks=2 → Running
+        // 5th consecutive change: changed_ticks=5 → Running
         app.refresh_sessions().await;
-        assert_eq!(app.sessions[0].status, SessionStatus::Running, "2 changed ticks: flips to Running");
+        assert_eq!(
+            app.sessions[0].status,
+            SessionStatus::Running,
+            "5 changed ticks: flips to Running"
+        );
     }
 
     // ── Preview skip optimization ──
@@ -3396,7 +3588,10 @@ mod tests {
         app.preview = "modified".to_string();
         app.refresh_preview().await;
         // If it skipped, preview remains "modified" (wasn't overwritten)
-        assert_eq!(app.preview, "modified", "should skip capture when idle and same session");
+        assert_eq!(
+            app.preview, "modified",
+            "should skip capture when idle and same session"
+        );
 
         // Change selected session — should NOT skip
         app.sessions.push(make_session("s2", AgentType::Claude));
@@ -3422,7 +3617,10 @@ mod tests {
         app.preview = "modified".to_string();
         app.refresh_preview().await;
         // Should NOT skip, so preview is overwritten
-        assert_ne!(app.preview, "modified", "should not skip when idle_ticks = 0");
+        assert_ne!(
+            app.preview, "modified",
+            "should not skip when idle_ticks = 0"
+        );
     }
 
     #[tokio::test]
@@ -3441,7 +3639,11 @@ mod tests {
         );
 
         app.refresh_sessions().await;
-        assert_eq!(pane_calls.load(Ordering::SeqCst), 1, "refresh_sessions should capture pane once");
+        assert_eq!(
+            pane_calls.load(Ordering::SeqCst),
+            1,
+            "refresh_sessions should capture pane once"
+        );
 
         app.refresh_preview().await;
         assert_eq!(app.preview, "pane-capture");
@@ -3488,7 +3690,10 @@ mod tests {
         // While still scrolled up in same session, preview should stay frozen.
         app.preview = "frozen".to_string();
         app.refresh_preview().await;
-        assert_eq!(app.preview, "frozen", "scrolled history should not recapture every tick");
+        assert_eq!(
+            app.preview, "frozen",
+            "scrolled history should not recapture every tick"
+        );
         assert_eq!(
             scrollback_calls.load(Ordering::SeqCst),
             1,
@@ -3560,7 +3765,11 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::NONE,
         };
         app.handle_mouse(mouse);
-        assert_eq!(app.mode, Mode::Browse, "right-click outside preview should detach");
+        assert_eq!(
+            app.mode,
+            Mode::Browse,
+            "right-click outside preview should detach"
+        );
     }
 
     #[test]
@@ -3580,7 +3789,11 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::NONE,
         };
         app.handle_mouse(mouse);
-        assert_eq!(app.mode, Mode::Browse, "left-click outside preview should detach");
+        assert_eq!(
+            app.mode,
+            Mode::Browse,
+            "left-click outside preview should detach"
+        );
     }
 
     #[test]
@@ -3594,14 +3807,24 @@ mod tests {
 
         let mouse = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: 40,  // inside inner preview
+            column: 40, // inside inner preview
             row: 5,
             modifiers: crossterm::event::KeyModifiers::NONE,
         };
         app.handle_mouse(mouse);
-        assert_eq!(app.mode, Mode::Attached, "left-click inside preview stays attached");
-        assert!(app.pending_literal_keys.is_none(), "should not forward mouse clicks to agents");
-        assert_eq!(app.preview_scroll_offset, 0, "should reset scroll to bottom");
+        assert_eq!(
+            app.mode,
+            Mode::Attached,
+            "left-click inside preview stays attached"
+        );
+        assert!(
+            app.pending_literal_keys.is_none(),
+            "should not forward mouse clicks to agents"
+        );
+        assert_eq!(
+            app.preview_scroll_offset, 0,
+            "should reset scroll to bottom"
+        );
     }
 
     #[test]
@@ -3621,7 +3844,11 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::NONE,
         };
         app.handle_mouse(mouse);
-        assert_eq!(app.mode, Mode::Attached, "right-click inside preview stays attached");
+        assert_eq!(
+            app.mode,
+            Mode::Attached,
+            "right-click inside preview stays attached"
+        );
     }
 
     // ── log_elapsed used in Idle status when log says working ──
@@ -3647,9 +3874,9 @@ mod tests {
         app.session_stats
             .insert("hydra-testid-s1".to_string(), stats);
 
-        // Run enough ticks to get to Idle (14 ticks: 1 first_capture + 12 unchanged + 1 to cross threshold)
-        // Because stats say log_idle=false (task_elapsed is Some), threshold is 12
-        for _ in 0..14 {
+        // Run enough ticks to get to Idle (32 ticks: 1 first_capture + 30 unchanged + 1 to cross threshold)
+        // Because stats say log_idle=false (task_elapsed is Some), threshold is 30
+        for _ in 0..32 {
             app.refresh_sessions().await;
         }
 
@@ -3658,7 +3885,10 @@ mod tests {
 
         // But since log_elapsed is Some, the task_elapsed should reflect log data
         // (The session has task_elapsed = log_elapsed because the log says agent is working)
-        assert!(app.sessions[0].task_elapsed.is_some(), "log_elapsed should be used for Idle status");
+        assert!(
+            app.sessions[0].task_elapsed.is_some(),
+            "log_elapsed should be used for Idle status"
+        );
     }
 
     // ── normalize_capture: ESC without bracket ──
@@ -3713,8 +3943,14 @@ mod tests {
 
         assert_eq!(app.mode, Mode::Browse);
         let msg = app.status_message.as_ref().unwrap();
-        assert!(msg.contains("Created session"), "should still report creation: {msg}");
-        assert!(msg.contains("warning: manifest save failed"), "should include warning: {msg}");
+        assert!(
+            msg.contains("Created session"),
+            "should still report creation: {msg}"
+        );
+        assert!(
+            msg.contains("warning: manifest save failed"),
+            "should include warning: {msg}"
+        );
     }
 
     // ── confirm_delete: manifest removal warning ────────────────────
@@ -3739,7 +3975,10 @@ mod tests {
         assert_eq!(app.mode, Mode::Browse);
         let msg = app.status_message.as_ref().unwrap();
         assert!(msg.contains("Killed session"), "should report kill: {msg}");
-        assert!(msg.contains("warning: manifest update failed"), "should include warning: {msg}");
+        assert!(
+            msg.contains("warning: manifest update failed"),
+            "should include warning: {msg}"
+        );
     }
 
     // ── Browse key 'c' toggles mouse_captured ──
@@ -3752,6 +3991,40 @@ mod tests {
         assert!(!app.mouse_captured, "first 'c' should disable capture");
         app.handle_browse_key(KeyCode::Char('c'));
         assert!(app.mouse_captured, "second 'c' should re-enable capture");
+    }
+
+    // ── confirm_new_session selects the newly created session by index ──
+
+    #[tokio::test]
+    async fn confirm_new_session_sets_selected_to_new_session_index() {
+        // Pre-populate mock with both "alpha" and "bravo" so that after
+        // create + refresh_sessions, the new session "bravo" is found in the list.
+        let sessions = vec![
+            make_session("alpha", AgentType::Claude),
+            make_session("bravo", AgentType::Claude),
+        ];
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(MockSessionManager::with_sessions(sessions)),
+        );
+        app.manifest_dir = std::env::temp_dir()
+            .join("hydra-test")
+            .join(format!("{:?}", std::thread::current().id()));
+        // app.sessions only has "alpha" → generate_name picks "bravo"
+        app.sessions = vec![make_session("alpha", AgentType::Claude)];
+        app.mode = Mode::NewSessionAgent;
+        app.agent_selection = 0;
+
+        app.confirm_new_session().await;
+
+        assert_eq!(app.mode, Mode::Browse);
+        // After refresh_sessions, sessions = ["alpha", "bravo"].
+        // "bravo" is at index 1, so selected should be 1.
+        assert_eq!(
+            app.selected, 1,
+            "selected should point to newly created session"
+        );
     }
 
     // ── refresh_preview scrollback error shows error message ──
@@ -3770,5 +4043,4 @@ mod tests {
         app.refresh_preview().await;
         assert_eq!(app.preview, "[unable to capture pane]");
     }
-
 }

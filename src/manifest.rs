@@ -47,11 +47,7 @@ pub async fn load_manifest(base_dir: &Path, project_id: &str) -> Manifest {
 /// Save manifest to disk, creating directories as needed.
 /// Uses write-to-temp-then-rename for atomic writes on POSIX,
 /// preventing corruption from crashes or concurrent instances.
-pub async fn save_manifest(
-    base_dir: &Path,
-    project_id: &str,
-    manifest: &Manifest,
-) -> Result<()> {
+pub async fn save_manifest(base_dir: &Path, project_id: &str, manifest: &Manifest) -> Result<()> {
     let path = manifest_path(base_dir, project_id);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -72,11 +68,7 @@ pub async fn save_manifest(
 }
 
 /// Add a session record to the manifest (load-modify-save).
-pub async fn add_session(
-    base_dir: &Path,
-    project_id: &str,
-    record: SessionRecord,
-) -> Result<()> {
+pub async fn add_session(base_dir: &Path, project_id: &str, record: SessionRecord) -> Result<()> {
     let mut manifest = load_manifest(base_dir, project_id).await;
     manifest.sessions.insert(record.name.clone(), record);
     save_manifest(base_dir, project_id, &manifest).await
@@ -116,7 +108,9 @@ impl SessionRecord {
                     "claude --dangerously-skip-permissions".to_string()
                 }
             }
-            "codex" => "codex -c check_for_update_on_startup=false --yolo resume --last".to_string(),
+            "codex" => {
+                "codex -c check_for_update_on_startup=false --yolo resume --last".to_string()
+            }
             _ => self.agent_type.clone(),
         }
     }
@@ -181,7 +175,10 @@ mod tests {
             cwd: "/tmp/test".to_string(),
             failed_attempts: 0,
         };
-        assert_eq!(record.resume_command(), "codex -c check_for_update_on_startup=false --yolo resume --last");
+        assert_eq!(
+            record.resume_command(),
+            "codex -c check_for_update_on_startup=false --yolo resume --last"
+        );
     }
 
     #[test]
@@ -223,7 +220,10 @@ mod tests {
             cwd: "/tmp/test".to_string(),
             failed_attempts: 0,
         };
-        assert_eq!(record.create_command(), "codex -c check_for_update_on_startup=false --yolo");
+        assert_eq!(
+            record.create_command(),
+            "codex -c check_for_update_on_startup=false --yolo"
+        );
     }
 
     #[test]
@@ -307,9 +307,7 @@ mod tests {
         tokio::fs::create_dir_all(path.parent().unwrap())
             .await
             .unwrap();
-        tokio::fs::write(&path, "not valid json {{{")
-            .await
-            .unwrap();
+        tokio::fs::write(&path, "not valid json {{{").await.unwrap();
 
         let manifest = load_manifest(base, pid).await;
         assert!(manifest.sessions.is_empty());
