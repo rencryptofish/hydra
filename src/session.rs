@@ -12,7 +12,7 @@ impl AgentType {
     pub fn command(&self) -> &str {
         match self {
             AgentType::Claude => "claude --dangerously-skip-permissions",
-            AgentType::Codex => "codex -c check_for_update_on_startup=false --full-auto",
+            AgentType::Codex => "codex -c check_for_update_on_startup=false --yolo",
         }
     }
 
@@ -51,6 +51,7 @@ pub enum SessionStatus {
 
 impl SessionStatus {
     /// Sort priority: Idle (needs input) first, then Running, then Exited.
+    #[cfg(test)]
     pub fn sort_order(&self) -> u8 {
         match self {
             SessionStatus::Idle => 0,
@@ -215,7 +216,7 @@ mod tests {
 
     #[test]
     fn agent_type_command_codex() {
-        assert_eq!(AgentType::Codex.command(), "codex -c check_for_update_on_startup=false --full-auto");
+        assert_eq!(AgentType::Codex.command(), "codex -c check_for_update_on_startup=false --yolo");
     }
 
     // ── AgentType::all tests ──────────────────────────────────────────

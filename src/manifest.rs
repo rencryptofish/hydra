@@ -116,7 +116,7 @@ impl SessionRecord {
                     "claude --dangerously-skip-permissions".to_string()
                 }
             }
-            "codex" => "codex -c check_for_update_on_startup=false --full-auto resume --last".to_string(),
+            "codex" => "codex -c check_for_update_on_startup=false --yolo resume --last".to_string(),
             _ => self.agent_type.clone(),
         }
     }
@@ -132,7 +132,7 @@ impl SessionRecord {
                     "claude --dangerously-skip-permissions".to_string()
                 }
             }
-            "codex" => "codex -c check_for_update_on_startup=false --full-auto".to_string(),
+            "codex" => "codex -c check_for_update_on_startup=false --yolo".to_string(),
             _ => self.agent_type.clone(),
         }
     }
@@ -181,7 +181,7 @@ mod tests {
             cwd: "/tmp/test".to_string(),
             failed_attempts: 0,
         };
-        assert_eq!(record.resume_command(), "codex -c check_for_update_on_startup=false --full-auto resume --last");
+        assert_eq!(record.resume_command(), "codex -c check_for_update_on_startup=false --yolo resume --last");
     }
 
     #[test]
@@ -223,7 +223,7 @@ mod tests {
             cwd: "/tmp/test".to_string(),
             failed_attempts: 0,
         };
-        assert_eq!(record.create_command(), "codex -c check_for_update_on_startup=false --full-auto");
+        assert_eq!(record.create_command(), "codex -c check_for_update_on_startup=false --yolo");
     }
 
     #[tokio::test]

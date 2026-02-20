@@ -57,7 +57,7 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 
 - Tick rate is 250ms (`EventHandler::new(Duration::from_millis(250))`)
 - tmux session names: `hydra-<8char_sha256_hex>-<user_name>`
-- Agent commands: `claude --dangerously-skip-permissions`, `codex -c check_for_update_on_startup=false --full-auto`
+- Agent commands: `claude --dangerously-skip-permissions`, `codex -c check_for_update_on_startup=false --yolo`
 - Mouse handling lives in `App::handle_mouse()` (moved from `main.rs` to `app.rs`)
 - **Preview scrolling**: `preview_scroll_offset: u16` tracks lines scrolled up from bottom (0 = bottom). Scroll wheel over preview adjusts by 3 lines/tick. Offset resets on session selection change. Rendering uses `Paragraph::scroll()` with math: `scroll_y = max_scroll_offset - capped_offset` so offset 0 shows latest output.
 - **Scrollback capture**: `capture_pane_scrollback()` uses `tmux capture-pane -p -S -` to get full history (used for preview display). Regular `capture_pane()` (visible pane only) is used for status comparison — keeps status detection lightweight.
