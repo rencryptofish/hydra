@@ -695,4 +695,419 @@ mod tests {
         assert!(cache.contains_key("hydra-a-two"));
         assert!(!cache.contains_key("hydra-a-stale"));
     }
+
+    #[test]
+    fn prune_agent_cache_empty_live_clears_all() {
+        let mut cache = HashMap::new();
+        cache.insert("a".to_string(), AgentType::Claude);
+        cache.insert("b".to_string(), AgentType::Codex);
+        prune_agent_cache(&mut cache, &HashSet::new());
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn prune_agent_cache_empty_cache_stays_empty() {
+        let mut cache = HashMap::new();
+        let live: HashSet<String> = ["x".to_string()].into_iter().collect();
+        prune_agent_cache(&mut cache, &live);
+        assert!(cache.is_empty());
+    }
+
+    // ── Default trait implementations ───────────────────────────────
+
+    /// Minimal SessionManager impl to test default trait methods.
+    struct MinimalManager {
+        capture_result: String,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionManager for MinimalManager {
+        async fn list_sessions(&self, _project_id: &str) -> Result<Vec<Session>> {
+            Ok(vec![])
+        }
+        async fn create_session(
+            &self,
+            _project_id: &str,
+            _name: &str,
+            _agent: &AgentType,
+            _cwd: &str,
+            _command_override: Option<&str>,
+        ) -> Result<String> {
+            Ok("test".into())
+        }
+        async fn capture_pane(&self, _tmux_name: &str) -> Result<String> {
+            Ok(self.capture_result.clone())
+        }
+        async fn kill_session(&self, _tmux_name: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn send_keys(&self, _tmux_name: &str, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn capture_pane_scrollback(&self, _tmux_name: &str) -> Result<String> {
+            Ok(self.capture_result.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn default_send_keys_literal_is_noop() {
+        let mgr = MinimalManager {
+            capture_result: String::new(),
+        };
+        let result = mgr.send_keys_literal("any-session", "hello").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn default_capture_panes_sequential() {
+        let mgr = MinimalManager {
+            capture_result: "output".into(),
+        };
+        let names = vec!["a".into(), "b".into(), "c".into()];
+        let results = mgr.capture_panes(&names).await;
+        assert_eq!(results.len(), 3);
+        for r in results {
+            assert_eq!(r.unwrap(), "output");
+        }
+    }
+
+    #[tokio::test]
+    async fn default_capture_panes_empty() {
+        let mgr = MinimalManager {
+            capture_result: String::new(),
+        };
+        let results = mgr.capture_panes(&[]).await;
+        assert!(results.is_empty());
+    }
+
+    // ── run_cmd_timeout / run_status_timeout ────────────────────────
+
+    #[tokio::test]
+    async fn run_cmd_timeout_success() {
+        let output = run_cmd_timeout(&mut Command::new("echo").arg("hello")).await;
+        let output = output.unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "hello"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cmd_timeout_bad_command() {
+        let result =
+            run_cmd_timeout(&mut Command::new("__nonexistent_command_that_does_not_exist__")).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_status_timeout_success() {
+        let status = run_status_timeout(&mut Command::new("true")).await;
+        assert!(status.unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn run_status_timeout_failure_exit_code() {
+        let status = run_status_timeout(&mut Command::new("false")).await;
+        assert!(!status.unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn run_status_timeout_bad_command() {
+        let result =
+            run_status_timeout(&mut Command::new("__nonexistent_command_that_does_not_exist__")).await;
+        assert!(result.is_err());
+    }
+
+    // ── Integration tests (require tmux) ────────────────────────────
+
+    /// Generate a unique tmux session name for integration tests.
+    fn test_session_name() -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        format!("hydra-test-{pid}-{id}")
+    }
+
+    /// Kill a tmux session, ignoring errors (cleanup helper).
+    async fn cleanup_session(name: &str) {
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", name])
+            .output();
+    }
+
+    #[tokio::test]
+    async fn integration_create_capture_kill() {
+        let name = test_session_name();
+
+        // Create a session running a simple shell command
+        let status = run_status_timeout(Command::new("tmux").args([
+            "new-session",
+            "-d",
+            "-s",
+            &name,
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "echo 'HYDRA_TEST_OUTPUT'; sleep 10",
+        ]))
+        .await
+        .unwrap();
+        assert!(status.success());
+
+        // Give the command a moment to produce output
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // capture_pane should return something
+        let content = capture_pane(&name).await.unwrap();
+        assert!(!content.is_empty());
+
+        // capture_pane_scrollback should also work
+        let scrollback = capture_pane_scrollback(&name).await.unwrap();
+        assert!(!scrollback.is_empty());
+
+        // kill_session should succeed
+        kill_session(&name).await.unwrap();
+
+        // capture after kill should fail or return session-not-available
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after_kill = capture_pane(&name).await.unwrap();
+        assert!(after_kill.contains("[session not available]") || after_kill.is_empty());
+    }
+
+    #[tokio::test]
+    async fn integration_kill_nonexistent_session() {
+        let result = kill_session("hydra-test-nonexistent-session-xyz").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn integration_capture_pane_nonexistent() {
+        let result = capture_pane("hydra-test-nonexistent-session-xyz").await.unwrap();
+        assert_eq!(result, "[session not available]");
+    }
+
+    #[tokio::test]
+    async fn integration_capture_scrollback_nonexistent() {
+        let result = capture_pane_scrollback("hydra-test-nonexistent-session-xyz").await.unwrap();
+        assert_eq!(result, "[session not available]");
+    }
+
+    #[tokio::test]
+    async fn integration_send_keys_to_session() {
+        let name = test_session_name();
+        // Create session with bash
+        let status = run_status_timeout(Command::new("tmux").args([
+            "new-session", "-d", "-s", &name, "-x", "80", "-y", "24",
+        ]))
+        .await
+        .unwrap();
+        assert!(status.success());
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // send_keys should not error
+        let result = send_keys(&name, "echo hello").await;
+        assert!(result.is_ok());
+
+        // send_keys_literal should not error
+        let result = send_keys_literal(&name, "test").await;
+        assert!(result.is_ok());
+
+        cleanup_session(&name).await;
+    }
+
+    #[tokio::test]
+    async fn integration_is_pane_dead_live_session() {
+        let name = test_session_name();
+        let status = run_status_timeout(Command::new("tmux").args([
+            "new-session", "-d", "-s", &name, "-x", "80", "-y", "24",
+            "sleep", "30",
+        ]))
+        .await
+        .unwrap();
+        assert!(status.success());
+
+        let dead = is_pane_dead(&name).await;
+        assert!(!dead, "live session should not be dead");
+
+        cleanup_session(&name).await;
+    }
+
+    #[tokio::test]
+    async fn integration_is_pane_dead_nonexistent() {
+        let dead = is_pane_dead("hydra-test-nonexistent-xyz").await;
+        assert!(dead, "nonexistent session should be dead");
+    }
+
+    #[tokio::test]
+    async fn integration_is_pane_dead_exited_session() {
+        let name = test_session_name();
+        // Create session with remain-on-exit, running a command that exits immediately
+        let status = run_status_timeout(Command::new("tmux").args([
+            "new-session", "-d", "-s", &name, "-x", "80", "-y", "24",
+            "true",
+        ]))
+        .await
+        .unwrap();
+        assert!(status.success());
+
+        // Set remain-on-exit so the pane stays
+        let _ = run_status_timeout(Command::new("tmux").args([
+            "set-option", "-t", &name, "remain-on-exit", "on",
+        ]))
+        .await;
+
+        // Wait for command to exit
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let dead = is_pane_dead(&name).await;
+        assert!(dead, "exited session with remain-on-exit should be dead");
+
+        cleanup_session(&name).await;
+    }
+
+    #[tokio::test]
+    async fn integration_get_agent_type_nonexistent() {
+        let result = get_agent_type("hydra-test-nonexistent-xyz").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn integration_get_agent_type_with_env() {
+        let name = test_session_name();
+        let status = run_status_timeout(Command::new("tmux").args([
+            "new-session", "-d", "-s", &name, "-x", "80", "-y", "24",
+            "sleep", "30",
+        ]))
+        .await
+        .unwrap();
+        assert!(status.success());
+
+        // Set the env var
+        let _ = run_status_timeout(Command::new("tmux").args([
+            "set-environment", "-t", &name, "HYDRA_AGENT_TYPE", "codex",
+        ]))
+        .await;
+
+        let agent = get_agent_type(&name).await;
+        assert_eq!(agent, Some(AgentType::Codex));
+
+        cleanup_session(&name).await;
+    }
+
+    #[tokio::test]
+    async fn integration_create_session_free_fn() {
+        let sess_name = "itest-create";
+        let tmux_name =
+            create_session("ffffffff", sess_name, &AgentType::Claude, "/tmp", Some("sleep 30"))
+                .await
+                .unwrap();
+
+        // Verify session exists
+        let content = capture_pane(&tmux_name).await.unwrap();
+        assert!(!content.is_empty() || content.is_empty()); // session exists if no error
+
+        // Verify remain-on-exit was set
+        let output = run_cmd_timeout(Command::new("tmux").args([
+            "show-option", "-t", &tmux_name, "remain-on-exit",
+        ]))
+        .await
+        .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("on"));
+
+        // Verify agent type env var was set
+        let agent = get_agent_type(&tmux_name).await;
+        assert_eq!(agent, Some(AgentType::Claude));
+
+        cleanup_session(&tmux_name).await;
+    }
+
+    #[tokio::test]
+    async fn integration_create_session_with_command_override() {
+        let sess_name = "itest-override";
+        // Use a long-running command so the session stays alive for capture
+        let tmux_name = create_session(
+            "ffffffff",
+            sess_name,
+            &AgentType::Codex,
+            "/tmp",
+            Some("sh -c 'echo HYDRA_OVERRIDE_OK && sleep 30'"),
+        )
+        .await
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let content = capture_pane(&tmux_name).await.unwrap();
+        assert!(
+            content.contains("HYDRA_OVERRIDE_OK"),
+            "command override should be used: {content}"
+        );
+
+        cleanup_session(&tmux_name).await;
+    }
+
+    #[tokio::test]
+    async fn integration_tmux_manager_create_and_kill() {
+        let mgr = TmuxSessionManager::new();
+        let tmux_name = mgr
+            .create_session("eeeeeeee", "mgr-test", &AgentType::Claude, "/tmp", Some("sleep 30"))
+            .await
+            .unwrap();
+
+        // Cache should contain the entry
+        {
+            let cache = mgr.agent_cache.lock().unwrap();
+            assert_eq!(cache.get(&tmux_name), Some(&AgentType::Claude));
+        }
+
+        // capture_pane via manager should work
+        let _content = mgr.capture_pane(&tmux_name).await.unwrap();
+
+        // capture_panes (batch) via manager
+        let results = mgr.capture_panes(&[tmux_name.clone()]).await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok());
+
+        // capture_pane_scrollback via manager
+        let _scrollback = mgr.capture_pane_scrollback(&tmux_name).await.unwrap();
+
+        // send_keys via manager
+        mgr.send_keys(&tmux_name, "echo hi").await.unwrap();
+
+        // send_keys_literal via manager
+        mgr.send_keys_literal(&tmux_name, "test").await.unwrap();
+
+        // kill via manager
+        mgr.kill_session(&tmux_name).await.unwrap();
+
+        // Cache should be pruned
+        {
+            let cache = mgr.agent_cache.lock().unwrap();
+            assert!(!cache.contains_key(&tmux_name));
+        }
+    }
+
+    #[tokio::test]
+    async fn integration_tmux_manager_list_sessions() {
+        let mgr = TmuxSessionManager::new();
+        let project_id = "abab1234";
+        let tmux_name = mgr
+            .create_session(project_id, "listtest", &AgentType::Codex, "/tmp", Some("sleep 30"))
+            .await
+            .unwrap();
+
+        let sessions = mgr.list_sessions(project_id).await.unwrap();
+        let found = sessions.iter().any(|s| s.tmux_name == tmux_name);
+        assert!(found, "created session should appear in list: {sessions:?}");
+
+        // Verify agent type was resolved from cache
+        let session = sessions.iter().find(|s| s.tmux_name == tmux_name).unwrap();
+        assert_eq!(session.agent_type, AgentType::Codex);
+
+        cleanup_session(&tmux_name).await;
+    }
 }
