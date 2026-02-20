@@ -74,6 +74,9 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 - Parse session JSONL once per refresh path: update stats and extract the last assistant text in the same incremental pass.
 - Use a retry cooldown for unresolved UUID lookups (6 cycles ~= 30s at 5s refresh cadence) to avoid repeatedly traversing process trees for sessions that do not expose Claude UUIDs.
 - Replace repeated `iter().find()` lookups in session refresh loops with a prebuilt `HashMap` to avoid O(n^2) behavior as session counts grow.
+- `raw.githubusercontent.com` returns 404 for private repos — can't use `curl | bash` install pattern. Use `cargo install --git ssh://...` instead.
+- `cargo install --git ssh://...` uses libgit2 by default, which doesn't read the SSH agent. Set `CARGO_NET_GIT_FETCH_WITH_CLI=true` to force cargo to use the system `git` CLI (which does).
+- `hydra update` now uses signed binary releases: downloads binary + `.minisig` from GitHub Releases, verifies Ed25519 signature in memory via `minisign-verify` crate before writing to disk. `UPDATE_PUBLIC_KEY` in `main.rs` is a placeholder — must be replaced with the real key before cutting releases.
 
 ## Common Changes
 
