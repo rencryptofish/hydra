@@ -1,8 +1,27 @@
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::time::Duration;
 
+use anyhow::{bail, Context, Result as AnyhowResult};
 use tokio::process::Command;
+
+/// Default timeout for subprocess calls in log resolution (5 seconds).
+const CMD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum depth for process tree walks (tmux shell → agent → subprocesses).
+const MAX_TREE_DEPTH: usize = 5;
+
+/// Maximum total PIDs collected during a process tree walk.
+const MAX_TREE_PIDS: usize = 100;
+
+/// Run a Command with a timeout, returning its Output.
+async fn run_cmd_timeout(cmd: &mut Command) -> AnyhowResult<std::process::Output> {
+    match tokio::time::timeout(CMD_TIMEOUT, cmd.output()).await {
+        Ok(result) => result.context("subprocess failed to execute"),
+        Err(_) => bail!("subprocess timed out after {}s", CMD_TIMEOUT.as_secs()),
+    }
+}
 
 /// Per-session stats aggregated from Claude Code JSONL logs.
 /// Updated incrementally — only new bytes are parsed on each refresh.
@@ -194,11 +213,11 @@ fn update_session_stats_from_path(path: &std::path::Path, stats: &mut SessionSta
 
 /// Get the pane PID for a tmux session.
 pub async fn get_pane_pid(tmux_name: &str) -> Option<u32> {
-    let output = Command::new("tmux")
-        .args(["list-panes", "-t", tmux_name, "-F", "#{pane_pid}"])
-        .output()
-        .await
-        .ok()?;
+    let output = run_cmd_timeout(
+        Command::new("tmux").args(["list-panes", "-t", tmux_name, "-F", "#{pane_pid}"]),
+    )
+    .await
+    .ok()?;
 
     if !output.status.success() {
         return None;
@@ -235,11 +254,11 @@ fn parse_session_id_from_cmdline(cmdline: &str) -> Option<String> {
 /// Extract --session-id from a process's command line arguments.
 /// This is the most reliable way to get the Claude session UUID.
 async fn resolve_uuid_from_cmdline(pid: u32) -> Option<String> {
-    let output = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .output()
-        .await
-        .ok()?;
+    let output = run_cmd_timeout(
+        Command::new("ps").args(["-p", &pid.to_string(), "-o", "command="]),
+    )
+    .await
+    .ok()?;
 
     if !output.status.success() {
         return None;
@@ -250,25 +269,42 @@ async fn resolve_uuid_from_cmdline(pid: u32) -> Option<String> {
 }
 
 /// Collect all descendant PIDs of a process (children, grandchildren, etc.).
+/// Bounded by `MAX_TREE_DEPTH` levels and `MAX_TREE_PIDS` total to prevent
+/// runaway walks on pathological process trees.
 async fn collect_descendant_pids(pid: u32) -> Vec<u32> {
     let mut all_pids = vec![pid];
-    let mut queue = vec![pid];
+    // Process level-by-level for depth tracking
+    let mut current_level = vec![pid];
+    let mut depth = 0;
 
-    while let Some(parent) = queue.pop() {
-        let output = Command::new("pgrep")
-            .args(["-P", &parent.to_string()])
-            .output()
+    while !current_level.is_empty() && depth < MAX_TREE_DEPTH && all_pids.len() < MAX_TREE_PIDS {
+        let mut next_level = Vec::new();
+
+        for parent in &current_level {
+            if all_pids.len() >= MAX_TREE_PIDS {
+                break;
+            }
+            let output = run_cmd_timeout(
+                Command::new("pgrep").args(["-P", &parent.to_string()]),
+            )
             .await;
 
-        if let Ok(output) = output {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if let Ok(child_pid) = line.trim().parse::<u32>() {
-                    all_pids.push(child_pid);
-                    queue.push(child_pid);
+            if let Ok(output) = output {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    if all_pids.len() >= MAX_TREE_PIDS {
+                        break;
+                    }
+                    if let Ok(child_pid) = line.trim().parse::<u32>() {
+                        all_pids.push(child_pid);
+                        next_level.push(child_pid);
+                    }
                 }
             }
         }
+
+        current_level = next_level;
+        depth += 1;
     }
 
     all_pids
@@ -303,9 +339,7 @@ async fn resolve_uuid_from_lsof_pids(pids: &[u32]) -> Option<String> {
         .collect::<Vec<_>>()
         .join(",");
 
-    let output = Command::new("lsof")
-        .args(["-p", &pid_list])
-        .output()
+    let output = run_cmd_timeout(Command::new("lsof").args(["-p", &pid_list]))
         .await
         .ok()?;
 

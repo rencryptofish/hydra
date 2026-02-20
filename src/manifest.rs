@@ -45,6 +45,8 @@ pub async fn load_manifest(base_dir: &Path, project_id: &str) -> Manifest {
 }
 
 /// Save manifest to disk, creating directories as needed.
+/// Uses write-to-temp-then-rename for atomic writes on POSIX,
+/// preventing corruption from crashes or concurrent instances.
 pub async fn save_manifest(
     base_dir: &Path,
     project_id: &str,
@@ -55,7 +57,9 @@ pub async fn save_manifest(
         tokio::fs::create_dir_all(parent).await?;
     }
     let json = serde_json::to_string_pretty(manifest)?;
-    tokio::fs::write(&path, json).await?;
+    let tmp_path = path.with_extension("json.tmp");
+    tokio::fs::write(&tmp_path, json).await?;
+    tokio::fs::rename(&tmp_path, &path).await?;
     Ok(())
 }
 

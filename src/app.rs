@@ -172,8 +172,24 @@ impl App {
                 self.status_message = Some(format!("Error listing sessions: {e}"));
             }
         }
+        // Prune stale entries from per-session HashMaps to prevent unbounded
+        // memory growth when sessions are created and deleted over time.
+        {
+            let live_keys: std::collections::HashSet<&String> =
+                self.sessions.iter().map(|s| &s.tmux_name).collect();
+            self.prev_captures.retain(|k, _| live_keys.contains(k));
+            self.idle_ticks.retain(|k, _| live_keys.contains(k));
+            self.task_starts.retain(|k, _| live_keys.contains(k));
+            self.task_last_active.retain(|k, _| live_keys.contains(k));
+            self.last_messages.retain(|k, _| live_keys.contains(k));
+            self.session_stats.retain(|k, _| live_keys.contains(k));
+            self.log_uuids.retain(|k, _| live_keys.contains(k));
+        }
+
         // Keep selected index in bounds
-        if self.selected >= self.sessions.len() && !self.sessions.is_empty() {
+        if self.sessions.is_empty() {
+            self.selected = 0;
+        } else if self.selected >= self.sessions.len() {
             self.selected = self.sessions.len() - 1;
         }
     }
@@ -2386,5 +2402,189 @@ mod tests {
         app.mode = Mode::ConfirmDelete;
         app.handle_key(make_key(KeyCode::Esc)).await;
         assert_eq!(app.mode, Mode::Browse);
+    }
+
+    // ── Additional coverage tests ────────────────────────────────────
+
+    #[test]
+    fn app_new_creates_instance() {
+        // Covers App::new() which delegates to new_with_manager with TmuxSessionManager
+        let app = App::new("testid".to_string(), "/tmp/test".to_string());
+        assert_eq!(app.project_id, "testid");
+        assert_eq!(app.cwd, "/tmp/test");
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attached_key_unmappable_key_is_noop() {
+        // Keys that keycode_to_tmux returns None for (e.g., CapsLock, Null)
+        // should not panic or send anything
+        use std::sync::{Arc, Mutex};
+
+        struct TrackingManager {
+            sent_keys: Arc<Mutex<Vec<(String, String)>>>,
+        }
+        #[async_trait::async_trait]
+        impl SessionManager for TrackingManager {
+            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> { Ok(vec![]) }
+            async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
+            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
+            async fn send_keys(&self, tmux_name: &str, key: &str) -> anyhow::Result<()> {
+                self.sent_keys.lock().unwrap().push((tmux_name.to_string(), key.to_string()));
+                Ok(())
+            }
+            async fn send_mouse(&self, _: &str, _: &str, _: u8, _: u16, _: u16) -> anyhow::Result<()> { Ok(()) }
+            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
+        }
+
+        let sent_keys = Arc::new(Mutex::new(Vec::new()));
+        let manager = TrackingManager { sent_keys: sent_keys.clone() };
+
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(manager),
+        );
+        app.sessions = vec![make_session("worker", AgentType::Claude)];
+        app.mode = Mode::Attached;
+
+        // Send a key that doesn't map to tmux (e.g., CapsLock)
+        app.handle_attached_key(make_key(KeyCode::CapsLock)).await;
+
+        let keys = sent_keys.lock().unwrap();
+        assert!(keys.is_empty(), "unmappable key should not send anything");
+    }
+
+    #[test]
+    fn mouse_click_already_selected_session_stays() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let sessions = vec![
+            make_session("a", AgentType::Claude),
+            make_session("b", AgentType::Claude),
+        ];
+        let mut app = test_app_with_sessions(sessions);
+        app.sidebar_area.set(Rect::new(0, 0, 24, 20));
+        app.preview_area.set(Rect::new(24, 0, 56, 20));
+        app.selected = 0;
+        app.preview_scroll_offset = 5; // non-zero offset
+
+        // Click on first session (already selected)
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 1, // inner area row 0 = first session
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert_eq!(app.selected, 0);
+        // Scroll offset should NOT reset since session didn't change
+        assert_eq!(app.preview_scroll_offset, 5);
+    }
+
+    #[test]
+    fn mouse_attached_scroll_outside_preview_is_noop() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let sessions = vec![make_session("a", AgentType::Claude)];
+        let mut app = test_app_with_sessions(sessions);
+        app.mode = Mode::Attached;
+        app.sidebar_area.set(Rect::new(0, 0, 24, 20));
+        app.preview_area.set(Rect::new(24, 0, 56, 20));
+
+        // Scroll up outside the preview area (in sidebar)
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 5,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert_eq!(app.preview_scroll_offset, 0, "scroll outside preview should be noop");
+        assert_eq!(app.mode, Mode::Attached);
+    }
+
+    #[test]
+    fn parse_diff_numstat_empty_path_skipped() {
+        // A line with insertions/deletions but empty path should be skipped
+        let out = "10\t5\t\n";
+        let files = super::parse_diff_numstat(out);
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn parse_diff_numstat_malformed_line() {
+        // Lines without enough tab-separated parts
+        let out = "only_one_column\n";
+        let files = super::parse_diff_numstat(out);
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn parse_diff_numstat_untracked_field_is_false() {
+        let out = "10\t5\tsrc/main.rs\n";
+        let files = super::parse_diff_numstat(out);
+        assert_eq!(files.len(), 1);
+        assert!(!files[0].untracked, "parsed files should not be untracked");
+    }
+
+    #[tokio::test]
+    async fn refresh_messages_runs_on_20th_tick() {
+        let mut app = test_app();
+        // Start at tick 19 so the next call (tick 20) triggers the inner loop
+        app.message_tick = 19;
+        app.refresh_messages().await;
+        assert_eq!(app.message_tick, 20);
+        // No panic and no sessions to process — this just covers the tick check
+    }
+
+    #[tokio::test]
+    async fn refresh_messages_wraps_tick_counter() {
+        let mut app = test_app();
+        app.message_tick = 255; // u8::MAX
+        app.refresh_messages().await;
+        assert_eq!(app.message_tick, 0, "tick counter should wrap around");
+    }
+
+    #[test]
+    fn mouse_attached_click_inside_preview_stays_attached() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let sessions = vec![make_session("a", AgentType::Claude)];
+        let mut app = test_app_with_sessions(sessions);
+        app.mode = Mode::Attached;
+        app.sidebar_area.set(Rect::new(0, 0, 24, 20));
+        app.preview_area.set(Rect::new(24, 0, 56, 20));
+
+        // Click inside the preview inner area (not on border)
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 30,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert_eq!(app.mode, Mode::Attached, "clicking inside preview should stay attached");
+    }
+
+    #[test]
+    fn mouse_attached_other_event_is_noop() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let sessions = vec![make_session("a", AgentType::Claude)];
+        let mut app = test_app_with_sessions(sessions);
+        app.mode = Mode::Attached;
+        app.sidebar_area.set(Rect::new(0, 0, 24, 20));
+        app.preview_area.set(Rect::new(24, 0, 56, 20));
+
+        // MouseMove in attached mode
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 30,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert_eq!(app.mode, Mode::Attached);
     }
 }
