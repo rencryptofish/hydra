@@ -1,17 +1,19 @@
 <div align="center">
 
 ```
-                    ╱▔▔▔╲
-                   ╱  ◉◉  ╲
-                  ╱  ╱  ╲  ╲
-          ╱▔▔▔▔▔╱  ╱    ╲  ╲▔▔▔▔▔╲
-         ╱  ◉◉ ╱  ╱ ╱▔▔╲ ╲  ╲ ◉◉  ╲
-        ╱  ╱▔ ╱  ╱ ╱    ╲ ╲  ╲ ▔╲  ╲
-       (  (  (  (  ( HYDRA )  )  )  )  )
-        ╲  ╲  ╲  ╲  ╲    ╱  ╱  ╱  ╱
-         ╲   ╲  ╲  ╲  ▔▔  ╱  ╱  ╱
-          ╲   ╲  ╲  ╲    ╱  ╱  ╱
-           ▔▔▔   ▔▔  ▔▔▔▔  ▔▔▔
+              ╭─────╮
+              │ ◉ ◉ │
+  ╭─────╮     ╰──┬──╯     ╭─────╮
+  │ ◉ ◉ │        │        │ ◉ ◉ │
+  ╰──┬──╯        │        ╰──┬──╯
+     ╰─────╮  ╭──┴──╮  ╭─────╯
+            ╰──┤     ├──╯
+               │     │
+               ╰──┬──╯
+                  │
+           ╔═════╧═════╗
+           ║   HYDRA   ║
+           ╚═══════════╝
 ```
 
 # hydra
@@ -21,7 +23,7 @@
 Run multiple Claude and Codex agents in parallel, each in its own tmux session, managed from a single TUI.
 
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-83_passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-253_passing-brightgreen.svg)](#testing)
 [![Coverage](https://img.shields.io/badge/coverage-65%25-yellow.svg)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -36,6 +38,10 @@ Run multiple Claude and Codex agents in parallel, each in its own tmux session, 
 - **Status indicators** — green (idle), red (running), yellow (exited) dots per session
 - **Task timer** — tracks elapsed time for the current running task per agent
 - **Last message preview** — shows the last assistant response in the sidebar (reads Claude Code JSONL logs)
+- **Auto-generated names** — sessions get NATO phonetic alphabet names (alpha, bravo, charlie, ...)
+- **Session persistence** — sessions survive laptop shutdown; auto-revived on next launch using agent resume
+- **Session stats** — live cost, token, and tool-call metrics per agent from JSONL logs
+- **Diff tree** — sidebar shows per-file git diff stats grouped by directory
 - **Multi-agent support** — Claude (`claude --dangerously-skip-permissions`) and Codex (`codex --yolo`)
 - **Mouse support** — click to select sessions, scroll the preview pane
 - **Full scrollback** — scroll up through complete session history in the preview
@@ -82,23 +88,25 @@ Single-binary Rust TUI built on [ratatui](https://ratatui.rs) + [crossterm](http
 
 ```
 src/
-├── main.rs      CLI parsing, event loop, key dispatch
-├── app.rs       App state, mode machine (Browse/Attached/NewSession/ConfirmDelete)
-├── ui.rs        All ratatui rendering (snapshot tested)
-├── tmux.rs      SessionManager trait + TmuxSessionManager impl
-├── session.rs   Session/AgentType data types
-├── logs.rs      Claude Code JSONL log reader (PID → lsof → task UUID → logs)
-└── event.rs     Async crossterm event reader
+├── main.rs       CLI parsing, event loop, key dispatch
+├── app.rs        App state, mode machine (Browse/Attached/NewSession/ConfirmDelete)
+├── ui.rs         All ratatui rendering (snapshot tested)
+├── tmux.rs       SessionManager trait + TmuxSessionManager impl
+├── session.rs    Session/AgentType data types
+├── manifest.rs   Session persistence (~/.hydra/<project>/sessions.json)
+├── logs.rs       Claude Code JSONL log reader + session stats
+└── event.rs      Async crossterm event reader
 ```
 
 Key design decisions:
 - **`SessionManager` trait** — all tmux interaction is behind an async trait for testability (mock/noop impls in tests)
 - **Content-change detection** — session status is determined by diffing `capture-pane` output between ticks, not `session_activity`
-- **Async I/O** — all tmux subprocess calls use `tokio::process::Command` to avoid blocking the event loop
+- **Session revival** — manifest file persists session metadata; on startup, dead sessions are recreated with agent-specific resume commands
+- **Async I/O** — all tmux subprocess calls and manifest file I/O use `tokio` to avoid blocking the event loop
 
 ## Testing
 
-83 tests across unit, snapshot, and CLI integration:
+253 tests across unit, snapshot, and CLI integration:
 
 ```bash
 cargo test                # run all tests
