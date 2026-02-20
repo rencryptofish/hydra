@@ -567,12 +567,13 @@ impl App {
     }
 }
 
-/// A single file's diff stats from `git diff --numstat`.
+/// A single file's diff stats from `git diff --numstat` or untracked listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffFile {
     pub path: String,
     pub insertions: u32,
     pub deletions: u32,
+    pub untracked: bool,
 }
 
 /// Parse `git diff --numstat` output into per-file stats.
@@ -595,25 +596,49 @@ fn parse_diff_numstat(output: &str) -> Vec<DiffFile> {
                 path,
                 insertions,
                 deletions,
+                untracked: false,
             })
         })
         .collect()
 }
 
-/// Get per-file git diff stats for the working tree.
+/// Get per-file git diff stats for the working tree, including untracked files.
 async fn get_git_diff_numstat(cwd: &str) -> Vec<DiffFile> {
-    let output = tokio::process::Command::new("git")
-        .args(["diff", "--numstat"])
-        .current_dir(cwd)
-        .output()
-        .await;
+    let (diff_out, untracked_out) = tokio::join!(
+        tokio::process::Command::new("git")
+            .args(["diff", "--numstat"])
+            .current_dir(cwd)
+            .output(),
+        tokio::process::Command::new("git")
+            .args(["ls-files", "--others", "--exclude-standard"])
+            .current_dir(cwd)
+            .output(),
+    );
 
-    match output {
+    let mut files = match diff_out {
         Ok(o) if o.status.success() => {
             parse_diff_numstat(&String::from_utf8_lossy(&o.stdout))
         }
         _ => Vec::new(),
+    };
+
+    if let Ok(o) = untracked_out {
+        if o.status.success() {
+            for path in String::from_utf8_lossy(&o.stdout).lines() {
+                let path = path.trim();
+                if !path.is_empty() {
+                    files.push(DiffFile {
+                        path: path.to_string(),
+                        insertions: 0,
+                        deletions: 0,
+                        untracked: true,
+                    });
+                }
+            }
+        }
     }
+
+    files
 }
 
 #[cfg(test)]
@@ -1068,9 +1093,9 @@ mod tests {
         let out = "45\t12\tsrc/app.rs\n30\t5\tsrc/ui.rs\n3\t0\tREADME.md\n";
         let files = super::parse_diff_numstat(out);
         assert_eq!(files.len(), 3);
-        assert_eq!(files[0], super::DiffFile { path: "src/app.rs".into(), insertions: 45, deletions: 12 });
-        assert_eq!(files[1], super::DiffFile { path: "src/ui.rs".into(), insertions: 30, deletions: 5 });
-        assert_eq!(files[2], super::DiffFile { path: "README.md".into(), insertions: 3, deletions: 0 });
+        assert_eq!(files[0], super::DiffFile { path: "src/app.rs".into(), insertions: 45, deletions: 12, untracked: false });
+        assert_eq!(files[1], super::DiffFile { path: "src/ui.rs".into(), insertions: 30, deletions: 5, untracked: false });
+        assert_eq!(files[2], super::DiffFile { path: "README.md".into(), insertions: 3, deletions: 0, untracked: false });
     }
 
     #[test]
@@ -1595,79 +1620,56 @@ mod tests {
         app.refresh_sessions().await;
         assert_eq!(app.sessions[0].status, SessionStatus::Running, "first tick = Running");
 
-        // Second refresh with same content = Idle
+        // With debouncing, need 3 consecutive unchanged ticks to become Idle
         app.refresh_sessions().await;
-        assert_eq!(app.sessions[0].status, SessionStatus::Idle, "unchanged = Idle");
+        assert_eq!(app.sessions[0].status, SessionStatus::Running, "2nd tick still Running");
+        app.refresh_sessions().await;
+        assert_eq!(app.sessions[0].status, SessionStatus::Running, "3rd tick still Running");
+        app.refresh_sessions().await;
+        assert_eq!(app.sessions[0].status, SessionStatus::Idle, "4th tick = Idle (3 consecutive)");
     }
 
     #[tokio::test]
-    async fn refresh_sessions_sorts_idle_first() {
-        // Create sessions in mixed order: Running, Exited, Idle
-        let mut s_run = make_session("runner", AgentType::Claude);
-        s_run.status = SessionStatus::Running;
-        let mut s_exit = make_session("exited", AgentType::Claude);
-        s_exit.status = SessionStatus::Exited;
-        let mut s_idle = make_session("idler", AgentType::Claude);
-        s_idle.status = SessionStatus::Idle;
-
-        let sessions = vec![s_run, s_exit, s_idle];
+    async fn refresh_sessions_sorts_alphabetically() {
+        let sessions = vec![
+            make_session("charlie", AgentType::Claude),
+            make_session("alpha", AgentType::Claude),
+            make_session("bravo", AgentType::Claude),
+        ];
         let mut app = App::new_with_manager(
             "testid".to_string(),
             "/tmp/test".to_string(),
             Box::new(MockSessionManager::with_sessions(sessions)),
         );
-        // Pre-populate prev_captures so statuses stabilize to Idle (same content)
-        app.prev_captures.insert(
-            "hydra-testid-runner".to_string(),
-            "mock pane content".to_string(),
-        );
-        app.prev_captures.insert(
-            "hydra-testid-idler".to_string(),
-            "mock pane content".to_string(),
-        );
 
         app.refresh_sessions().await;
 
-        // Exited stays Exited; the other two become Idle (same mock content)
-        // Sort order: Idle < Running < Exited
-        let statuses: Vec<_> = app.sessions.iter().map(|s| &s.status).collect();
-        assert!(
-            statuses.windows(2).all(|w| w[0].sort_order() <= w[1].sort_order()),
-            "sessions should be sorted by status: got {:?}",
-            app.sessions.iter().map(|s| (&s.name, &s.status)).collect::<Vec<_>>()
-        );
+        let names: Vec<_> = app.sessions.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "bravo", "charlie"]);
     }
 
     #[tokio::test]
     async fn refresh_sessions_preserves_selection_across_sort() {
-        let mut s1 = make_session("a", AgentType::Claude);
-        s1.status = SessionStatus::Idle;
-        let mut s2 = make_session("b", AgentType::Claude);
-        s2.status = SessionStatus::Exited;
-
-        let sessions = vec![s1, s2];
+        // Manager returns sessions in reverse order of their names
+        let sessions = vec![
+            make_session("bravo", AgentType::Claude),
+            make_session("alpha", AgentType::Claude),
+        ];
         let mut app = App::new_with_manager(
             "testid".to_string(),
             "/tmp/test".to_string(),
-            Box::new(MockSessionManager::with_sessions(sessions)),
+            Box::new(MockSessionManager::with_sessions(sessions.clone())),
         );
-        // Select "b" (index 1) and pre-populate so we have known state
-        app.sessions = vec![make_session("a", AgentType::Claude), make_session("b", AgentType::Claude)];
-        app.selected = 1; // "b" selected
-        app.prev_captures.insert(
-            "hydra-testid-a".to_string(),
-            "mock pane content".to_string(),
-        );
-        app.prev_captures.insert(
-            "hydra-testid-b".to_string(),
-            "mock pane content".to_string(),
-        );
+        // Pre-set: user has "bravo" selected (index 0 before sort)
+        app.sessions = sessions;
+        app.selected = 0; // "bravo" selected
 
         app.refresh_sessions().await;
 
-        // "b" should still be selected regardless of new position
+        // After alphabetical sort, "alpha" is 0 and "bravo" is 1
+        // Selection should follow "bravo" to its new index
         let selected_name = &app.sessions[app.selected].name;
-        assert_eq!(selected_name, "b", "selection should follow session across sort");
+        assert_eq!(selected_name, "bravo", "selection should follow session across sort");
     }
 
     #[tokio::test]
@@ -1970,7 +1972,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_sessions_idle_after_long_pause_clears_timer() {
-        // Use a mock that returns constant pane content (= Idle after first tick)
+        // Use a mock that returns constant pane content
         let sessions = vec![make_session("worker", AgentType::Claude)];
         let mut app = App::new_with_manager(
             "testid".to_string(),
@@ -1983,8 +1985,10 @@ mod tests {
         assert_eq!(app.sessions[0].status, SessionStatus::Running);
         assert!(app.sessions[0].task_elapsed.is_some());
 
-        // Second refresh: Idle (same content), but recent activity = frozen timer
-        app.refresh_sessions().await;
+        // Run 3 more ticks to pass debounce threshold → Idle
+        for _ in 0..3 {
+            app.refresh_sessions().await;
+        }
         assert_eq!(app.sessions[0].status, SessionStatus::Idle);
 
         // Simulate long idle: move task_last_active back >5 seconds
@@ -1998,7 +2002,7 @@ mod tests {
             five_secs_ago - std::time::Duration::from_secs(10),
         );
 
-        // Third refresh: still Idle, but last_active > 5s ago = clear timer
+        // Next refresh: still Idle, but last_active > 5s ago = clear timer
         app.refresh_sessions().await;
         assert_eq!(app.sessions[0].status, SessionStatus::Idle);
         assert!(

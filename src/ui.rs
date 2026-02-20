@@ -155,6 +155,7 @@ fn build_diff_tree_lines<'a>(diff_files: &[crate::app::DiffFile], width: usize) 
     let dim = Style::default().fg(Color::DarkGray);
     let green = Style::default().fg(Color::Green);
     let red = Style::default().fg(Color::Red);
+    let cyan = Style::default().fg(Color::Cyan);
 
     let mut sorted: Vec<&crate::app::DiffFile> = diff_files.iter().collect();
     sorted.sort_by(|a, b| a.path.cmp(&b.path));
@@ -188,7 +189,11 @@ fn build_diff_tree_lines<'a>(diff_files: &[crate::app::DiffFile], width: usize) 
         }
 
         // Build diff stat string
-        let stat = format_compact_diff(f.insertions, f.deletions);
+        let stat = if f.untracked {
+            "new".to_string()
+        } else {
+            format_compact_diff(f.insertions, f.deletions)
+        };
         let indent = if dir.is_some() { "  " } else { " " };
 
         // Compute available space for filename
@@ -211,12 +216,15 @@ fn build_diff_tree_lines<'a>(diff_files: &[crate::app::DiffFile], width: usize) 
             Span::styled(format!("{indent}{name}{pad_str}"), dim),
         ];
 
-        // Color the stat: green for +, red for -
-        if f.insertions > 0 {
-            spans.push(Span::styled(format!("+{}", f.insertions), green));
-        }
-        if f.deletions > 0 {
-            spans.push(Span::styled(format!("-{}", f.deletions), red));
+        if f.untracked {
+            spans.push(Span::styled("new", cyan));
+        } else {
+            if f.insertions > 0 {
+                spans.push(Span::styled(format!("+{}", f.insertions), green));
+            }
+            if f.deletions > 0 {
+                spans.push(Span::styled(format!("-{}", f.deletions), red));
+            }
         }
 
         lines.push(Line::from(spans));
@@ -806,9 +814,10 @@ mod tests {
 
         // Per-file git diff stats
         app.diff_files = vec![
-            crate::app::DiffFile { path: "src/app.rs".into(), insertions: 45, deletions: 12 },
-            crate::app::DiffFile { path: "src/ui.rs".into(), insertions: 30, deletions: 5 },
-            crate::app::DiffFile { path: "README.md".into(), insertions: 8, deletions: 0 },
+            crate::app::DiffFile { path: "src/app.rs".into(), insertions: 45, deletions: 12, untracked: false },
+            crate::app::DiffFile { path: "src/ui.rs".into(), insertions: 30, deletions: 5, untracked: false },
+            crate::app::DiffFile { path: "README.md".into(), insertions: 8, deletions: 0, untracked: false },
+            crate::app::DiffFile { path: "src/new_mod.rs".into(), insertions: 0, deletions: 0, untracked: true },
         ];
 
         terminal.draw(|f| super::draw(f, &app)).unwrap();
