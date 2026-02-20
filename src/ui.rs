@@ -310,9 +310,9 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
     let (border_style, border_type) = if app.mode == Mode::Attached {
         (
             Style::default()
-                .fg(Color::Green)
+                .fg(Color::LightGreen)
                 .add_modifier(Modifier::BOLD),
-            BorderType::Thick,
+            BorderType::Double,
         )
     } else {
         (Style::default().fg(Color::Cyan), BorderType::Plain)
@@ -777,6 +777,172 @@ mod tests {
         let result = super::centered_rect(40, 10, area);
         assert_eq!(result.width, 0);
         assert_eq!(result.height, 0);
+    }
+
+    // ── format_compact_diff unit tests ──────────────────────────────
+
+    #[test]
+    fn format_compact_diff_both() {
+        assert_eq!(super::format_compact_diff(10, 5), "+10-5");
+    }
+
+    #[test]
+    fn format_compact_diff_insert_only() {
+        assert_eq!(super::format_compact_diff(7, 0), "+7");
+    }
+
+    #[test]
+    fn format_compact_diff_delete_only() {
+        assert_eq!(super::format_compact_diff(0, 3), "-3");
+    }
+
+    #[test]
+    fn format_compact_diff_zero() {
+        assert_eq!(super::format_compact_diff(0, 0), "");
+    }
+
+    // ── build_diff_tree_lines unit tests ─────────────────────────────
+
+    #[test]
+    fn diff_tree_empty() {
+        let lines = super::build_diff_tree_lines(&[], 40);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn diff_tree_root_level_file() {
+        let files = vec![crate::app::DiffFile {
+            path: "README.md".into(),
+            insertions: 3,
+            deletions: 0,
+            untracked: false,
+        }];
+        let lines = super::build_diff_tree_lines(&files, 40);
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn diff_tree_with_directory() {
+        let files = vec![
+            crate::app::DiffFile { path: "src/app.rs".into(), insertions: 10, deletions: 2, untracked: false },
+            crate::app::DiffFile { path: "src/ui.rs".into(), insertions: 5, deletions: 0, untracked: false },
+        ];
+        let lines = super::build_diff_tree_lines(&files, 40);
+        // 1 directory header + 2 files
+        assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn diff_tree_multiple_directories() {
+        let files = vec![
+            crate::app::DiffFile { path: "src/app.rs".into(), insertions: 1, deletions: 0, untracked: false },
+            crate::app::DiffFile { path: "tests/cli.rs".into(), insertions: 2, deletions: 1, untracked: false },
+        ];
+        let lines = super::build_diff_tree_lines(&files, 40);
+        // 2 directory headers + 2 files
+        assert_eq!(lines.len(), 4);
+    }
+
+    #[test]
+    fn diff_tree_deletion_only_file() {
+        let files = vec![crate::app::DiffFile {
+            path: "old.rs".into(),
+            insertions: 0,
+            deletions: 15,
+            untracked: false,
+        }];
+        let lines = super::build_diff_tree_lines(&files, 40);
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn diff_tree_narrow_width_truncates_name() {
+        let files = vec![crate::app::DiffFile {
+            path: "src/very_long_filename_that_exceeds.rs".into(),
+            insertions: 100,
+            deletions: 50,
+            untracked: false,
+        }];
+        let lines = super::build_diff_tree_lines(&files, 10);
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn diff_tree_narrow_width_truncates_directory() {
+        let files = vec![crate::app::DiffFile {
+            path: "very/deeply/nested/directory/structure/file.rs".into(),
+            insertions: 1,
+            deletions: 0,
+            untracked: false,
+        }];
+        // inner_w = 11, dir "very/deeply/nested/directory/structure/" is 40 chars > 11
+        let lines = super::build_diff_tree_lines(&files, 12);
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn diff_tree_zero_changes_file() {
+        let files = vec![crate::app::DiffFile {
+            path: "unchanged.rs".into(),
+            insertions: 0,
+            deletions: 0,
+            untracked: false,
+        }];
+        let lines = super::build_diff_tree_lines(&files, 40);
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn diff_tree_untracked_file() {
+        let files = vec![crate::app::DiffFile {
+            path: "new_file.rs".into(),
+            insertions: 0,
+            deletions: 0,
+            untracked: true,
+        }];
+        let lines = super::build_diff_tree_lines(&files, 40);
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn diff_tree_mixed_tracked_and_untracked() {
+        let files = vec![
+            crate::app::DiffFile { path: "src/app.rs".into(), insertions: 10, deletions: 2, untracked: false },
+            crate::app::DiffFile { path: "src/new.rs".into(), insertions: 0, deletions: 0, untracked: true },
+        ];
+        let lines = super::build_diff_tree_lines(&files, 40);
+        // 1 directory header + 2 files
+        assert_eq!(lines.len(), 3);
+    }
+
+    // ── Snapshot with deletion-only diff ─────────────────────────────
+
+    #[test]
+    fn browse_mode_with_deletion_only_diff() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = make_app();
+        app.sessions = vec![make_session("worker-1", AgentType::Claude)];
+        app.selected = 0;
+        app.preview = "preview content".to_string();
+
+        let mut stats = crate::logs::SessionStats::default();
+        stats.turns = 5;
+        stats.tokens_in = 5000;
+        stats.tokens_out = 1000;
+        stats.edits = 2;
+        app.session_stats
+            .insert("hydra-testproj-worker-1".to_string(), stats);
+
+        app.diff_files = vec![
+            crate::app::DiffFile { path: "old.rs".into(), insertions: 0, deletions: 20, untracked: false },
+        ];
+
+        terminal.draw(|f| super::draw(f, &app)).unwrap();
+        let output = buffer_to_string(&terminal);
+
+        insta::assert_snapshot!(output);
     }
 
     #[test]

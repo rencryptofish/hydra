@@ -287,11 +287,11 @@ pub async fn capture_pane_scrollback(tmux_name: &str) -> Result<String> {
 
 /// Send a key to a tmux session via `tmux send-keys`.
 pub async fn send_keys(tmux_name: &str, key: &str) -> Result<()> {
-    let status = Command::new("tmux")
-        .args(["send-keys", "-t", tmux_name, key])
-        .status()
-        .await
-        .context("Failed to send keys to tmux session")?;
+    let status = run_status_timeout(
+        Command::new("tmux").args(["send-keys", "-t", tmux_name, key]),
+    )
+    .await
+    .context("Failed to send keys to tmux session")?;
 
     if !status.success() {
         bail!("tmux send-keys failed for '{tmux_name}'");
@@ -313,11 +313,11 @@ pub async fn send_mouse(
     // SGR mouse encoding: press = \x1b[<button;x;yM  release = \x1b[<button;x;ym
     let suffix = if kind == "press" { 'M' } else { 'm' };
     let seq = format!("\x1b[<{button};{x};{y}{suffix}");
-    let status = Command::new("tmux")
-        .args(["send-keys", "-t", tmux_name, "-l", &seq])
-        .status()
-        .await
-        .context("Failed to send mouse event to tmux session")?;
+    let status = run_status_timeout(
+        Command::new("tmux").args(["send-keys", "-t", tmux_name, "-l", &seq]),
+    )
+    .await
+    .context("Failed to send mouse event to tmux session")?;
 
     if !status.success() {
         bail!("tmux send-keys (mouse) failed for '{tmux_name}'");
@@ -391,11 +391,11 @@ fn apply_tmux_modifiers(base: &str, modifiers: crossterm::event::KeyModifiers) -
 
 /// Kill a tmux session.
 pub async fn kill_session(tmux_name: &str) -> Result<()> {
-    let status = Command::new("tmux")
-        .args(["kill-session", "-t", tmux_name])
-        .status()
-        .await
-        .context("Failed to kill tmux session")?;
+    let status = run_status_timeout(
+        Command::new("tmux").args(["kill-session", "-t", tmux_name]),
+    )
+    .await
+    .context("Failed to kill tmux session")?;
 
     if !status.success() {
         bail!("tmux kill-session failed for '{tmux_name}'");
