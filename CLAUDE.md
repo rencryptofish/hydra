@@ -48,10 +48,13 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 
 ## Conventions
 
-- Tick rate is 500ms (`EventHandler::new(Duration::from_millis(500))`)
+- Tick rate is 250ms (`EventHandler::new(Duration::from_millis(250))`)
 - tmux session names: `hydra-<8char_sha256_hex>-<user_name>`
 - Agent commands: `claude --dangerously-skip-permissions`, `codex --yolo`
-- Mouse events forwarded via SGR escape sequences through `send_mouse()`
+- Mouse handling lives in `App::handle_mouse()` (moved from `main.rs` to `app.rs`)
+- **Preview scrolling**: `preview_scroll_offset: u16` tracks lines scrolled up from bottom (0 = bottom). Scroll wheel over preview adjusts by 3 lines/tick. Offset resets on session selection change. Rendering uses `Paragraph::scroll()` with math: `scroll_y = max_scroll_offset - capped_offset` so offset 0 shows latest output.
+- **Scrollback capture**: `capture_pane_scrollback()` uses `tmux capture-pane -p -S -` to get full history (used for preview display). Regular `capture_pane()` (visible pane only) is used for status comparison — keeps status detection lightweight.
+- **No mouse forwarding to tmux**: SGR mouse sequences and arrow-key forwarding for scroll were removed — agents don't support mouse input, and forwarding caused garbled text. Mouse clicks/scroll in the preview are handled locally (scroll viewport, attach/detach).
 
 ## Common Changes
 
