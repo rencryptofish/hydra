@@ -43,6 +43,8 @@ pub struct SessionStats {
     /// ISO 8601 timestamp of the most recent assistant message (task end).
     pub last_assistant_ts: Option<String>,
     pub read_offset: u64,
+    /// Active subagent count (from queue-operation enqueue/remove entries).
+    pub active_subagents: u16,
 }
 
 /// Upper bound for per-session touched file history.
@@ -296,6 +298,24 @@ fn update_session_stats_from_path_and_last_message(
                         if let Some(s) = fname.as_str() {
                             stats.touch_file(s.to_string());
                         }
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Fast path: queue-operation entries for subagent tracking
+        if line.contains("\"queue-operation\"") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if v.get("type").and_then(|t| t.as_str()) == Some("queue-operation") {
+                    match v.get("operation").and_then(|o| o.as_str()) {
+                        Some("enqueue") => {
+                            stats.active_subagents = stats.active_subagents.saturating_add(1);
+                        }
+                        Some("remove") => {
+                            stats.active_subagents = stats.active_subagents.saturating_sub(1);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -3086,6 +3106,53 @@ mod tests {
         assert_eq!(stats.edits, 2, "Write + Edit = 2 edits");
         assert_eq!(stats.bash_cmds, 1, "1 Bash command");
         // Read and other tools don't increment any counter
+    }
+
+    // ── queue-operation subagent tracking ──
+
+    #[test]
+    fn stats_queue_operation_enqueue_increments_subagents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let lines = [
+            r#"{"type":"queue-operation","operation":"enqueue","taskId":"a"}"#,
+            r#"{"type":"queue-operation","operation":"enqueue","taskId":"b"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let mut stats = SessionStats::default();
+        update_session_stats_from_path(&path, &mut stats);
+        assert_eq!(stats.active_subagents, 2);
+    }
+
+    #[test]
+    fn stats_queue_operation_remove_decrements_subagents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let lines = [
+            r#"{"type":"queue-operation","operation":"enqueue","taskId":"a"}"#,
+            r#"{"type":"queue-operation","operation":"enqueue","taskId":"b"}"#,
+            r#"{"type":"queue-operation","operation":"remove","taskId":"a"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let mut stats = SessionStats::default();
+        update_session_stats_from_path(&path, &mut stats);
+        assert_eq!(stats.active_subagents, 1);
+    }
+
+    #[test]
+    fn stats_queue_operation_remove_saturates_at_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let lines = [
+            r#"{"type":"queue-operation","operation":"remove","taskId":"x"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let mut stats = SessionStats::default();
+        update_session_stats_from_path(&path, &mut stats);
+        assert_eq!(stats.active_subagents, 0);
     }
 
     // ── escape_project_path ──

@@ -145,6 +145,14 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default(),
             ));
         }
+        if let Some(stats) = app.session_stats.get(&session.tmux_name) {
+            if stats.active_subagents > 0 {
+                spans.push(Span::styled(
+                    format!(" [{}T]", stats.active_subagents),
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
+        }
         let mut lines = vec![Line::from(spans)];
         if let Some(msg) = app.last_messages.get(&session.tmux_name) {
             let max_chars = 50;

@@ -52,6 +52,8 @@ pub struct App {
     idle_ticks: HashMap<String, u8>,
     /// Consecutive ticks with changed pane content (for Idle→Running debounce).
     changed_ticks: HashMap<String, u8>,
+    /// Consecutive refresh ticks where is_pane_dead() reported dead (for Exited debounce).
+    dead_ticks: HashMap<String, u8>,
     task_starts: HashMap<String, Instant>,
     task_last_active: HashMap<String, Instant>,
     pub last_messages: HashMap<String, String>,
@@ -83,6 +85,11 @@ pub struct App {
 }
 
 impl App {
+    /// Consecutive dead ticks required before accepting Exited (~600ms at 200ms/refresh).
+    const DEAD_TICK_THRESHOLD: u8 = 3;
+    /// Extended dead tick threshold when subagents are active (~3s), allowing orchestration to settle.
+    const DEAD_TICK_SUBAGENT_THRESHOLD: u8 = 15;
+
     pub fn new(project_id: String, cwd: String) -> Self {
         Self::new_with_manager(project_id, cwd, Box::new(TmuxSessionManager::new()))
     }
@@ -111,6 +118,7 @@ impl App {
             raw_captures: HashMap::new(),
             idle_ticks: HashMap::new(),
             changed_ticks: HashMap::new(),
+            dead_ticks: HashMap::new(),
             task_starts: HashMap::new(),
             task_last_active: HashMap::new(),
             last_messages: HashMap::new(),
@@ -172,11 +180,51 @@ impl App {
                 for session in &mut sessions {
                     let name = session.tmux_name.clone();
 
-                    // Carry forward previous status so hysteresis "keep current" works.
+                    let has_active_subagents = self
+                        .session_stats
+                        .get(&name)
+                        .map(|st| st.active_subagents > 0)
+                        .unwrap_or(false);
+
+                    // Debounce Exited: require consecutive dead ticks before accepting.
+                    // A single is_pane_dead()=true (e.g. timeout during heavy I/O) should
+                    // not permanently mark a session as Exited.
+                    if session.status == SessionStatus::Exited {
+                        let count = self.dead_ticks.entry(name.clone()).or_insert(0);
+                        *count = count.saturating_add(1);
+                        let threshold = if has_active_subagents {
+                            Self::DEAD_TICK_SUBAGENT_THRESHOLD
+                        } else {
+                            Self::DEAD_TICK_THRESHOLD
+                        };
+                        if *count < threshold {
+                            // Not enough consecutive dead ticks — keep previous non-Exited status
+                            session.status = prev_statuses
+                                .get(&name)
+                                .filter(|s| **s != SessionStatus::Exited)
+                                .cloned()
+                                .unwrap_or(SessionStatus::Idle);
+                        }
+                    } else {
+                        self.dead_ticks.insert(name.clone(), 0);
+                    }
+
+                    // Carry forward previous status for hysteresis.
                     // list_sessions() returns fresh Session objects; without this, the
                     // default status would defeat the debounce logic.
                     if let Some(prev_status) = prev_statuses.get(&name) {
-                        if session.status != SessionStatus::Exited {
+                        if session.status == SessionStatus::Exited {
+                            // Pane is confirmed dead (passed debounce); keep Exited
+                        } else if *prev_status == SessionStatus::Exited {
+                            // Pane was dead, now alive: clear stale caches for fresh start
+                            self.prev_captures.remove(&name);
+                            self.raw_captures.remove(&name);
+                            self.idle_ticks.remove(&name);
+                            self.changed_ticks.remove(&name);
+                            // Keep Idle from list_sessions(); content comparison will see
+                            // first_capture and immediately set Running
+                        } else {
+                            // Normal: carry forward prev status for hysteresis
                             session.status = prev_status.clone();
                         }
                     }
@@ -188,7 +236,7 @@ impl App {
                     //
                     // Log signal (`task_elapsed`) is used only to *accelerate*
                     // Idle detection: when the log confirms the agent finished
-                    // (assistant replied), the idle threshold drops from 12 to 3
+                    // (assistant replied), the idle threshold drops from 30 to 8
                     // ticks. The log is never used to force Running — it updates
                     // too infrequently (~5s) and stale data would keep sessions
                     // stuck in Running after the agent finishes.
@@ -212,25 +260,34 @@ impl App {
 
                         // If raw content is identical, skip normalization entirely.
                         // Only normalize when raw differs (to filter spinner noise).
-                        let unchanged = if raw_unchanged {
-                            true
+                        let (unchanged, raw_changed_but_normalized_same) = if raw_unchanged {
+                            (true, false)
                         } else {
                             let normalized = normalize_capture(content);
                             let prev = self.prev_captures.get(&name);
-                            let result = prev.is_some_and(|p| *p == normalized);
+                            let normalized_unchanged = prev.is_some_and(|p| *p == normalized);
                             self.prev_captures.insert(name.clone(), normalized);
-                            result
+                            (normalized_unchanged, normalized_unchanged)
                         };
+
+                        // Codex often signals active work with spinner/progress-only
+                        // updates. If raw capture changed but normalized text did not,
+                        // still count it as activity for Codex sessions.
+                        let changed = !unchanged
+                            || (session.agent_type == AgentType::Codex
+                                && raw_changed_but_normalized_same);
 
                         if first_capture {
                             // Brand-new session — assume Running until debounce says otherwise.
                             session.status = SessionStatus::Running;
-                        } else if unchanged {
+                        } else if !changed {
                             let count = self.idle_ticks.entry(name.clone()).or_insert(0);
                             *count = count.saturating_add(1);
                             self.changed_ticks.insert(name.clone(), 0);
 
-                            if *count >= idle_threshold {
+                            if has_active_subagents {
+                                session.status = SessionStatus::Running;
+                            } else if *count >= idle_threshold {
                                 session.status = SessionStatus::Idle;
                             }
                             // else: keep current status (hysteresis)
@@ -327,6 +384,7 @@ impl App {
             self.raw_captures.retain(|k, _| live_keys.contains(k));
             self.idle_ticks.retain(|k, _| live_keys.contains(k));
             self.changed_ticks.retain(|k, _| live_keys.contains(k));
+            self.dead_ticks.retain(|k, _| live_keys.contains(k));
             self.task_starts.retain(|k, _| live_keys.contains(k));
             self.task_last_active.retain(|k, _| live_keys.contains(k));
             self.last_messages.retain(|k, _| live_keys.contains(k));
@@ -1045,6 +1103,9 @@ mod tests {
         scrollback_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         // Dynamic capture: if set, capture_pane calls this with the call index
         capture_fn: Option<std::sync::Arc<dyn Fn(usize) -> String + Send + Sync>>,
+        // Dynamic list: if set, list_sessions calls this with the call index
+        list_fn: Option<std::sync::Arc<dyn Fn(usize) -> Vec<Session> + Send + Sync>>,
+        list_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl MockSessionManager {
@@ -1061,6 +1122,8 @@ mod tests {
                 capture_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 scrollback_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 capture_fn: None,
+                list_fn: None,
+                list_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
         fn with_sessions(sessions: Vec<Session>) -> Self {
@@ -1091,14 +1154,30 @@ mod tests {
             self.capture_fn = Some(std::sync::Arc::new(f));
             self
         }
+        fn with_list_fn<F>(mut self, f: F) -> Self
+        where
+            F: Fn(usize) -> Vec<Session> + Send + Sync + 'static,
+        {
+            self.list_fn = Some(std::sync::Arc::new(f));
+            self
+        }
     }
 
     #[async_trait::async_trait]
     impl SessionManager for MockSessionManager {
         async fn list_sessions(&self, _project_id: &str) -> anyhow::Result<Vec<Session>> {
+            let n = self
+                .list_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             match &self.list_result {
                 Some(Err(msg)) => Err(anyhow::anyhow!("{}", msg)),
-                _ => Ok(self.sessions.clone()),
+                _ => {
+                    if let Some(f) = &self.list_fn {
+                        Ok(f(n))
+                    } else {
+                        Ok(self.sessions.clone())
+                    }
+                }
             }
         }
         async fn create_session(
@@ -2437,7 +2516,10 @@ mod tests {
         app.task_last_active
             .insert("hydra-testid-dead".to_string(), std::time::Instant::now());
 
-        app.refresh_sessions().await;
+        // Dead-tick debounce requires DEAD_TICK_THRESHOLD consecutive dead ticks
+        for _ in 0..App::DEAD_TICK_THRESHOLD {
+            app.refresh_sessions().await;
+        }
         assert_eq!(app.sessions[0].status, SessionStatus::Exited);
         assert!(
             !app.task_starts.contains_key("hydra-testid-dead"),
@@ -3168,6 +3250,7 @@ mod tests {
             .insert(stale.clone(), SessionStats::default());
         app.log_uuids.insert(stale.clone(), "uuid".into());
         app.uuid_retry_cooldowns.insert(stale.clone(), 3);
+        app.dead_ticks.insert(stale.clone(), 1);
 
         app.refresh_sessions().await;
 
@@ -3214,6 +3297,10 @@ mod tests {
         assert!(
             !app.uuid_retry_cooldowns.contains_key(&stale),
             "stale uuid_retry_cooldowns should be pruned"
+        );
+        assert!(
+            !app.dead_ticks.contains_key(&stale),
+            "stale dead_ticks should be pruned"
         );
     }
 
@@ -3636,6 +3723,60 @@ mod tests {
             app.sessions[0].status,
             SessionStatus::Running,
             "5 changed ticks: flips to Running"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_sessions_codex_spinner_only_updates_stay_running() {
+        let sessions = vec![make_session("s1", AgentType::Codex)];
+        let frames = [
+            "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}",
+            "\u{2827}", "\u{2807}", "\u{280f}",
+        ];
+        let manager = MockSessionManager::with_sessions(sessions)
+            .with_capture_fn(move |n| format!("thinking {}", frames[n % frames.len()]));
+
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(manager),
+        );
+
+        for _ in 0..40 {
+            app.refresh_sessions().await;
+        }
+
+        assert_eq!(
+            app.sessions[0].status,
+            SessionStatus::Running,
+            "Codex spinner-only activity should keep session Running"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_sessions_claude_spinner_only_updates_can_set_idle() {
+        let sessions = vec![make_session("s1", AgentType::Claude)];
+        let frames = [
+            "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}",
+            "\u{2827}", "\u{2807}", "\u{280f}",
+        ];
+        let manager = MockSessionManager::with_sessions(sessions)
+            .with_capture_fn(move |n| format!("thinking {}", frames[n % frames.len()]));
+
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(manager),
+        );
+
+        for _ in 0..31 {
+            app.refresh_sessions().await;
+        }
+
+        assert_eq!(
+            app.sessions[0].status,
+            SessionStatus::Idle,
+            "Claude spinner-only noise remains ignored for Idle detection"
         );
     }
 
@@ -4115,5 +4256,205 @@ mod tests {
         app.preview_scroll_offset = 5; // trigger scrollback path
         app.refresh_preview().await;
         assert_eq!(app.preview, "[unable to capture pane]");
+    }
+
+    // ── Dead-tick debounce tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn refresh_sessions_single_dead_tick_does_not_mark_exited() {
+        let exited = make_session_with_status("s1", AgentType::Claude, SessionStatus::Exited);
+        let manager = MockSessionManager::with_sessions(vec![exited]);
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(manager),
+        );
+
+        // Single dead tick should NOT mark Exited (debounce threshold = 3)
+        app.refresh_sessions().await;
+        assert_ne!(
+            app.sessions[0].status,
+            SessionStatus::Exited,
+            "single dead tick should not mark Exited"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_sessions_consecutive_dead_ticks_marks_exited() {
+        let exited = make_session_with_status("s1", AgentType::Claude, SessionStatus::Exited);
+        let manager = MockSessionManager::with_sessions(vec![exited]);
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(manager),
+        );
+
+        // Run DEAD_TICK_THRESHOLD consecutive dead ticks → should be Exited
+        for _ in 0..App::DEAD_TICK_THRESHOLD {
+            app.refresh_sessions().await;
+        }
+        assert_eq!(
+            app.sessions[0].status,
+            SessionStatus::Exited,
+            "consecutive dead ticks at threshold should mark Exited"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_sessions_dead_ticks_reset_on_alive() {
+        // Session starts as Exited for 2 ticks, then becomes alive, then dead again
+        let exited = make_session_with_status("s1", AgentType::Claude, SessionStatus::Exited);
+        let alive = make_session_with_status("s1", AgentType::Claude, SessionStatus::Idle);
+        let manager = MockSessionManager::new().with_list_fn(move |n| match n {
+            0 | 1 => vec![exited.clone()],
+            2 => vec![alive.clone()],
+            _ => vec![exited.clone()],
+        });
+
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(manager),
+        );
+
+        // 2 dead ticks (below threshold)
+        app.refresh_sessions().await;
+        app.refresh_sessions().await;
+        assert_ne!(app.sessions[0].status, SessionStatus::Exited);
+
+        // 1 alive tick — resets dead_ticks counter
+        app.refresh_sessions().await;
+        assert_eq!(
+            app.dead_ticks
+                .get("hydra-testid-s1")
+                .copied()
+                .unwrap_or(0),
+            0,
+            "alive tick should reset dead_ticks counter"
+        );
+
+        // 1 dead tick after reset — should NOT be Exited
+        app.refresh_sessions().await;
+        assert_ne!(
+            app.sessions[0].status,
+            SessionStatus::Exited,
+            "single dead tick after reset should not mark Exited"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_sessions_exited_recovery_clears_caches() {
+        // Session starts as Exited (passed debounce), then becomes alive
+        let exited = make_session_with_status("s1", AgentType::Claude, SessionStatus::Exited);
+        let alive = make_session_with_status("s1", AgentType::Claude, SessionStatus::Idle);
+        let manager = MockSessionManager::new().with_list_fn({
+            let threshold = App::DEAD_TICK_THRESHOLD as usize;
+            move |n| {
+                if n < threshold {
+                    vec![exited.clone()]
+                } else {
+                    vec![alive.clone()]
+                }
+            }
+        });
+
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(manager),
+        );
+
+        // Pass debounce threshold to confirm Exited
+        for _ in 0..App::DEAD_TICK_THRESHOLD {
+            app.refresh_sessions().await;
+        }
+        assert_eq!(app.sessions[0].status, SessionStatus::Exited);
+
+        // Pre-populate caches to verify they get cleared on recovery
+        let key = "hydra-testid-s1".to_string();
+        app.prev_captures.insert(key.clone(), "old".into());
+        app.raw_captures.insert(key.clone(), "old".into());
+        app.idle_ticks.insert(key.clone(), 10);
+        app.changed_ticks.insert(key.clone(), 5);
+
+        // Session comes back alive — Exited→alive transition should clear caches
+        app.refresh_sessions().await;
+        assert_ne!(
+            app.sessions[0].status,
+            SessionStatus::Exited,
+            "session should recover from Exited"
+        );
+        // First capture on recovery should set Running
+        assert_eq!(
+            app.sessions[0].status,
+            SessionStatus::Running,
+            "first capture after recovery should be Running"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_sessions_active_subagents_forces_running_when_idle() {
+        let sessions = vec![make_session("s1", AgentType::Claude)];
+        let manager = MockSessionManager::with_sessions(sessions);
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(manager),
+        );
+
+        // Inject active subagents into session stats
+        let key = "hydra-testid-s1".to_string();
+        let mut stats = SessionStats::default();
+        stats.active_subagents = 2;
+        app.session_stats.insert(key.clone(), stats);
+
+        // Run enough ticks to normally trigger Idle (1 first-capture + 30 unchanged)
+        for _ in 0..40 {
+            app.refresh_sessions().await;
+        }
+
+        // With active subagents, session should stay Running despite unchanged content
+        assert_eq!(
+            app.sessions[0].status,
+            SessionStatus::Running,
+            "active subagents should force Running even with unchanged content"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_sessions_active_subagents_extends_dead_threshold() {
+        let exited = make_session_with_status("s1", AgentType::Claude, SessionStatus::Exited);
+        let manager = MockSessionManager::with_sessions(vec![exited]);
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(manager),
+        );
+
+        // Inject active subagents
+        let key = "hydra-testid-s1".to_string();
+        let mut stats = SessionStats::default();
+        stats.active_subagents = 1;
+        app.session_stats.insert(key, stats);
+
+        // Run up to normal threshold — should NOT be Exited due to subagent extension
+        for _ in 0..App::DEAD_TICK_THRESHOLD {
+            app.refresh_sessions().await;
+        }
+        assert_ne!(
+            app.sessions[0].status,
+            SessionStatus::Exited,
+            "active subagents should extend dead threshold"
+        );
+
+        // Run up to subagent threshold → should be Exited
+        for _ in App::DEAD_TICK_THRESHOLD..App::DEAD_TICK_SUBAGENT_THRESHOLD {
+            app.refresh_sessions().await;
+        }
+        assert_eq!(
+            app.sessions[0].status,
+            SessionStatus::Exited,
+            "should mark Exited after extended subagent threshold"
+        );
     }
 }
