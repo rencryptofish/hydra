@@ -36,7 +36,7 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
   - **Yellow** = Exited (agent process ended, pane is dead)
 - **Task elapsed timer**: Tracks per-session `Instant` timestamps in App. Running starts the clock; Idle <5s shows frozen duration (same task); Idle >5s clears it (new task).
 - **Embedded attach mode**: `Mode::Attached` forwards keystrokes via `tmux send-keys` instead of `tmux attach`. Preview border switches to thick green (`BorderType::Thick` + bold) for clear visual distinction. Esc returns to Browse.
-- **Last message display**: Sidebar shows the last Claude assistant message per session (dimmed second line, truncated to 50 chars). UUIDs are resolved once via PID→lsof and cached in `App.log_uuids`. Messages refresh every 20 ticks (~5s). Only reads last 200KB of JSONL for efficiency.
+- **Last message display**: Sidebar shows the last Claude assistant message per session (dimmed second line, truncated to 50 chars). UUIDs are resolved via PID→process tree lookup and cached in `App.log_uuids`. Failed UUID resolutions are retried with cooldown to avoid repeated expensive subprocess walks. Messages refresh every 50 ticks (~5s). Only reads incremental JSONL bytes for efficiency.
 - **Claude Code JSONL logs**: Located at `~/.claude/projects/<escaped-cwd>/<uuid>.jsonl`. Path escaping replaces `/` with `-` (e.g. `/Users/monkey/hydra` → `-Users-monkey-hydra`). Structure: `{"type": "assistant", "message": {"content": [{"text": "..."}]}}`. The UUID is discovered by parsing `--session-id` from the process command line (`ps -p <pid> -o command=`), falling back to `lsof -p <pane_pid>` for legacy sessions without `--session-id`.
 - **remain-on-exit**: Set on session creation so exited agents stay visible with `Exited` status instead of vanishing.
 - **Agent type caching**: `TmuxSessionManager` caches `HYDRA_AGENT_TYPE` env var lookups in a `std::sync::Mutex<HashMap>` to avoid repeated `tmux show-environment` calls on every tick. Uses `std::sync::Mutex` (not tokio) since the lock is never held across `.await` points. Cache is also pre-populated on `create_session`.
@@ -57,7 +57,7 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 
 ## Conventions
 
-- Tick rate is 250ms (`EventHandler::new(Duration::from_millis(250))`)
+- Tick rate is 100ms (`EventHandler::new(Duration::from_millis(100))`)
 - tmux session names: `hydra-<8char_sha256_hex>-<user_name>`
 - Agent commands: `claude --dangerously-skip-permissions`, `codex -c check_for_update_on_startup=false --yolo`
 - Mouse handling lives in `App::handle_mouse()` (moved from `main.rs` to `app.rs`)
@@ -66,6 +66,14 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 - **No mouse forwarding to tmux**: Mouse clicks in the preview are NOT forwarded to agent tmux panes — agents don't support mouse input, and forwarding SGR mouse sequences causes garbled text (e.g. `[<0;12;21m`). Left-clicking inside the preview in Attached mode only resets `preview_scroll_offset` to 0. Clicks outside the preview detach. Scroll events are handled locally.
 - **Pending action pattern**: `handle_mouse()` is synchronous (to avoid converting 15+ tests to async), so it can't call async trait methods directly. Instead it sets `App.pending_literal_keys: Option<(String, String)>` which the event loop consumes via `flush_pending_keys()`. This pattern keeps mouse tests simple while supporting async I/O.
 - **Literal key sending**: `send_keys_literal()` on `SessionManager` sends raw text/escape sequences via `tmux send-keys -l` (literal mode). Has a default no-op impl in the trait so mock impls don't need to override it.
+
+## Recent Learnings (2026-02-20)
+
+- Keep the UI event tick responsive (100ms) but decouple expensive tmux refresh work to a lower cadence; this preserves input feel while reducing subprocess pressure.
+- Cache preview line count in app state and update it only when preview text changes; avoid `lines().count()` during every draw.
+- Parse session JSONL once per refresh path: update stats and extract the last assistant text in the same incremental pass.
+- Use a retry cooldown for unresolved UUID lookups (6 cycles ~= 30s at 5s refresh cadence) to avoid repeatedly traversing process trees for sessions that do not expose Claude UUIDs.
+- Replace repeated `iter().find()` lookups in session refresh loops with a prebuilt `HashMap` to avoid O(n^2) behavior as session counts grow.
 
 ## Common Changes
 

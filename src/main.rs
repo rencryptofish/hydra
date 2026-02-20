@@ -22,6 +22,9 @@ use app::{App, Mode};
 use event::{Event, EventHandler};
 use session::{project_id, AgentType};
 
+const EVENT_TICK_RATE: Duration = Duration::from_millis(100);
+const SESSION_REFRESH_INTERVAL_TICKS: u8 = 2;
+
 #[derive(Parser)]
 #[command(name = "hydra", about = "AI Agent tmux session manager")]
 struct Cli {
@@ -112,8 +115,9 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
     app.refresh_sessions().await;
     app.refresh_preview().await;
 
-    let mut events = EventHandler::new(Duration::from_millis(100));
+    let mut events = EventHandler::new(EVENT_TICK_RATE);
     let mut prev_mouse_captured = true;
+    let mut session_refresh_tick = 0u8;
 
     // Draw initial frame before entering event loop
     terminal.draw(|frame| ui::draw(frame, &app))?;
@@ -146,8 +150,11 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
                 }
             }
             Some(Event::Tick) => {
-                app.refresh_sessions().await;
-                app.refresh_preview().await;
+                session_refresh_tick = session_refresh_tick.wrapping_add(1);
+                if session_refresh_tick % SESSION_REFRESH_INTERVAL_TICKS == 0 {
+                    app.refresh_sessions().await;
+                    app.refresh_preview().await;
+                }
                 app.refresh_messages();
             }
             Some(Event::Resize) => {}

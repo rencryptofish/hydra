@@ -12,6 +12,7 @@ use crate::session::{AgentType, Session, SessionStatus};
 /// Results from a background message/stats refresh task.
 pub struct MessageRefreshResult {
     pub log_uuids: HashMap<String, String>,
+    pub uuid_retry_cooldowns: HashMap<String, u8>,
     pub last_messages: HashMap<String, String>,
     pub session_stats: HashMap<String, SessionStats>,
     pub global_stats: GlobalStats,
@@ -31,6 +32,8 @@ pub struct App {
     pub sessions: Vec<Session>,
     pub selected: usize,
     pub preview: String,
+    /// Cached preview line count to avoid O(n) line scans every frame.
+    pub preview_line_count: u16,
     pub mode: Mode,
     pub agent_selection: usize,
     pub should_quit: bool,
@@ -57,6 +60,8 @@ pub struct App {
     /// Per-file git diff stats from `git diff --numstat`
     pub diff_files: Vec<DiffFile>,
     log_uuids: HashMap<String, String>,
+    /// Per-session cooldown (in refresh cycles) before retrying UUID resolution.
+    uuid_retry_cooldowns: HashMap<String, u8>,
     /// Latest per-session pane captures from `refresh_sessions` tick.
     /// Used by preview refresh to avoid redundant tmux calls.
     latest_pane_captures: HashMap<String, String>,
@@ -91,6 +96,7 @@ impl App {
             sessions: Vec::new(),
             selected: 0,
             preview: String::new(),
+            preview_line_count: 0,
             mode: Mode::Browse,
             agent_selection: 0,
             should_quit: false,
@@ -112,6 +118,7 @@ impl App {
             global_stats: GlobalStats::default(),
             diff_files: Vec::new(),
             log_uuids: HashMap::new(),
+            uuid_retry_cooldowns: HashMap::new(),
             latest_pane_captures: HashMap::new(),
             message_tick: 0,
             manifest_dir: crate::manifest::default_base_dir(),
@@ -124,12 +131,29 @@ impl App {
         }
     }
 
+    fn set_preview_content(&mut self, content: String, has_scrollback: bool) {
+        self.preview_line_count = count_lines_u16(&content);
+        self.preview = content;
+        self.preview_has_scrollback = has_scrollback;
+    }
+
+    #[cfg(test)]
+    pub fn set_preview_text(&mut self, content: String) {
+        self.preview_line_count = count_lines_u16(&content);
+        self.preview = content;
+    }
+
     pub async fn refresh_sessions(&mut self) {
         let pid = self.project_id.clone();
         let result = self.manager.list_sessions(&pid).await;
         match result {
             Ok(mut sessions) => {
                 let now = Instant::now();
+                let prev_statuses: HashMap<String, SessionStatus> = self
+                    .sessions
+                    .iter()
+                    .map(|s| (s.tmux_name.clone(), s.status.clone()))
+                    .collect();
 
                 // Batch-capture pane content in parallel for all non-exited sessions.
                 // This turns N sequential subprocess waits into 1 parallel wait.
@@ -151,9 +175,9 @@ impl App {
                     // Carry forward previous status so hysteresis "keep current" works.
                     // list_sessions() returns fresh Session objects; without this, the
                     // default status would defeat the debounce logic.
-                    if let Some(prev_session) = self.sessions.iter().find(|s| s.tmux_name == name) {
+                    if let Some(prev_status) = prev_statuses.get(&name) {
                         if session.status != SessionStatus::Exited {
-                            session.status = prev_session.status.clone();
+                            session.status = prev_status.clone();
                         }
                     }
 
@@ -308,6 +332,7 @@ impl App {
             self.last_messages.retain(|k, _| live_keys.contains(k));
             self.session_stats.retain(|k, _| live_keys.contains(k));
             self.log_uuids.retain(|k, _| live_keys.contains(k));
+            self.uuid_retry_cooldowns.retain(|k, _| live_keys.contains(k));
             self.latest_pane_captures
                 .retain(|k, _| live_keys.contains(k));
         }
@@ -347,26 +372,26 @@ impl App {
             if wants_scrollback {
                 let result = self.manager.capture_pane_scrollback(&tmux_name).await;
                 match result {
-                    Ok(content) => self.preview = content,
-                    Err(_) => self.preview = String::from("[unable to capture pane]"),
+                    Ok(content) => self.set_preview_content(content, true),
+                    Err(_) => {
+                        self.set_preview_content(String::from("[unable to capture pane]"), true)
+                    }
                 }
-                self.preview_has_scrollback = true;
             } else if let Some(content) = self.latest_pane_captures.get(&tmux_name) {
-                self.preview = content.clone();
-                self.preview_has_scrollback = false;
+                self.set_preview_content(content.clone(), false);
             } else {
                 let result = self.manager.capture_pane(&tmux_name).await;
                 match result {
-                    Ok(content) => self.preview = content,
-                    Err(_) => self.preview = String::from("[unable to capture pane]"),
+                    Ok(content) => self.set_preview_content(content, false),
+                    Err(_) => {
+                        self.set_preview_content(String::from("[unable to capture pane]"), false)
+                    }
                 }
-                self.preview_has_scrollback = false;
             }
             self.preview_session = Some(tmux_name);
         } else {
-            self.preview = String::from("No sessions. Press 'n' to create one.");
+            self.set_preview_content(String::from("No sessions. Press 'n' to create one."), false);
             self.preview_session = None;
-            self.preview_has_scrollback = false;
         }
     }
 
@@ -379,6 +404,7 @@ impl App {
             match rx.try_recv() {
                 Ok(result) => {
                     self.log_uuids.extend(result.log_uuids);
+                    self.uuid_retry_cooldowns = result.uuid_retry_cooldowns;
                     self.last_messages.extend(result.last_messages);
                     self.session_stats = result.session_stats;
                     self.global_stats = result.global_stats;
@@ -408,6 +434,7 @@ impl App {
         // Clone data for background task
         let tmux_names: Vec<String> = self.sessions.iter().map(|s| s.tmux_name.clone()).collect();
         let log_uuids = self.log_uuids.clone();
+        let uuid_retry_cooldowns = self.uuid_retry_cooldowns.clone();
         let session_stats = self.session_stats.clone();
         let global_stats = self.global_stats.clone();
         let cwd = self.cwd.clone();
@@ -417,8 +444,15 @@ impl App {
 
         tokio::spawn(async move {
             let result =
-                compute_message_refresh(tmux_names, log_uuids, session_stats, global_stats, cwd)
-                    .await;
+                compute_message_refresh(
+                    tmux_names,
+                    log_uuids,
+                    uuid_retry_cooldowns,
+                    session_stats,
+                    global_stats,
+                    cwd,
+                )
+                .await;
             let _ = tx.send(result);
         });
     }
@@ -806,27 +840,47 @@ pub struct DiffFile {
 async fn compute_message_refresh(
     tmux_names: Vec<String>,
     mut log_uuids: HashMap<String, String>,
+    mut uuid_retry_cooldowns: HashMap<String, u8>,
     mut session_stats: HashMap<String, SessionStats>,
     mut global_stats: GlobalStats,
     cwd: String,
 ) -> MessageRefreshResult {
+    /// Retry unresolved UUID discovery every ~30s (6 refresh cycles at 5s each).
+    const UUID_RETRY_COOLDOWN_CYCLES: u8 = 6;
+
     let mut last_messages = HashMap::new();
 
     for tmux_name in &tmux_names {
         // Try to resolve UUID if not cached
         if !log_uuids.contains_key(tmux_name) {
-            if let Some(uuid) = crate::logs::resolve_session_uuid(tmux_name).await {
-                log_uuids.insert(tmux_name.clone(), uuid);
+            let should_attempt_resolve = match uuid_retry_cooldowns.get_mut(tmux_name) {
+                Some(cooldown) if *cooldown > 0 => {
+                    *cooldown -= 1;
+                    false
+                }
+                _ => true,
+            };
+
+            if should_attempt_resolve {
+                if let Some(uuid) = crate::logs::resolve_session_uuid(tmux_name).await {
+                    log_uuids.insert(tmux_name.clone(), uuid);
+                    uuid_retry_cooldowns.remove(tmux_name);
+                } else {
+                    uuid_retry_cooldowns
+                        .insert(tmux_name.clone(), UUID_RETRY_COOLDOWN_CYCLES);
+                }
             }
         }
 
         // Read last message and update stats if UUID is known
         if let Some(uuid) = log_uuids.get(tmux_name).cloned() {
-            if let Some(msg) = crate::logs::read_last_assistant_message(&cwd, &uuid) {
+            uuid_retry_cooldowns.remove(tmux_name);
+            let stats = session_stats.entry(tmux_name.clone()).or_default();
+            if let Some(msg) =
+                crate::logs::update_session_stats_and_last_message(&cwd, &uuid, stats)
+            {
                 last_messages.insert(tmux_name.clone(), msg);
             }
-            let stats = session_stats.entry(tmux_name.clone()).or_default();
-            crate::logs::update_session_stats(&cwd, &uuid, stats);
         }
     }
 
@@ -838,11 +892,16 @@ async fn compute_message_refresh(
 
     MessageRefreshResult {
         log_uuids,
+        uuid_retry_cooldowns,
         last_messages,
         session_stats,
         global_stats,
         diff_files,
     }
+}
+
+fn count_lines_u16(content: &str) -> u16 {
+    content.lines().count().min(u16::MAX as usize) as u16
 }
 
 /// Normalize captured pane content to reduce noise from spinners and cursors.
@@ -2895,6 +2954,7 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut result = MessageRefreshResult {
             log_uuids: std::collections::HashMap::new(),
+            uuid_retry_cooldowns: std::collections::HashMap::new(),
             last_messages: std::collections::HashMap::new(),
             session_stats: std::collections::HashMap::new(),
             global_stats: crate::logs::GlobalStats::default(),
@@ -2903,6 +2963,9 @@ mod tests {
         result
             .last_messages
             .insert("test-session".to_string(), "hello world".to_string());
+        result
+            .uuid_retry_cooldowns
+            .insert("test-session".to_string(), 4);
         tx.send(result).ok(); // ignore error (can't unwrap without Debug on the error type)
 
         app.bg_refresh_rx = Some(rx);
@@ -2912,6 +2975,11 @@ mod tests {
             app.last_messages.get("test-session").map(|s| s.as_str()),
             Some("hello world"),
             "should apply completed background result"
+        );
+        assert_eq!(
+            app.uuid_retry_cooldowns.get("test-session"),
+            Some(&4),
+            "should apply cooldown state from background result"
         );
         assert!(app.bg_refresh_rx.is_none(), "should consume the channel");
     }
@@ -3099,6 +3167,7 @@ mod tests {
         app.session_stats
             .insert(stale.clone(), SessionStats::default());
         app.log_uuids.insert(stale.clone(), "uuid".into());
+        app.uuid_retry_cooldowns.insert(stale.clone(), 3);
 
         app.refresh_sessions().await;
 
@@ -3141,6 +3210,10 @@ mod tests {
         assert!(
             !app.log_uuids.contains_key(&stale),
             "stale log_uuids should be pruned"
+        );
+        assert!(
+            !app.uuid_retry_cooldowns.contains_key(&stale),
+            "stale uuid_retry_cooldowns should be pruned"
         );
     }
 
@@ -3585,7 +3658,7 @@ mod tests {
         app.idle_ticks.insert("hydra-testid-s1".to_string(), 1);
 
         // Second call — should skip (same session, idle_ticks >= 1)
-        app.preview = "modified".to_string();
+        app.set_preview_text("modified".to_string());
         app.refresh_preview().await;
         // If it skipped, preview remains "modified" (wasn't overwritten)
         assert_eq!(
@@ -3614,7 +3687,7 @@ mod tests {
 
         app.refresh_preview().await;
         // idle_ticks = 0 (default), same session
-        app.preview = "modified".to_string();
+        app.set_preview_text("modified".to_string());
         app.refresh_preview().await;
         // Should NOT skip, so preview is overwritten
         assert_ne!(
@@ -3688,7 +3761,7 @@ mod tests {
         );
 
         // While still scrolled up in same session, preview should stay frozen.
-        app.preview = "frozen".to_string();
+        app.set_preview_text("frozen".to_string());
         app.refresh_preview().await;
         assert_eq!(
             app.preview, "frozen",

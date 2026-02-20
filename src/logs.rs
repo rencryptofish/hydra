@@ -142,11 +142,22 @@ pub fn format_cost(usd: f64) -> String {
 
 /// Incrementally update stats from a Claude JSONL log file.
 /// Only reads bytes after `stats.read_offset`, making repeated calls cheap.
+#[allow(dead_code)]
 pub fn update_session_stats(cwd: &str, uuid: &str, stats: &mut SessionStats) {
+    let _ = update_session_stats_and_last_message(cwd, uuid, stats);
+}
+
+/// Incrementally update stats and return the most recent assistant text seen
+/// in newly-read bytes (if any).
+pub fn update_session_stats_and_last_message(
+    cwd: &str,
+    uuid: &str,
+    stats: &mut SessionStats,
+) -> Option<String> {
     let escaped = escape_project_path(cwd);
     let home = match std::env::var("HOME") {
         Ok(h) => h,
-        Err(_) => return,
+        Err(_) => return None,
     };
     let path = PathBuf::from(&home)
         .join(".claude")
@@ -154,38 +165,47 @@ pub fn update_session_stats(cwd: &str, uuid: &str, stats: &mut SessionStats) {
         .join(&escaped)
         .join(format!("{uuid}.jsonl"));
 
-    update_session_stats_from_path(&path, stats);
+    update_session_stats_from_path_and_last_message(&path, stats)
 }
 
 /// Core stats parser — reads from a specific file path.
 /// Separated from `update_session_stats` for testability (avoids HOME env var).
+#[allow(dead_code)]
 fn update_session_stats_from_path(path: &std::path::Path, stats: &mut SessionStats) {
+    let _ = update_session_stats_from_path_and_last_message(path, stats);
+}
+
+fn update_session_stats_from_path_and_last_message(
+    path: &std::path::Path,
+    stats: &mut SessionStats,
+) -> Option<String> {
     let mut file = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(_) => return,
+        Err(_) => return None,
     };
     let file_len = match file.metadata() {
         Ok(m) => m.len(),
-        Err(_) => return,
+        Err(_) => return None,
     };
 
     // Nothing new to read
     if file_len <= stats.read_offset {
-        return;
+        return None;
     }
 
     // Seek to where we left off
     if stats.read_offset > 0 {
         if file.seek(SeekFrom::Start(stats.read_offset)).is_err() {
-            return;
+            return None;
         }
     }
 
     let mut buf = Vec::new();
     if file.read_to_end(&mut buf).is_err() {
-        return;
+        return None;
     }
     let text = String::from_utf8_lossy(&buf);
+    let mut last_text: Option<String> = None;
 
     for line in text.lines() {
         // Skip empty lines
@@ -193,29 +213,18 @@ fn update_session_stats_from_path(path: &std::path::Path, stats: &mut SessionSta
             continue;
         }
 
-        // Fast path: user messages — track timestamp for task-start timing
-        if line.contains("\"user\"")
-            && line.contains("\"timestamp\"")
-            && !line.contains("\"usage\"")
-        {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                if v.get("type").and_then(|t| t.as_str()) == Some("user") {
-                    if let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()) {
-                        stats.last_user_ts = Some(ts.to_string());
-                    }
-                }
-            }
-            continue;
-        }
-
-        // Fast path: assistant messages with usage (token counts + tool calls)
-        if line.contains("\"assistant\"") && line.contains("\"usage\"") {
+        // Fast path: assistant messages. Parse once and update both stats + last text.
+        if line.contains("\"assistant\"") {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 if v.get("type").and_then(|t| t.as_str()) == Some("assistant") {
-                    // Track timestamp for task-end timing
                     if let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()) {
                         stats.last_assistant_ts = Some(ts.to_string());
                     }
+
+                    if let Some(text) = extract_assistant_message_text(&v) {
+                        last_text = Some(text);
+                    }
+
                     // Extract token usage
                     if let Some(usage) = v.get("message").and_then(|m| m.get("usage")) {
                         stats.turns += 1;
@@ -260,6 +269,21 @@ fn update_session_stats_from_path(path: &std::path::Path, stats: &mut SessionSta
             continue;
         }
 
+        // Fast path: user messages — track timestamp for task-start timing
+        if line.contains("\"user\"")
+            && line.contains("\"timestamp\"")
+            && !line.contains("\"usage\"")
+        {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if v.get("type").and_then(|t| t.as_str()) == Some("user") {
+                    if let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()) {
+                        stats.last_user_ts = Some(ts.to_string());
+                    }
+                }
+            }
+            continue;
+        }
+
         // Fast path: tool results with filenames
         if line.contains("\"filenames\"") && line.contains("\"toolUseResult\"") {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
@@ -279,6 +303,7 @@ fn update_session_stats_from_path(path: &std::path::Path, stats: &mut SessionSta
     }
 
     stats.read_offset = file_len;
+    last_text
 }
 
 const FILE_DISCOVERY_INTERVAL_SECS: i64 = 30;
@@ -901,8 +926,29 @@ fn escape_project_path(cwd: &str) -> String {
     cwd.replace('/', "-")
 }
 
+fn extract_assistant_message_text(v: &serde_json::Value) -> Option<String> {
+    let content = v
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())?;
+
+    let mut parts = Vec::new();
+    for item in content {
+        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+            parts.push(text);
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
 /// Read the last assistant message from a Claude JSONL log file.
 /// Reads only the tail of the file for efficiency on large logs.
+#[allow(dead_code)]
 pub fn read_last_assistant_message(cwd: &str, uuid: &str) -> Option<String> {
     let escaped = escape_project_path(cwd);
     let home = std::env::var("HOME").ok()?;
@@ -938,20 +984,8 @@ pub fn read_last_assistant_message(cwd: &str, uuid: &str) -> Option<String> {
         if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
             continue;
         }
-        if let Some(content) = v
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_array())
-        {
-            let mut parts = Vec::new();
-            for item in content {
-                if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
-                    parts.push(t);
-                }
-            }
-            if !parts.is_empty() {
-                last_text = Some(parts.join(" "));
-            }
+        if let Some(text) = extract_assistant_message_text(&v) {
+            last_text = Some(text);
         }
     }
 
