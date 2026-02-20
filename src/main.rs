@@ -13,9 +13,13 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use minisign_verify::{PublicKey, Signature};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use std::env::consts::{ARCH, OS};
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use app::{App, Mode};
@@ -24,6 +28,16 @@ use session::{project_id, AgentType};
 
 const EVENT_TICK_RATE: Duration = Duration::from_millis(100);
 const SESSION_REFRESH_INTERVAL_TICKS: u8 = 2;
+
+// Minisign Ed25519 public key for verifying release binaries.
+// This is the second line (base64 key data) from the .pub file.
+// Generate keypair: minisign -G -p hydra.pub -s hydra.key
+// Sign binary:      minisign -Sm hydra-darwin-aarch64 -s hydra.key
+const UPDATE_PUBLIC_KEY: &str =
+    "RWAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+const GITHUB_RELEASES_URL: &str =
+    "https://api.github.com/repos/rencryptofish/hydra/releases/latest";
 
 #[derive(Parser)]
 #[command(name = "hydra", about = "AI Agent tmux session manager")]
@@ -105,23 +119,227 @@ async fn cmd_ls(project_id: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_update() -> Result<()> {
-    println!("Updating hydra from GitHub...");
-    let status = std::process::Command::new("cargo")
-        .args([
-            "install", "--locked", "--force", "--git",
-            "https://github.com/rencryptofish/hydra.git",
-            "hydra",
-        ])
-        .status()
-        .context("Failed to run cargo install — is cargo on PATH?")?;
+/// Maps the current OS/ARCH to the expected GitHub Release asset name.
+fn platform_asset_name() -> Result<String> {
+    let os = match OS {
+        "macos" => "darwin",
+        "linux" => "linux",
+        other => anyhow::bail!(
+            "Unsupported OS: {other}. Install manually with: cargo install --git https://github.com/rencryptofish/hydra.git"
+        ),
+    };
+    let arch = match ARCH {
+        "aarch64" => "aarch64",
+        "x86_64" => "x86_64",
+        other => anyhow::bail!(
+            "Unsupported architecture: {other}. Install manually with: cargo install --git https://github.com/rencryptofish/hydra.git"
+        ),
+    };
+    Ok(format!("hydra-{os}-{arch}"))
+}
 
-    if status.success() {
-        println!("hydra updated successfully.");
-        Ok(())
-    } else {
-        anyhow::bail!("Update failed (cargo exited with {}).", status);
+/// Fetches the latest release metadata from the GitHub API via curl.
+fn fetch_release_metadata() -> Result<serde_json::Value> {
+    let output = std::process::Command::new("curl")
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--max-time",
+            "30",
+            "-H",
+            "Accept: application/vnd.github.v3+json",
+            GITHUB_RELEASES_URL,
+        ])
+        .output()
+        .context("Failed to run curl — is curl on PATH?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("GitHub API request failed: {stderr}");
     }
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("Failed to parse GitHub API response")?;
+    Ok(json)
+}
+
+/// Extracts the binary URL, .minisig URL, and tag name from release JSON.
+fn find_asset_urls(
+    release: &serde_json::Value,
+    asset_name: &str,
+) -> Result<(String, String, String)> {
+    let tag = release["tag_name"]
+        .as_str()
+        .context("Release JSON missing 'tag_name'")?
+        .to_string();
+
+    let assets = release["assets"]
+        .as_array()
+        .context("Release JSON missing 'assets' array")?;
+
+    let mut binary_url: Option<String> = None;
+    let mut sig_url: Option<String> = None;
+    let mut available: Vec<String> = Vec::new();
+
+    let sig_name = format!("{asset_name}.minisig");
+
+    for asset in assets {
+        if let Some(name) = asset["name"].as_str() {
+            available.push(name.to_string());
+            if let Some(url) = asset["browser_download_url"].as_str() {
+                if name == asset_name {
+                    binary_url = Some(url.to_string());
+                } else if name == sig_name {
+                    sig_url = Some(url.to_string());
+                }
+            }
+        }
+    }
+
+    let binary_url = binary_url.with_context(|| {
+        format!(
+            "Binary '{asset_name}' not found in release {tag}. Available assets: {}",
+            available.join(", ")
+        )
+    })?;
+
+    let sig_url = sig_url.with_context(|| {
+        format!(
+            "Signature '{sig_name}' not found in release {tag} — release may not be signed. Available assets: {}",
+            available.join(", ")
+        )
+    })?;
+
+    Ok((binary_url, sig_url, tag))
+}
+
+/// Downloads a URL to a Vec<u8> via curl.
+fn download_bytes(url: &str, label: &str) -> Result<Vec<u8>> {
+    let output = std::process::Command::new("curl")
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--max-time",
+            "120",
+            url,
+        ])
+        .output()
+        .with_context(|| format!("Failed to download {label} — is curl on PATH?"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to download {label}: {stderr}");
+    }
+
+    if output.stdout.is_empty() {
+        anyhow::bail!("Downloaded {label} is empty");
+    }
+
+    Ok(output.stdout)
+}
+
+/// Verifies binary bytes against a minisig signature using the embedded public key.
+fn verify_signature(binary: &[u8], sig_content: &[u8]) -> Result<()> {
+    let pk = PublicKey::decode(UPDATE_PUBLIC_KEY)
+        .map_err(|e| anyhow::anyhow!("Invalid embedded public key: {e}"))?;
+
+    let sig_str = std::str::from_utf8(sig_content).context("Signature file is not valid UTF-8")?;
+    let sig = Signature::decode(sig_str)
+        .map_err(|e| anyhow::anyhow!("Failed to parse signature: {e}"))?;
+
+    pk.verify(binary, &sig, false).map_err(|e| {
+        anyhow::anyhow!(
+            "\n\x1b[1;31m!!! SIGNATURE VERIFICATION FAILED !!!\x1b[0m\n\
+             \n\
+             The downloaded binary does NOT match the expected signature.\n\
+             This could indicate a compromised release or man-in-the-middle attack.\n\
+             The binary has NOT been written to disk.\n\
+             \n\
+             Error: {e}"
+        )
+    })
+}
+
+/// Atomically replaces the current binary with the new one.
+fn replace_binary(new_binary: &[u8]) -> Result<()> {
+    let current = std::env::current_exe().context("Failed to determine current executable path")?;
+    let current = current
+        .canonicalize()
+        .context("Failed to canonicalize executable path")?;
+
+    let dir = current
+        .parent()
+        .context("Executable has no parent directory")?;
+
+    let tmp_name = format!(".hydra-update-{}.tmp", std::process::id());
+    let tmp_path = dir.join(&tmp_name);
+
+    // Write to temp file
+    if let Err(e) = std::fs::write(&tmp_path, new_binary) {
+        let _ = std::fs::remove_file(&tmp_path);
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            anyhow::bail!(
+                "Permission denied writing to {}. You may need to run with sudo.",
+                dir.display()
+            );
+        }
+        return Err(e).context("Failed to write temporary binary");
+    }
+
+    // Set executable permissions (unix only)
+    #[cfg(unix)]
+    {
+        if let Err(e) = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))
+        {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e).context("Failed to set executable permissions");
+        }
+    }
+
+    // Atomic rename
+    if let Err(e) = std::fs::rename(&tmp_path, &current) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e).with_context(|| {
+            format!(
+                "Failed to replace binary at {}. You may need to run with sudo.",
+                current.display()
+            )
+        });
+    }
+
+    Ok(())
+}
+
+async fn cmd_update() -> Result<()> {
+    println!("Checking for updates...");
+
+    let asset_name = platform_asset_name()?;
+    println!("Platform: {asset_name}");
+
+    let release = fetch_release_metadata()?;
+    let (binary_url, sig_url, tag) = find_asset_urls(&release, &asset_name)?;
+    println!("Latest release: {tag}");
+
+    println!("Downloading binary...");
+    let binary = download_bytes(&binary_url, "binary")?;
+    println!("Downloaded {} bytes", binary.len());
+
+    println!("Downloading signature...");
+    let sig = download_bytes(&sig_url, "signature")?;
+
+    println!("Verifying signature...");
+    verify_signature(&binary, &sig)?;
+    println!("Signature verified OK");
+
+    println!("Installing...");
+    replace_binary(&binary)?;
+
+    println!("hydra updated to {tag} successfully.");
+    Ok(())
 }
 
 async fn run_tui(project_id: String, cwd: String) -> Result<()> {
@@ -209,4 +427,95 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
     terminal.show_cursor()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+
+    #[test]
+    fn test_platform_asset_name() {
+        let name = platform_asset_name().unwrap();
+        assert!(name.starts_with("hydra-"), "expected hydra- prefix: {name}");
+        let valid = [
+            "hydra-darwin-aarch64",
+            "hydra-darwin-x86_64",
+            "hydra-linux-aarch64",
+            "hydra-linux-x86_64",
+        ];
+        assert!(valid.contains(&name.as_str()), "unexpected platform: {name}");
+    }
+
+    #[test]
+    fn test_find_asset_urls_success() {
+        let json = serde_json::json!({
+            "tag_name": "v0.2.0",
+            "assets": [
+                {
+                    "name": "hydra-darwin-aarch64",
+                    "browser_download_url": "https://example.com/hydra-darwin-aarch64"
+                },
+                {
+                    "name": "hydra-darwin-aarch64.minisig",
+                    "browser_download_url": "https://example.com/hydra-darwin-aarch64.minisig"
+                },
+                {
+                    "name": "hydra-linux-x86_64",
+                    "browser_download_url": "https://example.com/hydra-linux-x86_64"
+                }
+            ]
+        });
+
+        let (bin_url, sig_url, tag) =
+            find_asset_urls(&json, "hydra-darwin-aarch64").unwrap();
+        assert_eq!(bin_url, "https://example.com/hydra-darwin-aarch64");
+        assert_eq!(sig_url, "https://example.com/hydra-darwin-aarch64.minisig");
+        assert_eq!(tag, "v0.2.0");
+    }
+
+    #[test]
+    fn test_find_asset_urls_missing_asset() {
+        let json = serde_json::json!({
+            "tag_name": "v0.2.0",
+            "assets": [
+                {
+                    "name": "hydra-linux-x86_64",
+                    "browser_download_url": "https://example.com/hydra-linux-x86_64"
+                }
+            ]
+        });
+
+        let err = find_asset_urls(&json, "hydra-darwin-aarch64").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("hydra-darwin-aarch64"), "should mention missing asset: {msg}");
+        assert!(msg.contains("hydra-linux-x86_64"), "should list available assets: {msg}");
+    }
+
+    #[test]
+    fn test_find_asset_urls_missing_signature() {
+        let json = serde_json::json!({
+            "tag_name": "v0.2.0",
+            "assets": [
+                {
+                    "name": "hydra-darwin-aarch64",
+                    "browser_download_url": "https://example.com/hydra-darwin-aarch64"
+                }
+            ]
+        });
+
+        let err = find_asset_urls(&json, "hydra-darwin-aarch64").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("minisig"), "should mention missing signature: {msg}");
+        assert!(msg.contains("may not be signed"), "should note unsigned: {msg}");
+    }
+
+    #[test]
+    fn test_verify_signature_bad_key() {
+        let binary = b"fake binary content";
+        // A syntactically valid but wrong minisig — will fail verification
+        let bad_sig = b"untrusted comment: signature\nRWAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\ntrusted comment: bad\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n";
+
+        let result = verify_signature(binary, bad_sig);
+        assert!(result.is_err(), "should reject invalid signature");
+    }
 }

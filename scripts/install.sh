@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HYDRA_REPO="${HYDRA_REPO:-https://github.com/rencryptofish/hydra.git}"
+HYDRA_REPO="${HYDRA_REPO:-git@github.com:rencryptofish/hydra.git}"
 HYDRA_REF="${HYDRA_REF:-}"
 
 have_cmd() {
