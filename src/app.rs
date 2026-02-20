@@ -120,24 +120,35 @@ impl App {
                         }
                     }
 
-                    // Track task elapsed time
+                    // Track task elapsed time.
+                    // Prefer log-derived timestamps (survives Hydra restarts),
+                    // fall back to in-memory Instant tracking for responsiveness.
+                    let log_elapsed = self
+                        .session_stats
+                        .get(&name)
+                        .and_then(|st| st.task_elapsed());
+
                     match session.status {
                         SessionStatus::Running => {
                             self.task_starts.entry(name.clone()).or_insert(now);
                             self.task_last_active.insert(name.clone(), now);
-                            let start = self.task_starts[&name];
-                            session.task_elapsed = Some(now.duration_since(start));
+                            // Log elapsed is authoritative when available
+                            session.task_elapsed = log_elapsed.or_else(|| {
+                                let start = self.task_starts[&name];
+                                Some(now.duration_since(start))
+                            });
                         }
                         SessionStatus::Idle => {
-                            if let (Some(&start), Some(&last)) = (
+                            // Log says agent is still working (e.g. thinking)
+                            if log_elapsed.is_some() {
+                                session.task_elapsed = log_elapsed;
+                            } else if let (Some(&start), Some(&last)) = (
                                 self.task_starts.get(&name),
                                 self.task_last_active.get(&name),
                             ) {
                                 if now.duration_since(last).as_secs() < 5 {
-                                    // Brief pause — show frozen duration from last activity
                                     session.task_elapsed = Some(last.duration_since(start));
                                 } else {
-                                    // Task is done — clear timer
                                     self.task_starts.remove(&name);
                                     self.task_last_active.remove(&name);
                                 }
@@ -2586,5 +2597,57 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
         assert_eq!(app.mode, Mode::Attached);
+    }
+
+    // ── Resilience: selected resets to 0 when all sessions deleted ──
+
+    #[tokio::test]
+    async fn refresh_sessions_selected_resets_to_zero_when_empty() {
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(MockSessionManager::new()), // returns empty sessions
+        );
+        app.selected = 5; // out-of-bounds for an empty list
+        app.refresh_sessions().await;
+        assert!(app.sessions.is_empty());
+        assert_eq!(app.selected, 0, "selected should reset to 0 when sessions list is empty");
+    }
+
+    // ── Resilience: HashMap pruning removes stale keys ──────────────
+
+    #[tokio::test]
+    async fn refresh_sessions_prunes_stale_hashmap_entries() {
+        let sessions = vec![make_session("alpha", AgentType::Claude)];
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(MockSessionManager::with_sessions(sessions)),
+        );
+
+        // Pre-populate HashMaps with a stale key that won't appear in live sessions
+        let stale = "hydra-testid-deleted".to_string();
+        app.prev_captures.insert(stale.clone(), "old".into());
+        app.idle_ticks.insert(stale.clone(), 3);
+        app.task_starts.insert(stale.clone(), Instant::now());
+        app.task_last_active.insert(stale.clone(), Instant::now());
+        app.last_messages.insert(stale.clone(), "msg".into());
+        app.session_stats.insert(stale.clone(), SessionStats::default());
+        app.log_uuids.insert(stale.clone(), "uuid".into());
+
+        app.refresh_sessions().await;
+
+        // Live session key should still exist in prev_captures (inserted during refresh)
+        let live = "hydra-testid-alpha".to_string();
+        assert!(app.prev_captures.contains_key(&live), "live key should remain");
+
+        // Stale key should be pruned from all maps
+        assert!(!app.prev_captures.contains_key(&stale), "stale prev_captures should be pruned");
+        assert!(!app.idle_ticks.contains_key(&stale), "stale idle_ticks should be pruned");
+        assert!(!app.task_starts.contains_key(&stale), "stale task_starts should be pruned");
+        assert!(!app.task_last_active.contains_key(&stale), "stale task_last_active should be pruned");
+        assert!(!app.last_messages.contains_key(&stale), "stale last_messages should be pruned");
+        assert!(!app.session_stats.contains_key(&stale), "stale session_stats should be pruned");
+        assert!(!app.log_uuids.contains_key(&stale), "stale log_uuids should be pruned");
     }
 }
