@@ -443,6 +443,10 @@ pub fn read_last_assistant_message(cwd: &str, uuid: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Lock to serialize tests that modify the HOME environment variable.
+    /// HOME is process-global, so parallel tests that set_var("HOME", ...) race.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     // ── format_tokens tests ──────────────────────────────────────────
 
     #[test]
@@ -569,7 +573,10 @@ mod tests {
     fn update_session_stats_incremental() {
         use std::io::Write;
 
-        let path = std::env::temp_dir().join("hydra_test_stats_incr.jsonl");
+        let path = std::env::temp_dir().join(format!(
+            "hydra_test_stats_incr_{:?}.jsonl",
+            std::thread::current().id()
+        ));
         // Clean up any leftover
         let _ = std::fs::remove_file(&path);
 
@@ -862,6 +869,7 @@ mod tests {
         .unwrap();
 
         // Temporarily override HOME
+        let _lock = HOME_LOCK.lock().unwrap();
         let orig_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &tmp_dir);
 
@@ -894,6 +902,7 @@ mod tests {
         )
         .unwrap();
 
+        let _lock = HOME_LOCK.lock().unwrap();
         let orig_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &tmp_dir);
 
@@ -928,6 +937,7 @@ mod tests {
         let log_file = projects_dir.join(format!("{uuid}.jsonl"));
         let _ = std::fs::File::create(&log_file).unwrap();
 
+        let _lock = HOME_LOCK.lock().unwrap();
         let orig_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &tmp_dir);
 
@@ -956,6 +966,7 @@ mod tests {
         writeln!(f, r#"{{"type":"user","message":{{"content":"hello"}}}}"#).unwrap();
         writeln!(f, r#"{{"type":"system","message":{{"content":"info"}}}}"#).unwrap();
 
+        let _lock = HOME_LOCK.lock().unwrap();
         let orig_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &tmp_dir);
 
@@ -987,6 +998,7 @@ mod tests {
         )
         .unwrap();
 
+        let _lock = HOME_LOCK.lock().unwrap();
         let orig_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &tmp_dir);
 
@@ -1019,6 +1031,7 @@ mod tests {
         )
         .unwrap();
 
+        let _lock = HOME_LOCK.lock().unwrap();
         let orig_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &tmp_dir);
 
@@ -1051,6 +1064,7 @@ mod tests {
         )
         .unwrap();
 
+        let _lock = HOME_LOCK.lock().unwrap();
         let orig_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &tmp_dir);
 
