@@ -257,11 +257,11 @@ pub async fn create_session(
 
 /// Capture the current pane content of a tmux session.
 pub async fn capture_pane(tmux_name: &str) -> Result<String> {
-    let output = Command::new("tmux")
-        .args(["capture-pane", "-t", tmux_name, "-p"])
-        .output()
-        .await
-        .context("Failed to capture tmux pane")?;
+    let output = run_cmd_timeout(
+        Command::new("tmux").args(["capture-pane", "-t", tmux_name, "-p"]),
+    )
+    .await
+    .context("Failed to capture tmux pane")?;
 
     if !output.status.success() {
         return Ok(String::from("[session not available]"));
@@ -272,11 +272,11 @@ pub async fn capture_pane(tmux_name: &str) -> Result<String> {
 
 /// Capture the full scrollback buffer of a tmux session.
 pub async fn capture_pane_scrollback(tmux_name: &str) -> Result<String> {
-    let output = Command::new("tmux")
-        .args(["capture-pane", "-t", tmux_name, "-p", "-S", "-"])
-        .output()
-        .await
-        .context("Failed to capture tmux pane scrollback")?;
+    let output = run_cmd_timeout(
+        Command::new("tmux").args(["capture-pane", "-t", tmux_name, "-p", "-S", "-"]),
+    )
+    .await
+    .context("Failed to capture tmux pane scrollback")?;
 
     if !output.status.success() {
         return Ok(String::from("[session not available]"));
