@@ -3,10 +3,10 @@ source: src/ui.rs
 expression: output
 ---
 ┌ Sessions (2) ┐┌ worker-1 ────────────────────────────────────────────────────┐
-│>> ● worker-1 ││preview                                                       │
+│── ●  Idle    ││preview                                                       │
+│>> ● worker-1 ││                                                              │
 │     I'll help││                                                              │
 │   ● worker-2 ││                                                              │
-│              ││                                                              │
 │              ││                                                              │
 │              ││                                                              │
 │              ││                                                              │

@@ -3,8 +3,8 @@ source: src/ui.rs
 expression: output
 ---
 ┌ Sessions (1) ┐╔ active-session ══════════════════════════════════════════════╗
-│>> ● active-se│║$ claude                                                      ║
-│              │║Hello, how can I help?                                        ║
+│── ●  Idle    │║$ claude                                                      ║
+│>> ● active-se│║Hello, how can I help?                                        ║
 │              │║                                                              ║
 │              │║                                                              ║
 │              │║                                                              ║

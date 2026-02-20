@@ -3,9 +3,9 @@ source: src/ui.rs
 expression: output
 ---
 ┌ Sessions (1) ┐┌ worker-1 ────────────────────────────────────────────────────┐
-│>> ● worker-1 ││preview                                                       │
+│── ●  Idle    ││preview                                                       │
+│>> ● worker-1 ││                                                              │
 │     This is a││                                                              │
-│              ││                                                              │
 │              ││                                                              │
 │              ││                                                              │
 │              ││                                                              │

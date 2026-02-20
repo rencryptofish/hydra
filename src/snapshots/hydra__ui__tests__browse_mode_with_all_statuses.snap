@@ -3,12 +3,12 @@ source: src/ui.rs
 expression: output
 ---
 ┌ Sessions (3) ┐┌ running-one ─────────────────────────────────────────────────┐
-│   ● idle-one ││running session output                                        │
+│── ●  Idle    ││running session output                                        │
+│   ● idle-one ││                                                              │
+│── ●  Running ││                                                              │
 │>> ● running-o││                                                              │
+│── ●  Exited  ││                                                              │
 │   ● exited-on││                                                              │
-│              ││                                                              │
-│              ││                                                              │
-│              ││                                                              │
 │              ││                                                              │
 │              ││                                                              │
 │              ││                                                              │

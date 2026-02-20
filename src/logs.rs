@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -46,8 +46,7 @@ pub struct SessionStats {
 }
 
 impl SessionStats {
-    /// Estimated cost in USD using Sonnet pricing as default.
-    /// Input: $3/MTok, Output: $15/MTok, Cache read: $0.30/MTok, Cache write: $3.75/MTok
+    #[cfg(test)]
     pub fn cost_usd(&self) -> f64 {
         let input = self.tokens_in as f64 * 3.0 / 1_000_000.0;
         let output = self.tokens_out as f64 * 15.0 / 1_000_000.0;
@@ -56,6 +55,7 @@ impl SessionStats {
         input + output + cache_read + cache_write
     }
 
+    #[cfg(test)]
     pub fn file_count(&self) -> usize {
         self.files.len()
     }
@@ -259,6 +259,168 @@ fn update_session_stats_from_path(path: &std::path::Path, stats: &mut SessionSta
     }
 
     stats.read_offset = file_len;
+}
+
+/// Machine-wide stats for today, aggregated across all Claude Code JSONL logs.
+/// Updated incrementally — only new bytes are parsed on each refresh.
+#[derive(Debug)]
+pub struct GlobalStats {
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub tokens_cache_read: u64,
+    pub tokens_cache_write: u64,
+    /// Per-file read offsets for incremental reading
+    file_offsets: HashMap<PathBuf, u64>,
+    /// Date string (YYYY-MM-DD) these stats are for; reset when date changes
+    date: String,
+}
+
+impl Default for GlobalStats {
+    fn default() -> Self {
+        Self {
+            tokens_in: 0,
+            tokens_out: 0,
+            tokens_cache_read: 0,
+            tokens_cache_write: 0,
+            file_offsets: HashMap::new(),
+            date: String::new(),
+        }
+    }
+}
+
+impl GlobalStats {
+    /// Estimated cost in USD using Sonnet pricing.
+    /// Input: $3/MTok, Output: $15/MTok, Cache read: $0.30/MTok, Cache write: $3.75/MTok
+    pub fn cost_usd(&self) -> f64 {
+        let input = self.tokens_in as f64 * 3.0 / 1_000_000.0;
+        let output = self.tokens_out as f64 * 15.0 / 1_000_000.0;
+        let cache_read = self.tokens_cache_read as f64 * 0.30 / 1_000_000.0;
+        let cache_write = self.tokens_cache_write as f64 * 3.75 / 1_000_000.0;
+        input + output + cache_read + cache_write
+    }
+}
+
+/// Scan all `~/.claude/projects/*/*.jsonl` files and sum today's token usage.
+/// Incremental: only reads new bytes per file after the first call.
+/// Resets at midnight (date change).
+pub fn update_global_stats(stats: &mut GlobalStats) {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    // Reset on date change
+    if stats.date != today {
+        stats.tokens_in = 0;
+        stats.tokens_out = 0;
+        stats.tokens_cache_read = 0;
+        stats.tokens_cache_write = 0;
+        stats.file_offsets.clear();
+        stats.date = today.clone();
+    }
+
+    update_global_stats_inner(stats, &today, None);
+}
+
+/// Inner implementation that accepts an optional base_dir for testability.
+fn update_global_stats_inner(
+    stats: &mut GlobalStats,
+    today: &str,
+    base_dir: Option<&std::path::Path>,
+) {
+    let projects_dir = match base_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => {
+            let home = match std::env::var("HOME") {
+                Ok(h) => h,
+                Err(_) => return,
+            };
+            PathBuf::from(&home).join(".claude").join("projects")
+        }
+    };
+
+    let project_subdirs = match std::fs::read_dir(&projects_dir) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+
+    for entry in project_subdirs.flatten() {
+        if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let subdir = entry.path();
+        let files = match std::fs::read_dir(&subdir) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for file_entry in files.flatten() {
+            let path = file_entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+
+            let mut file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let file_len = match file.metadata() {
+                Ok(m) => m.len(),
+                Err(_) => continue,
+            };
+
+            let offset = stats.file_offsets.get(&path).copied().unwrap_or(0);
+            if file_len <= offset {
+                continue;
+            }
+
+            if offset > 0 {
+                if file.seek(SeekFrom::Start(offset)).is_err() {
+                    continue;
+                }
+            }
+
+            let mut buf = Vec::new();
+            if file.read_to_end(&mut buf).is_err() {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&buf);
+
+            for line in text.lines() {
+                if line.len() < 10 {
+                    continue;
+                }
+                // Fast path: only parse lines that have today's date, are assistant messages with usage
+                if !line.contains(today)
+                    || !line.contains("\"assistant\"")
+                    || !line.contains("\"usage\"")
+                {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+                        continue;
+                    }
+                    if let Some(usage) = v.get("message").and_then(|m| m.get("usage")) {
+                        stats.tokens_in += usage
+                            .get("input_tokens")
+                            .and_then(|t| t.as_u64())
+                            .unwrap_or(0);
+                        stats.tokens_out += usage
+                            .get("output_tokens")
+                            .and_then(|t| t.as_u64())
+                            .unwrap_or(0);
+                        stats.tokens_cache_read += usage
+                            .get("cache_read_input_tokens")
+                            .and_then(|t| t.as_u64())
+                            .unwrap_or(0);
+                        stats.tokens_cache_write += usage
+                            .get("cache_creation_input_tokens")
+                            .and_then(|t| t.as_u64())
+                            .unwrap_or(0);
+                    }
+                }
+            }
+
+            stats.file_offsets.insert(path, file_len);
+        }
+    }
 }
 
 /// Get the pane PID for a tmux session.
@@ -1048,8 +1210,6 @@ mod tests {
 
     #[test]
     fn read_last_assistant_message_empty_file() {
-        use std::io::Write;
-
         let tmp_dir = std::env::temp_dir().join("hydra_test_logs_empty");
         let escaped = escape_project_path("/tmp/empty-project");
         let projects_dir = tmp_dir.join(".claude").join("projects").join(&escaped);
@@ -1197,5 +1357,358 @@ mod tests {
             std::env::set_var("HOME", home);
         }
         let _ = std::fs::remove_dir_all(&tmp_dir.join(".claude"));
+    }
+
+    // ── update_session_stats (HOME wrapper) tests ──────────────────
+
+    #[test]
+    fn update_session_stats_via_home_env() {
+        use std::io::Write;
+
+        let tmp_dir = std::env::temp_dir().join("hydra_test_stats_home");
+        let escaped = escape_project_path("/tmp/stats-home-project");
+        let projects_dir = tmp_dir.join(".claude").join("projects").join(&escaped);
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let uuid = "aabbccdd-1122-3344-5566-778899aabbcc";
+        let log_file = projects_dir.join(format!("{uuid}.jsonl"));
+        let mut f = std::fs::File::create(&log_file).unwrap();
+        writeln!(f, r#"{{"type":"assistant","message":{{"usage":{{"input_tokens":500,"output_tokens":100,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"done"}}]}}}}"#).unwrap();
+        drop(f);
+
+        let _lock = HOME_LOCK.lock().unwrap();
+        let orig_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &tmp_dir);
+
+        let mut stats = SessionStats::default();
+        update_session_stats("/tmp/stats-home-project", uuid, &mut stats);
+        assert_eq!(stats.turns, 1);
+        assert_eq!(stats.tokens_in, 500);
+
+        if let Some(home) = orig_home {
+            std::env::set_var("HOME", home);
+        }
+        let _ = std::fs::remove_dir_all(&tmp_dir.join(".claude"));
+    }
+
+    #[test]
+    fn update_session_stats_missing_home_is_noop() {
+        let _lock = HOME_LOCK.lock().unwrap();
+        let orig_home = std::env::var("HOME").ok();
+        std::env::remove_var("HOME");
+
+        let mut stats = SessionStats::default();
+        update_session_stats("/tmp/whatever", "some-uuid-value-here-1234567890ab", &mut stats);
+        assert_eq!(stats.turns, 0, "missing HOME should be no-op");
+
+        if let Some(home) = orig_home {
+            std::env::set_var("HOME", home);
+        }
+    }
+
+    // ── parse_iso_timestamp tests ─────────────────────────────────
+
+    #[test]
+    fn parse_iso_timestamp_valid() {
+        let ts = parse_iso_timestamp("2026-01-15T10:00:00.000Z");
+        assert!(ts.is_some());
+    }
+
+    #[test]
+    fn parse_iso_timestamp_invalid() {
+        assert!(parse_iso_timestamp("not a timestamp").is_none());
+        assert!(parse_iso_timestamp("").is_none());
+        assert!(parse_iso_timestamp("2026-13-45T99:99:99Z").is_none());
+    }
+
+    // ── JSONL timestamp branch coverage ──────────────────────────
+
+    #[test]
+    fn stats_user_message_without_timestamp_field() {
+        // User message that contains "user" but no "timestamp" key —
+        // should not match the timestamp fast path
+        let path = write_tmp_jsonl("stats_user_no_ts", &[
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+        ]);
+
+        let mut stats = SessionStats::default();
+        update_session_stats_from_path(&path, &mut stats);
+        assert!(stats.last_user_ts.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stats_user_message_with_usage_skips_user_fast_path() {
+        // A line with both "user" and "timestamp" AND "usage" should
+        // not match the user timestamp fast path (line 181 condition)
+        let path = write_tmp_jsonl("stats_user_usage", &[
+            r#"{"type":"user","timestamp":"2026-01-15T10:00:00.000Z","usage":{"input_tokens":100},"message":{"content":"hi"}}"#,
+        ]);
+
+        let mut stats = SessionStats::default();
+        update_session_stats_from_path(&path, &mut stats);
+        // Should not set last_user_ts because "usage" is present
+        assert!(stats.last_user_ts.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stats_assistant_timestamp_tracked() {
+        let path = write_tmp_jsonl("stats_ast_ts", &[
+            r#"{"type":"assistant","timestamp":"2026-01-15T10:00:30.000Z","message":{"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
+        ]);
+
+        let mut stats = SessionStats::default();
+        update_session_stats_from_path(&path, &mut stats);
+        assert_eq!(stats.last_assistant_ts.as_deref(), Some("2026-01-15T10:00:30.000Z"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stats_assistant_without_timestamp_field() {
+        let path = write_tmp_jsonl("stats_ast_no_ts", &[
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
+        ]);
+
+        let mut stats = SessionStats::default();
+        update_session_stats_from_path(&path, &mut stats);
+        assert!(stats.last_assistant_ts.is_none());
+        assert_eq!(stats.turns, 1); // Still counted as a turn
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stats_tool_result_without_filenames() {
+        // toolUseResult without filenames array — should not crash
+        let path = write_tmp_jsonl("stats_tool_no_files", &[
+            r#"{"type":"user","toolUseResult":{"content":"some result"}}"#,
+        ]);
+
+        let mut stats = SessionStats::default();
+        update_session_stats_from_path(&path, &mut stats);
+        assert_eq!(stats.file_count(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stats_tool_result_with_non_string_filename() {
+        // filenames array with non-string entries — should skip gracefully
+        let path = write_tmp_jsonl("stats_tool_bad_fname", &[
+            r#"{"type":"user","toolUseResult":{"filenames":["/valid.rs", 123, null]}}"#,
+        ]);
+
+        let mut stats = SessionStats::default();
+        update_session_stats_from_path(&path, &mut stats);
+        assert_eq!(stats.file_count(), 1, "only string filenames counted");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stats_malformed_json_line_skipped() {
+        // Valid assistant + malformed line — should not interfere
+        let path = write_tmp_jsonl("stats_malformed", &[
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
+            r#"{"type":"assistant","usage" this is broken json"#,
+        ]);
+
+        let mut stats = SessionStats::default();
+        update_session_stats_from_path(&path, &mut stats);
+        assert_eq!(stats.turns, 1, "only valid lines counted");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stats_mixed_message_types_full_coverage() {
+        // A comprehensive test with user timestamps, assistant timestamps,
+        // tool use results, and file tracking
+        let path = write_tmp_jsonl("stats_mixed_full", &[
+            r#"{"type":"user","timestamp":"2026-01-15T10:00:00.000Z","message":{"role":"user","content":"start"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-15T10:00:15.000Z","message":{"usage":{"input_tokens":1000,"output_tokens":200,"cache_read_input_tokens":50,"cache_creation_input_tokens":25},"content":[{"type":"text","text":"thinking..."},{"type":"tool_use","name":"Edit","id":"t1","input":{}},{"type":"tool_use","name":"Bash","id":"t2","input":{}}]}}"#,
+            r#"{"filenames":["/src/main.rs"],"toolUseResult":{"filenames":["/src/main.rs"]}}"#,
+            r#"{"type":"user","timestamp":"2026-01-15T10:01:00.000Z","message":{"role":"user","content":"next task"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-15T10:01:30.000Z","message":{"usage":{"input_tokens":500,"output_tokens":100,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"Write","id":"t3","input":{}}]}}"#,
+        ]);
+
+        let mut stats = SessionStats::default();
+        update_session_stats_from_path(&path, &mut stats);
+
+        assert_eq!(stats.turns, 2);
+        assert_eq!(stats.tokens_in, 1500);
+        assert_eq!(stats.tokens_out, 300);
+        assert_eq!(stats.tokens_cache_read, 50);
+        assert_eq!(stats.tokens_cache_write, 25);
+        assert_eq!(stats.edits, 2, "Edit + Write = 2");
+        assert_eq!(stats.bash_cmds, 1);
+        assert_eq!(stats.file_count(), 1);
+        assert_eq!(stats.last_user_ts.as_deref(), Some("2026-01-15T10:01:00.000Z"));
+        assert_eq!(stats.last_assistant_ts.as_deref(), Some("2026-01-15T10:01:30.000Z"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parse_lsof_uuid_too_short_after_tasks() {
+        let output = "claude  12345  user  txt  REG  1,20  123  /Users/test/.claude/tasks/short/file";
+        assert_eq!(parse_uuid_from_lsof_output(output), None);
+    }
+
+    #[test]
+    fn parse_cmdline_equals_invalid_uuid() {
+        let cmdline = "claude --session-id=not-a-valid-uuid";
+        assert_eq!(parse_session_id_from_cmdline(cmdline), None);
+    }
+
+    // ── GlobalStats tests ───────────────────────────────────────────
+
+    #[test]
+    fn global_stats_cost_calculation() {
+        let stats = GlobalStats {
+            tokens_in: 1_000_000,
+            tokens_out: 100_000,
+            tokens_cache_read: 500_000,
+            tokens_cache_write: 200_000,
+            file_offsets: HashMap::new(),
+            date: String::new(),
+        };
+        let cost = stats.cost_usd();
+        assert!((cost - 5.40).abs() < 0.01, "expected ~$5.40, got ${cost:.2}");
+    }
+
+    #[test]
+    fn global_stats_default_is_zero() {
+        let stats = GlobalStats::default();
+        assert_eq!(stats.tokens_in, 0);
+        assert_eq!(stats.tokens_out, 0);
+        assert!((stats.cost_usd() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn update_global_stats_scans_jsonl_files() {
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("proj-a");
+        std::fs::create_dir_all(&projects).unwrap();
+
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        let log = projects.join("session1.jsonl");
+        let mut f = std::fs::File::create(&log).unwrap();
+        writeln!(f,
+            r#"{{"type":"assistant","timestamp":"{today}T10:00:00.000Z","message":{{"usage":{{"input_tokens":1000,"output_tokens":200,"cache_read_input_tokens":50,"cache_creation_input_tokens":10}},"content":[{{"type":"text","text":"hello"}}]}}}}"#,
+            today = today
+        ).unwrap();
+        writeln!(f,
+            r#"{{"type":"assistant","timestamp":"{today}T10:01:00.000Z","message":{{"usage":{{"input_tokens":2000,"output_tokens":300,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"world"}}]}}}}"#,
+            today = today
+        ).unwrap();
+        drop(f);
+
+        let mut stats = GlobalStats::default();
+        stats.date = today.clone();
+        update_global_stats_inner(&mut stats, &today, Some(tmp.path()));
+
+        assert_eq!(stats.tokens_in, 3000);
+        assert_eq!(stats.tokens_out, 500);
+        assert_eq!(stats.tokens_cache_read, 50);
+        assert_eq!(stats.tokens_cache_write, 10);
+    }
+
+    #[test]
+    fn update_global_stats_incremental_reads() {
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("proj-b");
+        std::fs::create_dir_all(&projects).unwrap();
+
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        let log = projects.join("session2.jsonl");
+        let mut f = std::fs::File::create(&log).unwrap();
+        writeln!(f,
+            r#"{{"type":"assistant","timestamp":"{today}T10:00:00.000Z","message":{{"usage":{{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"first"}}]}}}}"#,
+            today = today
+        ).unwrap();
+        drop(f);
+
+        let mut stats = GlobalStats::default();
+        stats.date = today.clone();
+        update_global_stats_inner(&mut stats, &today, Some(tmp.path()));
+        assert_eq!(stats.tokens_in, 100);
+
+        // Append more data
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        writeln!(f,
+            r#"{{"type":"assistant","timestamp":"{today}T10:01:00.000Z","message":{{"usage":{{"input_tokens":200,"output_tokens":100,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"second"}}]}}}}"#,
+            today = today
+        ).unwrap();
+        drop(f);
+
+        update_global_stats_inner(&mut stats, &today, Some(tmp.path()));
+        assert_eq!(stats.tokens_in, 300, "should accumulate incrementally");
+        assert_eq!(stats.tokens_out, 150);
+    }
+
+    #[test]
+    fn update_global_stats_skips_other_dates() {
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("proj-c");
+        std::fs::create_dir_all(&projects).unwrap();
+
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        let log = projects.join("session3.jsonl");
+        let mut f = std::fs::File::create(&log).unwrap();
+        // Write an entry from a different date — should be skipped
+        writeln!(f,
+            r#"{{"type":"assistant","timestamp":"2020-01-01T10:00:00.000Z","message":{{"usage":{{"input_tokens":5000,"output_tokens":1000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"old"}}]}}}}"#
+        ).unwrap();
+        // Write an entry from today — should be counted
+        writeln!(f,
+            r#"{{"type":"assistant","timestamp":"{today}T10:00:00.000Z","message":{{"usage":{{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"new"}}]}}}}"#,
+            today = today
+        ).unwrap();
+        drop(f);
+
+        let mut stats = GlobalStats::default();
+        stats.date = today.clone();
+        update_global_stats_inner(&mut stats, &today, Some(tmp.path()));
+
+        assert_eq!(stats.tokens_in, 100, "should only count today's entries");
+        assert_eq!(stats.tokens_out, 50);
+    }
+
+    #[test]
+    fn update_global_stats_resets_on_date_change() {
+        let mut stats = GlobalStats::default();
+        stats.tokens_in = 5000;
+        stats.tokens_out = 1000;
+        stats.date = "2020-01-01".to_string();
+        stats.file_offsets.insert(PathBuf::from("/fake"), 999);
+
+        // Calling update_global_stats will detect date mismatch and reset
+        update_global_stats(&mut stats);
+
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert_eq!(stats.date, today);
+        assert_eq!(stats.tokens_in, 0, "should reset on date change");
+        assert_eq!(stats.tokens_out, 0);
+        assert!(stats.file_offsets.is_empty());
+    }
+
+    #[test]
+    fn update_global_stats_no_projects_dir() {
+        let mut stats = GlobalStats::default();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        stats.date = today.clone();
+        // Point at nonexistent dir — should not panic
+        update_global_stats_inner(
+            &mut stats,
+            &today,
+            Some(std::path::Path::new("/nonexistent/path")),
+        );
+        assert_eq!(stats.tokens_in, 0);
     }
 }

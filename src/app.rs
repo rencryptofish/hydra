@@ -6,7 +6,7 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
-use crate::logs::SessionStats;
+use crate::logs::{GlobalStats, SessionStats};
 use crate::session::{AgentType, Session, SessionStatus};
 use crate::tmux::{SessionManager, TmuxSessionManager};
 
@@ -26,6 +26,8 @@ pub struct App {
     pub agent_selection: usize,
     pub should_quit: bool,
     pub project_id: String,
+    /// Which session the preview is currently showing (for skip-if-unchanged optimization).
+    preview_session: Option<String>,
     pub cwd: String,
     pub status_message: Option<String>,
     pub sidebar_area: Cell<Rect>,
@@ -38,6 +40,7 @@ pub struct App {
     task_last_active: HashMap<String, Instant>,
     pub last_messages: HashMap<String, String>,
     pub session_stats: HashMap<String, SessionStats>,
+    pub global_stats: GlobalStats,
     /// Per-file git diff stats from `git diff --numstat`
     pub diff_files: Vec<DiffFile>,
     log_uuids: HashMap<String, String>,
@@ -65,6 +68,7 @@ impl App {
             should_quit: false,
             project_id,
             cwd,
+            preview_session: None,
             status_message: None,
             sidebar_area: Cell::new(Rect::default()),
             preview_area: Cell::new(Rect::default()),
@@ -75,6 +79,7 @@ impl App {
             task_last_active: HashMap::new(),
             last_messages: HashMap::new(),
             session_stats: HashMap::new(),
+            global_stats: GlobalStats::default(),
             diff_files: Vec::new(),
             log_uuids: HashMap::new(),
             message_tick: 0,
@@ -90,21 +95,33 @@ impl App {
             Ok(mut sessions) => {
                 let now = Instant::now();
 
+                // Batch-capture pane content in parallel for all non-exited sessions.
+                // This turns N sequential subprocess waits into 1 parallel wait.
+                let live_names: Vec<String> = sessions
+                    .iter()
+                    .filter(|s| s.status != SessionStatus::Exited)
+                    .map(|s| s.tmux_name.clone())
+                    .collect();
+                let capture_futures = live_names
+                    .iter()
+                    .map(|name| crate::tmux::capture_pane(name));
+                let capture_results = futures::future::join_all(capture_futures).await;
+                let captures: HashMap<String, String> = live_names
+                    .into_iter()
+                    .zip(capture_results)
+                    .map(|(name, res)| (name, res.unwrap_or_default()))
+                    .collect();
+
                 for session in &mut sessions {
                     let name = session.tmux_name.clone();
 
                     // Determine Running vs Idle by comparing pane content.
                     // Debounce: require 3 consecutive unchanged ticks (~750ms) before
                     // transitioning Running → Idle to prevent status flickering.
-                    if session.status != SessionStatus::Exited {
-                        let content = self
-                            .manager
-                            .capture_pane(&name)
-                            .await
-                            .unwrap_or_default();
+                    if let Some(content) = captures.get(&name) {
                         let prev = self.prev_captures.get(&name);
-                        let unchanged = prev.is_some_and(|p| p == &content);
-                        self.prev_captures.insert(name.clone(), content);
+                        let unchanged = prev.is_some_and(|p| p == content);
+                        self.prev_captures.insert(name.clone(), content.clone());
 
                         if unchanged {
                             let count = self.idle_ticks.entry(name.clone()).or_insert(0);
@@ -166,9 +183,15 @@ impl App {
                     .get(self.selected)
                     .map(|s| s.tmux_name.clone());
 
-                // Sort alphabetically — status is shown by the colored dot, no need
-                // to reorder by status which causes the list to jump around.
-                sessions.sort_by(|a, b| a.name.cmp(&b.name));
+                // Group by status (Idle → Running → Exited), then alphabetically
+                // within each group. Headers make the grouping explicit so
+                // reordering feels intentional rather than chaotic.
+                sessions.sort_by(|a, b| {
+                    a.status
+                        .sort_order()
+                        .cmp(&b.status.sort_order())
+                        .then(a.name.cmp(&b.name))
+                });
 
                 self.sessions = sessions;
 
@@ -211,13 +234,23 @@ impl App {
             .get(self.selected)
             .map(|s| s.tmux_name.clone());
         if let Some(tmux_name) = tmux_name {
+            // Skip the expensive full-scrollback capture when the selected session
+            // hasn't changed and its pane content is confirmed unchanged (idle_ticks >= 1).
+            if self.preview_session.as_ref() == Some(&tmux_name)
+                && self.idle_ticks.get(&tmux_name).copied().unwrap_or(0) >= 1
+            {
+                return;
+            }
+
             let result = self.manager.capture_pane_scrollback(&tmux_name).await;
             match result {
                 Ok(content) => self.preview = content,
                 Err(_) => self.preview = String::from("[unable to capture pane]"),
             }
+            self.preview_session = Some(tmux_name);
         } else {
             self.preview = String::from("No sessions. Press 'n' to create one.");
+            self.preview_session = None;
         }
     }
 
@@ -251,6 +284,9 @@ impl App {
             }
         }
 
+        // Refresh machine-wide stats for today
+        crate::logs::update_global_stats(&mut self.global_stats);
+
         // Refresh per-file git diff stats
         self.diff_files = get_git_diff_numstat(&self.cwd).await;
     }
@@ -259,6 +295,7 @@ impl App {
         if !self.sessions.is_empty() {
             self.selected = (self.selected + 1) % self.sessions.len();
             self.preview_scroll_offset = 0;
+            self.preview_session = None;
         }
     }
 
@@ -270,6 +307,7 @@ impl App {
                 self.selected - 1
             };
             self.preview_scroll_offset = 0;
+            self.preview_session = None;
         }
     }
 
@@ -482,6 +520,7 @@ impl App {
                             if self.selected != idx {
                                 self.selected = idx;
                                 self.preview_scroll_offset = 0;
+                                self.preview_session = None;
                             }
                         }
                     } else if preview.contains(pos) {
@@ -673,6 +712,7 @@ mod tests {
     use super::*;
     use crate::session::{AgentType, Session};
     use crate::tmux::SessionManager;
+    use crossterm::event::MouseButton;
 
     // ── Mock and helpers ─────────────────────────────────────────────
 
@@ -718,16 +758,6 @@ mod tests {
             Ok(())
         }
         async fn send_keys(&self, _tmux_name: &str, _key: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn send_mouse(
-            &self,
-            _tmux_name: &str,
-            _kind: &str,
-            _button: u8,
-            _x: u16,
-            _y: u16,
-        ) -> anyhow::Result<()> {
             Ok(())
         }
         async fn capture_pane_scrollback(&self, _tmux_name: &str) -> anyhow::Result<String> {
@@ -1304,7 +1334,6 @@ mod tests {
 
     #[test]
     fn mouse_click_sidebar_selects_session() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
         let sessions = vec![
             make_session("a", AgentType::Claude),
@@ -1328,7 +1357,6 @@ mod tests {
 
     #[test]
     fn mouse_click_preview_attaches() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
@@ -1347,7 +1375,6 @@ mod tests {
 
     #[test]
     fn mouse_scroll_up_preview_scrolls() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
@@ -1365,7 +1392,6 @@ mod tests {
 
     #[test]
     fn mouse_scroll_down_preview_scrolls() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
@@ -1384,7 +1410,6 @@ mod tests {
 
     #[test]
     fn mouse_scroll_sidebar_navigates() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
         let sessions = vec![
             make_session("a", AgentType::Claude),
@@ -1416,7 +1441,6 @@ mod tests {
 
     #[test]
     fn mouse_attached_click_outside_detaches() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
@@ -1436,7 +1460,6 @@ mod tests {
 
     #[test]
     fn mouse_attached_scroll_up_in_preview() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
@@ -1456,7 +1479,6 @@ mod tests {
 
     #[test]
     fn mouse_attached_scroll_down_in_preview() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
@@ -1476,7 +1498,6 @@ mod tests {
 
     #[test]
     fn mouse_other_mode_is_noop() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
         let mut app = test_app();
         app.mode = Mode::ConfirmDelete;
@@ -1509,7 +1530,6 @@ mod tests {
             async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
             async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
             async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_mouse(&self, _: &str, _: &str, _: u8, _: u16, _: u16) -> anyhow::Result<()> { Ok(()) }
             async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
         }
 
@@ -1535,7 +1555,6 @@ mod tests {
             async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
             async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
             async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_mouse(&self, _: &str, _: &str, _: u8, _: u16, _: u16) -> anyhow::Result<()> { Ok(()) }
             async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> {
                 Err(anyhow::anyhow!("capture failed"))
             }
@@ -1563,7 +1582,6 @@ mod tests {
             async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
             async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
             async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_mouse(&self, _: &str, _: &str, _: u8, _: u16, _: u16) -> anyhow::Result<()> { Ok(()) }
             async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
         }
 
@@ -1592,7 +1610,6 @@ mod tests {
                 Err(anyhow::anyhow!("kill failed"))
             }
             async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_mouse(&self, _: &str, _: &str, _: u8, _: u16, _: u16) -> anyhow::Result<()> { Ok(()) }
             async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
         }
 
@@ -1712,7 +1729,6 @@ mod tests {
 
     #[test]
     fn mouse_click_sidebar_with_two_line_items() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
         let sessions = vec![
             make_session("a", AgentType::Claude),
@@ -1738,7 +1754,6 @@ mod tests {
 
     #[test]
     fn mouse_click_tiny_sidebar_no_panic() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
         let mut app = test_app();
         // Sidebar too small (width < 2)
@@ -1756,7 +1771,6 @@ mod tests {
 
     #[test]
     fn mouse_move_is_noop() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
@@ -1903,7 +1917,6 @@ mod tests {
             async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
             async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
             async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_mouse(&self, _: &str, _: &str, _: u8, _: u16, _: u16) -> anyhow::Result<()> { Ok(()) }
             async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
         }
 
@@ -1971,7 +1984,6 @@ mod tests {
             async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
             async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
             async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_mouse(&self, _: &str, _: &str, _: u8, _: u16, _: u16) -> anyhow::Result<()> { Ok(()) }
             async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
         }
 
@@ -2217,7 +2229,6 @@ mod tests {
                 self.sent_keys.lock().unwrap().push((tmux_name.to_string(), key.to_string()));
                 Ok(())
             }
-            async fn send_mouse(&self, _: &str, _: &str, _: u8, _: u16, _: u16) -> anyhow::Result<()> { Ok(()) }
             async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
         }
 
@@ -2260,7 +2271,6 @@ mod tests {
                 self.sent_keys.lock().unwrap().push((tmux_name.to_string(), key.to_string()));
                 Ok(())
             }
-            async fn send_mouse(&self, _: &str, _: &str, _: u8, _: u16, _: u16) -> anyhow::Result<()> { Ok(()) }
             async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
         }
 
@@ -2448,7 +2458,6 @@ mod tests {
                 self.sent_keys.lock().unwrap().push((tmux_name.to_string(), key.to_string()));
                 Ok(())
             }
-            async fn send_mouse(&self, _: &str, _: &str, _: u8, _: u16, _: u16) -> anyhow::Result<()> { Ok(()) }
             async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
         }
 
@@ -2472,7 +2481,6 @@ mod tests {
 
     #[test]
     fn mouse_click_already_selected_session_stays() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
         let sessions = vec![
             make_session("a", AgentType::Claude),
@@ -2498,7 +2506,6 @@ mod tests {
 
     #[test]
     fn mouse_attached_scroll_outside_preview_is_noop() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
@@ -2561,7 +2568,6 @@ mod tests {
 
     #[test]
     fn mouse_attached_click_inside_preview_stays_attached() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
@@ -2581,7 +2587,6 @@ mod tests {
 
     #[test]
     fn mouse_attached_other_event_is_noop() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
@@ -2649,5 +2654,278 @@ mod tests {
         assert!(!app.last_messages.contains_key(&stale), "stale last_messages should be pruned");
         assert!(!app.session_stats.contains_key(&stale), "stale session_stats should be pruned");
         assert!(!app.log_uuids.contains_key(&stale), "stale log_uuids should be pruned");
+    }
+
+    // ── Revival: success resets failed_attempts ──────────────────
+
+    #[tokio::test]
+    async fn revive_sessions_success_resets_failed_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = "testid";
+        let mut manifest = crate::manifest::Manifest::default();
+        let mut record = make_manifest_record("alpha", "claude");
+        record.failed_attempts = 2; // Previously failed twice
+        manifest.sessions.insert("alpha".to_string(), record);
+        crate::manifest::save_manifest(dir.path(), pid, &manifest).await.unwrap();
+
+        let mut app = App::new_with_manager(
+            pid.to_string(),
+            "/tmp/test".to_string(),
+            Box::new(MockSessionManager::new()),
+        );
+        app.manifest_dir = dir.path().to_path_buf();
+        app.revive_sessions().await;
+
+        // Verify failed_attempts was reset to 0
+        let loaded = crate::manifest::load_manifest(dir.path(), pid).await;
+        assert_eq!(
+            loaded.sessions["alpha"].failed_attempts, 0,
+            "successful revival should reset failed_attempts"
+        );
+    }
+
+    // ── confirm_new_session success path ──────────────────────────
+
+    #[tokio::test]
+    async fn confirm_new_session_success_saves_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = "testid";
+
+        let mut app = App::new_with_manager(
+            pid.to_string(),
+            "/tmp/test".to_string(),
+            Box::new(MockSessionManager::new()),
+        );
+        app.manifest_dir = dir.path().to_path_buf();
+        app.mode = Mode::NewSessionAgent;
+        app.new_session_name = "worker".to_string();
+        app.confirm_new_session().await;
+
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app.status_message.as_ref().unwrap().contains("Created session"));
+
+        // Verify manifest was saved
+        let loaded = crate::manifest::load_manifest(dir.path(), pid).await;
+        assert!(loaded.sessions.contains_key("worker"));
+    }
+
+    // ── confirm_delete success path ──────────────────────────────
+
+    #[tokio::test]
+    async fn confirm_delete_success_updates_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = "testid";
+
+        // Pre-populate manifest with a session
+        let mut manifest = crate::manifest::Manifest::default();
+        manifest.sessions.insert("s1".to_string(), make_manifest_record("s1", "claude"));
+        crate::manifest::save_manifest(dir.path(), pid, &manifest).await.unwrap();
+
+        let sessions = vec![make_session("s1", AgentType::Claude)];
+        let mut app = App::new_with_manager(
+            pid.to_string(),
+            "/tmp/test".to_string(),
+            Box::new(MockSessionManager::with_sessions(sessions.clone())),
+        );
+        app.manifest_dir = dir.path().to_path_buf();
+        app.sessions = sessions;
+        app.mode = Mode::ConfirmDelete;
+        app.confirm_delete().await;
+
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app.status_message.as_ref().unwrap().contains("Killed session"));
+
+        // Verify manifest entry was removed
+        let loaded = crate::manifest::load_manifest(dir.path(), pid).await;
+        assert!(!loaded.sessions.contains_key("s1"), "session should be removed from manifest");
+    }
+
+    // ── Mouse: click preview to attach ───────────────────────────
+
+    #[test]
+    fn mouse_click_preview_attaches() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let sessions = vec![make_session("a", AgentType::Claude)];
+        let mut app = test_app_with_sessions(sessions);
+        app.sidebar_area.set(Rect::new(0, 0, 24, 20));
+        app.preview_area.set(Rect::new(24, 0, 56, 20));
+
+        // Click inside preview area
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 40,
+            row: 10,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.mode, Mode::Attached);
+    }
+
+    // ── Mouse: scroll in sidebar selects sessions ────────────────
+
+    #[test]
+    fn mouse_scroll_sidebar_navigates() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let sessions = vec![
+            make_session("a", AgentType::Claude),
+            make_session("b", AgentType::Claude),
+            make_session("c", AgentType::Claude),
+        ];
+        let mut app = test_app_with_sessions(sessions);
+        app.sidebar_area.set(Rect::new(0, 0, 24, 20));
+        app.preview_area.set(Rect::new(24, 0, 56, 20));
+        assert_eq!(app.selected, 0);
+
+        // Scroll down in sidebar
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert_eq!(app.selected, 1);
+
+        // Scroll up in sidebar
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 5,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert_eq!(app.selected, 0);
+    }
+
+    // ── Mouse: scroll in preview scrolls viewport ────────────────
+
+    #[test]
+    fn mouse_scroll_preview_changes_offset() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let sessions = vec![make_session("a", AgentType::Claude)];
+        let mut app = test_app_with_sessions(sessions);
+        app.sidebar_area.set(Rect::new(0, 0, 24, 20));
+        app.preview_area.set(Rect::new(24, 0, 56, 20));
+        assert_eq!(app.preview_scroll_offset, 0);
+
+        // Scroll up in preview
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 40,
+            row: 10,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(app.preview_scroll_offset > 0);
+
+        let offset = app.preview_scroll_offset;
+
+        // Scroll down should decrease offset
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 40,
+            row: 10,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(app.preview_scroll_offset < offset);
+    }
+
+    // ── Task timer: Running starts clock ─────────────────────────
+
+    #[tokio::test]
+    async fn refresh_sessions_running_starts_task_timer() {
+        struct RunningManager;
+        #[async_trait::async_trait]
+        impl SessionManager for RunningManager {
+            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> {
+                Ok(vec![Session {
+                    name: "worker".to_string(),
+                    tmux_name: "hydra-testid-worker".to_string(),
+                    agent_type: AgentType::Claude,
+                    status: SessionStatus::Running,
+                    task_elapsed: None,
+                    _alive: true,
+                }])
+            }
+            async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
+            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
+            async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
+            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
+        }
+
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(RunningManager),
+        );
+        app.refresh_sessions().await;
+
+        let key = "hydra-testid-worker";
+        assert!(app.task_starts.contains_key(key), "Running session should start task timer");
+        assert!(app.task_last_active.contains_key(key), "Running session should set last_active");
+    }
+
+    // ── Task timer: Idle with recent activity keeps frozen timer ──
+
+    #[tokio::test]
+    async fn refresh_sessions_idle_recent_keeps_frozen_timer() {
+        struct IdleManager;
+        #[async_trait::async_trait]
+        impl SessionManager for IdleManager {
+            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> {
+                Ok(vec![Session {
+                    name: "worker".to_string(),
+                    tmux_name: "hydra-testid-worker".to_string(),
+                    agent_type: AgentType::Claude,
+                    status: SessionStatus::Idle,
+                    task_elapsed: None,
+                    _alive: true,
+                }])
+            }
+            async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
+            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
+            async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
+            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
+        }
+
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(IdleManager),
+        );
+
+        let key = "hydra-testid-worker".to_string();
+        // Pre-populate task_starts and task_last_active with recent timestamps
+        let now = Instant::now();
+        app.task_starts.insert(key.clone(), now);
+        app.task_last_active.insert(key.clone(), now);
+
+        app.refresh_sessions().await;
+
+        // Timer should still be set (within 5s window)
+        assert!(app.task_starts.contains_key(&key), "recent idle should keep task timer");
+        // Session should have a task_elapsed value
+        assert!(app.sessions[0].task_elapsed.is_some(), "idle within 5s should show frozen timer");
+    }
+
+    // ── Revive: empty manifest is no-op ──────────────────────────
+
+    #[tokio::test]
+    async fn revive_sessions_empty_manifest_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(MockSessionManager::new()),
+        );
+        app.manifest_dir = dir.path().to_path_buf();
+        app.revive_sessions().await;
+        assert!(app.status_message.is_none(), "empty manifest should produce no message");
     }
 }

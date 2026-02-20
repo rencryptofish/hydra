@@ -51,12 +51,21 @@ pub enum SessionStatus {
 
 impl SessionStatus {
     /// Sort priority: Idle (needs input) first, then Running, then Exited.
-    #[cfg(test)]
     pub fn sort_order(&self) -> u8 {
         match self {
             SessionStatus::Idle => 0,
             SessionStatus::Running => 1,
             SessionStatus::Exited => 2,
+        }
+    }
+}
+
+impl fmt::Display for SessionStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SessionStatus::Running => write!(f, "Running"),
+            SessionStatus::Idle => write!(f, "Idle"),
+            SessionStatus::Exited => write!(f, "Exited"),
         }
     }
 }

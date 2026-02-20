@@ -49,8 +49,8 @@ fn status_color(status: &SessionStatus) -> Color {
 }
 
 fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
-    // Check if any session has stats to show
-    let has_stats = app.session_stats.values().any(|st| st.turns > 0);
+    // Show stats if global stats have any tokens
+    let has_stats = app.global_stats.tokens_in + app.global_stats.tokens_out > 0;
 
     let stats_height = if has_stats { 3 } else { 0 }; // 1 line + top/bottom border
 
@@ -75,59 +75,93 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let stats_area = sidebar_chunks[1];
     let tree_area = sidebar_chunks[2];
 
-    // Draw session list
-    let items: Vec<ListItem> = app
-        .sessions
-        .iter()
-        .enumerate()
-        .map(|(i, session)| {
-            let marker = if i == app.selected { ">> " } else { "   " };
-            let name_style = if i == app.selected {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            let mut spans = vec![
-                Span::styled(marker, name_style),
-                Span::styled("● ", Style::default().fg(status_color(&session.status))),
-                Span::styled(format!("{} [{}]", session.name, session.agent_type), name_style),
+    // Build session list with status group headers.
+    // Sessions are already sorted by status group then name in app.rs.
+    // We insert a header ListItem when the status group changes.
+    // `selected_visual_row` maps app.selected (session index) to the
+    // visual row in the list (accounting for header items).
+    let inner_width = list_area.width.saturating_sub(2) as usize; // inside border
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut selected_visual_row: usize = 0;
+    let mut current_group: Option<u8> = None;
+
+    for (i, session) in app.sessions.iter().enumerate() {
+        let group = session.status.sort_order();
+        if current_group != Some(group) {
+            current_group = Some(group);
+            // Build header: "── ● Running ──────"
+            let label = format!(" {} ", session.status);
+            let dot_color = status_color(&session.status);
+            let dashes_left = "── ";
+            let dashes_right_len = inner_width
+                .saturating_sub(dashes_left.len() + 2 + label.len()); // 2 for "● "
+            let dashes_right: String = "─".repeat(dashes_right_len);
+            let header_spans = vec![
+                Span::styled(dashes_left, dim),
+                Span::styled("● ", Style::default().fg(dot_color)),
+                Span::styled(label, dim),
+                Span::styled(dashes_right, dim),
             ];
-            if let Some(elapsed) = session.task_elapsed {
-                spans.push(Span::styled(
-                    format!(" {}", format_duration(elapsed)),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-            let mut lines = vec![Line::from(spans)];
-            if let Some(msg) = app.last_messages.get(&session.tmux_name) {
-                let max_chars = 50;
-                let display = if msg.chars().count() > max_chars {
-                    let truncated: String = msg.chars().take(max_chars).collect();
-                    format!("     {truncated}...")
-                } else {
-                    format!("     {msg}")
-                };
-                lines.push(Line::from(Span::styled(
-                    display,
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-            ListItem::new(lines)
-        })
-        .collect();
+            items.push(ListItem::new(Line::from(header_spans)));
+        }
+
+        if i == app.selected {
+            selected_visual_row = items.len();
+        }
+
+        let marker = if i == app.selected { ">> " } else { "   " };
+        let name_style = if i == app.selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let mut spans = vec![
+            Span::styled(marker, name_style),
+            Span::styled("● ", Style::default().fg(status_color(&session.status))),
+            Span::styled(format!("{} [{}]", session.name, session.agent_type), name_style),
+        ];
+        if let Some(elapsed) = session.task_elapsed {
+            spans.push(Span::styled(
+                format!(" {}", format_duration(elapsed)),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        let mut lines = vec![Line::from(spans)];
+        if let Some(msg) = app.last_messages.get(&session.tmux_name) {
+            let max_chars = 50;
+            let display = if msg.chars().count() > max_chars {
+                let truncated: String = msg.chars().take(max_chars).collect();
+                format!("     {truncated}...")
+            } else {
+                format!("     {msg}")
+            };
+            lines.push(Line::from(Span::styled(
+                display,
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        items.push(ListItem::new(lines));
+    }
 
     let session_count = app.sessions.len();
     let title = format!(" Sessions ({session_count}) ");
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .border_style(Style::default().fg(Color::Cyan)),
-    );
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_style(Style::default()) // selection handled manually via ">>"
+        .highlight_symbol("");
 
-    frame.render_widget(list, list_area);
+    // Use stateful rendering to scroll the list to the selected visual row.
+    let mut list_state = ratatui::widgets::ListState::default();
+    list_state.select(Some(selected_visual_row));
+    frame.render_stateful_widget(list, list_area, &mut list_state);
 
     // Draw aggregate stats across all sessions
     if has_stats {
@@ -262,16 +296,12 @@ fn draw_diff_tree(frame: &mut Frame, lines: &[Line], area: Rect) {
 }
 
 fn draw_stats(frame: &mut Frame, app: &App, area: Rect) {
-    // Aggregate across all sessions
-    let mut total_cost = 0.0;
-    let mut total_tokens = 0u64;
-    let mut total_edits = 0u16;
+    // Use machine-wide global stats for cost and tokens
+    let total_cost = app.global_stats.cost_usd();
+    let total_tokens = app.global_stats.tokens_in + app.global_stats.tokens_out;
 
-    for stats in app.session_stats.values() {
-        total_cost += stats.cost_usd();
-        total_tokens += stats.tokens_in + stats.tokens_out;
-        total_edits += stats.edits;
-    }
+    // Edits are hydra-specific (per-session)
+    let total_edits: u16 = app.session_stats.values().map(|s| s.edits).sum();
 
     let dim = Style::default().fg(Color::DarkGray);
     let val = Style::default().fg(Color::White);
@@ -456,9 +486,6 @@ mod tests {
             Ok(())
         }
         async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn send_mouse(&self, _: &str, _: &str, _: u8, _: u16, _: u16) -> anyhow::Result<()> {
             Ok(())
         }
         async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> {
@@ -957,25 +984,23 @@ mod tests {
         app.selected = 0;
         app.preview = "some preview content".to_string();
 
-        // Populate stats for multiple sessions (aggregated in display)
+        // Populate global stats (machine-wide, drives stats block visibility)
+        app.global_stats.tokens_in = 28200;
+        app.global_stats.tokens_out = 6500;
+        app.global_stats.tokens_cache_read = 500;
+        app.global_stats.tokens_cache_write = 100;
+
+        // Per-session stats (edits are still hydra-specific)
         let mut stats1 = crate::logs::SessionStats::default();
         stats1.turns = 12;
-        stats1.tokens_in = 18200;
-        stats1.tokens_out = 4500;
         stats1.edits = 5;
         stats1.bash_cmds = 3;
-        stats1.touch_file("/src/main.rs".to_string());
-        stats1.touch_file("/src/app.rs".to_string());
         app.session_stats.insert("hydra-testproj-worker-1".to_string(), stats1);
 
         let mut stats2 = crate::logs::SessionStats::default();
         stats2.turns = 8;
-        stats2.tokens_in = 10000;
-        stats2.tokens_out = 2000;
         stats2.edits = 3;
         stats2.bash_cmds = 2;
-        stats2.touch_file("/src/main.rs".to_string()); // overlaps with worker-1
-        stats2.touch_file("/src/ui.rs".to_string());
         app.session_stats.insert("hydra-testproj-worker-2".to_string(), stats2);
 
         // Per-file git diff stats

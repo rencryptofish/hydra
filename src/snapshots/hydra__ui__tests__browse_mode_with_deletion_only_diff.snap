@@ -3,7 +3,8 @@ source: src/ui.rs
 expression: output
 ---
 ┌ Sessions (1) ┐┌ worker-1 ────────────────────────────────────────────────────┐
-│>> ● worker-1 ││preview content                                               │
+│── ●  Idle    ││preview content                                               │
+│>> ● worker-1 ││                                                              │
 │              ││                                                              │
 │              ││                                                              │
 │              ││                                                              │
@@ -18,9 +19,8 @@ expression: output
 │              ││                                                              │
 │              ││                                                              │
 │              ││                                                              │
-└──────────────┘│                                                              │
-┌ Stats ───────┐│                                                              │
-│$0.03 6.0k 2✎ ││                                                              │
+│              ││                                                              │
+│              ││                                                              │
 └──────────────┘│                                                              │
 ┌ Changes ─────┐│                                                              │
 │ old.rs   -20 ││                                                              │

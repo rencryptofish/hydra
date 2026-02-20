@@ -41,14 +41,6 @@ pub trait SessionManager: Send + Sync {
     async fn capture_pane(&self, tmux_name: &str) -> Result<String>;
     async fn kill_session(&self, tmux_name: &str) -> Result<()>;
     async fn send_keys(&self, tmux_name: &str, key: &str) -> Result<()>;
-    async fn send_mouse(
-        &self,
-        tmux_name: &str,
-        kind: &str,
-        button: u8,
-        x: u16,
-        y: u16,
-    ) -> Result<()>;
     async fn capture_pane_scrollback(&self, tmux_name: &str) -> Result<String>;
 }
 
@@ -158,17 +150,6 @@ impl SessionManager for TmuxSessionManager {
 
     async fn send_keys(&self, tmux_name: &str, key: &str) -> Result<()> {
         send_keys(tmux_name, key).await
-    }
-
-    async fn send_mouse(
-        &self,
-        tmux_name: &str,
-        kind: &str,
-        button: u8,
-        x: u16,
-        y: u16,
-    ) -> Result<()> {
-        send_mouse(tmux_name, kind, button, x, y).await
     }
 
     async fn capture_pane_scrollback(&self, tmux_name: &str) -> Result<String> {
@@ -295,32 +276,6 @@ pub async fn send_keys(tmux_name: &str, key: &str) -> Result<()> {
 
     if !status.success() {
         bail!("tmux send-keys failed for '{tmux_name}'");
-    }
-
-    Ok(())
-}
-
-/// Send a mouse event to a tmux session using SGR escape sequences.
-///
-/// `kind` is "press" or "release". Coordinates are 1-based for SGR encoding.
-pub async fn send_mouse(
-    tmux_name: &str,
-    kind: &str,
-    button: u8,
-    x: u16,
-    y: u16,
-) -> Result<()> {
-    // SGR mouse encoding: press = \x1b[<button;x;yM  release = \x1b[<button;x;ym
-    let suffix = if kind == "press" { 'M' } else { 'm' };
-    let seq = format!("\x1b[<{button};{x};{y}{suffix}");
-    let status = run_status_timeout(
-        Command::new("tmux").args(["send-keys", "-t", tmux_name, "-l", &seq]),
-    )
-    .await
-    .context("Failed to send mouse event to tmux session")?;
-
-    if !status.success() {
-        bail!("tmux send-keys (mouse) failed for '{tmux_name}'");
     }
 
     Ok(())
