@@ -159,11 +159,6 @@ impl App {
                         if first_capture {
                             // Brand-new session — assume Running until debounce says otherwise.
                             session.status = SessionStatus::Running;
-                        } else if log_working {
-                            // Log says agent is actively processing — trust it.
-                            session.status = SessionStatus::Running;
-                            self.idle_ticks.insert(name.clone(), 0);
-                            self.changed_ticks.insert(name.clone(), 0);
                         } else if unchanged {
                             let count = self.idle_ticks.entry(name.clone()).or_insert(0);
                             *count = count.saturating_add(1);
@@ -171,14 +166,21 @@ impl App {
 
                             if *count >= 12 {
                                 session.status = SessionStatus::Idle;
+                            } else if log_working {
+                                // Log says agent is still processing but pane hasn't
+                                // hit the idle threshold yet — keep Running. This avoids
+                                // premature Idle during agent "thinking" pauses, but
+                                // doesn't reset idle_ticks so the pane-based counter
+                                // can still accumulate as a fallback for stale stats.
+                                session.status = SessionStatus::Running;
                             }
-                            // else: keep current status
+                            // else: keep current status (hysteresis)
                         } else {
                             let count = self.changed_ticks.entry(name.clone()).or_insert(0);
                             *count = count.saturating_add(1);
                             self.idle_ticks.insert(name.clone(), 0);
 
-                            if *count >= 2 {
+                            if *count >= 2 || log_working {
                                 session.status = SessionStatus::Running;
                             }
                             // else: keep current status (don't flip to Running on a single blip)
@@ -3114,9 +3116,11 @@ mod tests {
     // ── log-based status override test ──────────────────────────────
 
     #[tokio::test]
-    async fn refresh_sessions_log_working_forces_running() {
+    async fn refresh_sessions_log_working_keeps_running_before_idle_threshold() {
         // When session_stats.task_elapsed() returns Some (agent is working),
-        // status should be forced to Running even if pane content is unchanged.
+        // status should stay Running during the pane-based debounce window
+        // (idle_ticks < 12), but once idle_ticks >= 12, pane-based Idle wins
+        // over potentially stale log data.
         let sessions = vec![make_session("s1", AgentType::Claude)];
         let mut app = App::new_with_manager(
             "testid".to_string(),
@@ -3124,24 +3128,33 @@ mod tests {
             Box::new(MockSessionManager::with_sessions(sessions)),
         );
 
-        // Run enough ticks to normally reach Idle
-        for _ in 0..15 {
-            app.refresh_sessions().await;
-        }
-        assert_eq!(app.sessions[0].status, SessionStatus::Idle, "baseline: idle without log");
-
-        // Now inject session_stats with a pending user message (agent is working)
+        // Inject session_stats with a pending user message (agent is working)
         let mut stats = crate::logs::SessionStats::default();
         let ts = (chrono::Utc::now() - chrono::Duration::seconds(5))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         stats.last_user_ts = Some(ts);
         app.session_stats.insert("hydra-testid-s1".to_string(), stats);
 
+        // First tick: first_capture, sets Running
+        app.refresh_sessions().await;
+        assert_eq!(app.sessions[0].status, SessionStatus::Running, "first tick = Running");
+
+        // Ticks 2-12: unchanged content, but log_working keeps it Running
+        for i in 2..=12 {
+            app.refresh_sessions().await;
+            assert_eq!(
+                app.sessions[0].status,
+                SessionStatus::Running,
+                "tick {i}: log_working should keep Running before idle threshold"
+            );
+        }
+
+        // Tick 13: idle_ticks reaches 12, pane-based Idle overrides stale log
         app.refresh_sessions().await;
         assert_eq!(
             app.sessions[0].status,
-            SessionStatus::Running,
-            "log says working → should be Running"
+            SessionStatus::Idle,
+            "tick 13: pane-based Idle should override stale log data"
         );
     }
 
