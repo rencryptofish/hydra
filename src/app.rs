@@ -46,9 +46,14 @@ pub struct App {
     /// Per-file git diff stats from `git diff --numstat`
     pub diff_files: Vec<DiffFile>,
     log_uuids: HashMap<String, String>,
+    /// Latest per-session pane captures from `refresh_sessions` tick.
+    /// Used by preview refresh to avoid redundant tmux calls.
+    latest_pane_captures: HashMap<String, String>,
     message_tick: u8,
     pub manifest_dir: PathBuf,
     manager: Box<dyn SessionManager>,
+    /// Whether `preview` currently contains full scrollback (not just live pane).
+    preview_has_scrollback: bool,
     /// Pending literal keys to send to tmux (tmux_name, text).
     /// Set by `handle_mouse` for forwarding clicks; consumed by the event loop.
     pub pending_literal_keys: Option<(String, String)>,
@@ -88,9 +93,11 @@ impl App {
             global_stats: GlobalStats::default(),
             diff_files: Vec::new(),
             log_uuids: HashMap::new(),
+            latest_pane_captures: HashMap::new(),
             message_tick: 0,
             manifest_dir: crate::manifest::default_base_dir(),
             manager,
+            preview_has_scrollback: false,
             pending_literal_keys: None,
         }
     }
@@ -240,6 +247,8 @@ impl App {
                         .then(a.name.cmp(&b.name))
                 });
 
+                // Reuse these cheap pane snapshots for preview refresh.
+                self.latest_pane_captures = captures;
                 self.sessions = sessions;
 
                 // Restore selection to the same session after sort
@@ -250,6 +259,7 @@ impl App {
                 }
             }
             Err(e) => {
+                self.latest_pane_captures.clear();
                 self.status_message = Some(format!("Error listing sessions: {e}"));
             }
         }
@@ -266,6 +276,8 @@ impl App {
             self.last_messages.retain(|k, _| live_keys.contains(k));
             self.session_stats.retain(|k, _| live_keys.contains(k));
             self.log_uuids.retain(|k, _| live_keys.contains(k));
+            self.latest_pane_captures
+                .retain(|k, _| live_keys.contains(k));
         }
 
         // Keep selected index in bounds
@@ -282,23 +294,47 @@ impl App {
             .get(self.selected)
             .map(|s| s.tmux_name.clone());
         if let Some(tmux_name) = tmux_name {
-            // Skip the expensive full-scrollback capture when the selected session
-            // hasn't changed and its pane content is confirmed unchanged (idle_ticks >= 1).
-            if self.preview_session.as_ref() == Some(&tmux_name)
+            let same_session = self.preview_session.as_ref() == Some(&tmux_name);
+            let wants_scrollback = self.preview_scroll_offset > 0;
+
+            // If the user is inspecting history, keep the current scrollback snapshot
+            // stable and avoid re-capturing huge buffers every event/tick.
+            if same_session && wants_scrollback && self.preview_has_scrollback {
+                return;
+            }
+
+            // Skip no-op refreshes for unchanged live view.
+            if same_session
+                && !wants_scrollback
+                && !self.preview_has_scrollback
                 && self.idle_ticks.get(&tmux_name).copied().unwrap_or(0) >= 1
             {
                 return;
             }
 
-            let result = self.manager.capture_pane_scrollback(&tmux_name).await;
-            match result {
-                Ok(content) => self.preview = content,
-                Err(_) => self.preview = String::from("[unable to capture pane]"),
+            if wants_scrollback {
+                let result = self.manager.capture_pane_scrollback(&tmux_name).await;
+                match result {
+                    Ok(content) => self.preview = content,
+                    Err(_) => self.preview = String::from("[unable to capture pane]"),
+                }
+                self.preview_has_scrollback = true;
+            } else if let Some(content) = self.latest_pane_captures.get(&tmux_name) {
+                self.preview = content.clone();
+                self.preview_has_scrollback = false;
+            } else {
+                let result = self.manager.capture_pane(&tmux_name).await;
+                match result {
+                    Ok(content) => self.preview = content,
+                    Err(_) => self.preview = String::from("[unable to capture pane]"),
+                }
+                self.preview_has_scrollback = false;
             }
             self.preview_session = Some(tmux_name);
         } else {
             self.preview = String::from("No sessions. Press 'n' to create one.");
             self.preview_session = None;
+            self.preview_has_scrollback = false;
         }
     }
 
@@ -344,6 +380,7 @@ impl App {
             self.selected = (self.selected + 1) % self.sessions.len();
             self.preview_scroll_offset = 0;
             self.preview_session = None;
+            self.preview_has_scrollback = false;
         }
     }
 
@@ -356,6 +393,7 @@ impl App {
             };
             self.preview_scroll_offset = 0;
             self.preview_session = None;
+            self.preview_has_scrollback = false;
         }
     }
 
@@ -586,6 +624,7 @@ impl App {
                                 self.selected = idx;
                                 self.preview_scroll_offset = 0;
                                 self.preview_session = None;
+                                self.preview_has_scrollback = false;
                             }
                         }
                     } else if preview.contains(pos) {
@@ -788,18 +827,29 @@ fn parse_diff_numstat(output: &str) -> Vec<DiffFile> {
         .collect()
 }
 
+/// Maximum number of diff files to process (bounds sort + render cost per tick).
+const MAX_DIFF_FILES: usize = 200;
+
 /// Get per-file git diff stats for the working tree, including untracked files.
 async fn get_git_diff_numstat(cwd: &str) -> Vec<DiffFile> {
-    let (diff_out, untracked_out) = tokio::join!(
-        tokio::process::Command::new("git")
-            .args(["diff", "--numstat"])
-            .current_dir(cwd)
-            .output(),
-        tokio::process::Command::new("git")
-            .args(["ls-files", "--others", "--exclude-standard"])
-            .current_dir(cwd)
-            .output(),
-    );
+    let git_future = async {
+        tokio::join!(
+            tokio::process::Command::new("git")
+                .args(["diff", "--numstat"])
+                .current_dir(cwd)
+                .output(),
+            tokio::process::Command::new("git")
+                .args(["ls-files", "--others", "--exclude-standard"])
+                .current_dir(cwd)
+                .output(),
+        )
+    };
+
+    let (diff_out, untracked_out) =
+        match tokio::time::timeout(std::time::Duration::from_secs(3), git_future).await {
+            Ok(results) => results,
+            Err(_) => return Vec::new(), // timeout — return empty
+        };
 
     let mut files = match diff_out {
         Ok(o) if o.status.success() => {
@@ -824,6 +874,7 @@ async fn get_git_diff_numstat(cwd: &str) -> Vec<DiffFile> {
         }
     }
 
+    files.truncate(MAX_DIFF_FILES);
     files
 }
 
@@ -1696,7 +1747,9 @@ mod tests {
             async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
                 Ok(String::new())
             }
-            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
+            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> {
+                Err(anyhow::anyhow!("capture failed"))
+            }
             async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
             async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
             async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
@@ -1721,7 +1774,9 @@ mod tests {
             async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
                 Ok(String::new())
             }
-            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
+            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> {
+                Err(anyhow::anyhow!("capture failed"))
+            }
             async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
             async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
             async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> {
@@ -3322,8 +3377,6 @@ mod tests {
         // First call — captures preview
         app.refresh_preview().await;
         assert_eq!(app.preview_session.as_deref(), Some("hydra-testid-s1"));
-        let first_preview = app.preview.clone();
-
         // Simulate idle_ticks >= 1 for the session
         app.idle_ticks.insert("hydra-testid-s1".to_string(), 1);
 
@@ -3358,6 +3411,161 @@ mod tests {
         app.refresh_preview().await;
         // Should NOT skip, so preview is overwritten
         assert_ne!(app.preview, "modified", "should not skip when idle_ticks = 0");
+    }
+
+    #[tokio::test]
+    async fn refresh_preview_uses_cached_pane_capture_from_refresh_sessions() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct CaptureCounter {
+            sessions: Vec<Session>,
+            pane_calls: Arc<AtomicUsize>,
+            scrollback_calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl SessionManager for CaptureCounter {
+            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> {
+                Ok(self.sessions.clone())
+            }
+            async fn create_session(
+                &self,
+                _: &str,
+                _: &str,
+                _: &AgentType,
+                _: &str,
+                _: Option<&str>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> {
+                self.pane_calls.fetch_add(1, Ordering::SeqCst);
+                Ok("pane-capture".to_string())
+            }
+            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
+            async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
+            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> {
+                self.scrollback_calls.fetch_add(1, Ordering::SeqCst);
+                Ok("scrollback-capture".to_string())
+            }
+        }
+
+        let sessions = vec![make_session("s1", AgentType::Claude)];
+        let pane_calls = Arc::new(AtomicUsize::new(0));
+        let scrollback_calls = Arc::new(AtomicUsize::new(0));
+        let manager = CaptureCounter {
+            sessions: sessions.clone(),
+            pane_calls: pane_calls.clone(),
+            scrollback_calls: scrollback_calls.clone(),
+        };
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(manager),
+        );
+
+        app.refresh_sessions().await;
+        assert_eq!(pane_calls.load(Ordering::SeqCst), 1, "refresh_sessions should capture pane once");
+
+        app.refresh_preview().await;
+        assert_eq!(app.preview, "pane-capture");
+        assert_eq!(
+            pane_calls.load(Ordering::SeqCst),
+            1,
+            "refresh_preview should reuse cached pane capture (no extra tmux call)"
+        );
+        assert_eq!(
+            scrollback_calls.load(Ordering::SeqCst),
+            0,
+            "live preview should not use scrollback capture"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_preview_scrollback_captured_once_while_scrolled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct CaptureCounter {
+            sessions: Vec<Session>,
+            pane_calls: Arc<AtomicUsize>,
+            scrollback_calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl SessionManager for CaptureCounter {
+            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> {
+                Ok(self.sessions.clone())
+            }
+            async fn create_session(
+                &self,
+                _: &str,
+                _: &str,
+                _: &AgentType,
+                _: &str,
+                _: Option<&str>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> {
+                self.pane_calls.fetch_add(1, Ordering::SeqCst);
+                Ok("pane-capture".to_string())
+            }
+            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
+            async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
+            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> {
+                self.scrollback_calls.fetch_add(1, Ordering::SeqCst);
+                Ok("scrollback-capture".to_string())
+            }
+        }
+
+        let sessions = vec![make_session("s1", AgentType::Claude)];
+        let pane_calls = Arc::new(AtomicUsize::new(0));
+        let scrollback_calls = Arc::new(AtomicUsize::new(0));
+        let manager = CaptureCounter {
+            sessions: sessions.clone(),
+            pane_calls: pane_calls.clone(),
+            scrollback_calls: scrollback_calls.clone(),
+        };
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(manager),
+        );
+
+        app.refresh_sessions().await;
+        app.refresh_preview().await;
+        assert_eq!(app.preview, "pane-capture");
+
+        app.preview_scroll_offset = 1;
+        app.refresh_preview().await;
+        assert_eq!(app.preview, "scrollback-capture");
+        assert_eq!(
+            scrollback_calls.load(Ordering::SeqCst),
+            1,
+            "first scroll-up should fetch scrollback once"
+        );
+
+        // While still scrolled up in same session, preview should stay frozen.
+        app.preview = "frozen".to_string();
+        app.refresh_preview().await;
+        assert_eq!(app.preview, "frozen", "scrolled history should not recapture every tick");
+        assert_eq!(
+            scrollback_calls.load(Ordering::SeqCst),
+            1,
+            "no extra scrollback captures while inspecting history"
+        );
+
+        // Returning to bottom should switch back to live pane path.
+        app.preview_scroll_offset = 0;
+        app.refresh_preview().await;
+        assert_eq!(app.preview, "pane-capture");
+        assert_eq!(
+            pane_calls.load(Ordering::SeqCst),
+            1,
+            "should reuse cached pane capture when returning to live view"
+        );
     }
 
     // ── flush_pending_keys ──
@@ -3484,6 +3692,27 @@ mod tests {
         let input = "\x1bother text";
         let result = super::normalize_capture(input);
         assert_eq!(result, "other text");
+    }
+
+    // ── parse_diff_numstat: tab in path ─────────────────────────────
+
+    #[test]
+    fn parse_diff_numstat_tab_in_path() {
+        // git numstat uses tabs to separate fields; a tab inside the path
+        // would split incorrectly. We only take the first field after the
+        // second tab, so the rest is lost. This test documents the behavior.
+        let out = "10\t5\tpath\twith\ttabs\n";
+        let files = super::parse_diff_numstat(out);
+        // The parser splits on \t and takes .next() for path, so it gets "path"
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "path");
+    }
+
+    // ── MAX_DIFF_FILES constant ─────────────────────────────────────
+
+    #[test]
+    fn max_diff_files_constant_is_200() {
+        assert_eq!(super::MAX_DIFF_FILES, 200);
     }
 
 }

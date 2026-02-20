@@ -9,7 +9,7 @@ mod ui;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture, KeyEventKind},
+    event::{DisableMouseCapture, EnableMouseCapture, KeyEventKind, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -18,7 +18,7 @@ use ratatui::Terminal;
 use std::io;
 use std::time::Duration;
 
-use app::App;
+use app::{App, Mode};
 use event::{Event, EventHandler};
 use session::{project_id, AgentType};
 
@@ -125,14 +125,22 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
         match events.next().await {
             Some(Event::Key(key)) => {
                 if key.kind == KeyEventKind::Press {
+                    let was_attached = app.mode == Mode::Attached;
                     app.handle_key(key).await;
-                    app.refresh_preview().await;
+                    // In Attached mode, avoid one tmux preview capture per keypress.
+                    // Tick refreshes keep the preview live without input lag.
+                    if !was_attached {
+                        app.refresh_preview().await;
+                    }
                 }
             }
             Some(Event::Mouse(mouse)) => {
+                let should_refresh_preview = !matches!(mouse.kind, MouseEventKind::Moved);
                 app.handle_mouse(mouse);
                 app.flush_pending_keys().await;
-                app.refresh_preview().await;
+                if should_refresh_preview {
+                    app.refresh_preview().await;
+                }
             }
             Some(Event::Tick) => {
                 app.refresh_sessions().await;
@@ -155,5 +163,4 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
 
     Ok(())
 }
-
 

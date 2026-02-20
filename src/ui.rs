@@ -174,6 +174,11 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Truncate a string to at most `max` characters (Unicode-safe).
+fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
 /// Build lines for a compact diff tree grouped by directory.
 /// Files sorted by path, grouped under directory headers.
 /// Output example:
@@ -204,6 +209,11 @@ fn build_diff_tree_lines<'a>(diff_files: &[crate::app::DiffFile], width: usize) 
             None => (None, f.path.as_str()),
         };
 
+        // Skip entries with empty basenames (e.g. trailing-slash paths)
+        if basename.is_empty() {
+            continue;
+        }
+
         // Emit directory header if changed
         let dir_str = dir.unwrap_or("");
         let show_dir = match current_dir {
@@ -212,8 +222,8 @@ fn build_diff_tree_lines<'a>(diff_files: &[crate::app::DiffFile], width: usize) 
         };
         if show_dir {
             if let Some(d) = dir {
-                let display: String = if d.len() > inner_w {
-                    d[..inner_w].to_string()
+                let display: String = if d.chars().count() > inner_w {
+                    truncate_chars(d, inner_w)
                 } else {
                     d.to_string()
                 };
@@ -235,15 +245,19 @@ fn build_diff_tree_lines<'a>(diff_files: &[crate::app::DiffFile], width: usize) 
         let prefix_len = indent.len();
         let available = inner_w.saturating_sub(prefix_len + stat_len + 1);
 
-        let name: String = if basename.len() > available && available > 3 {
-            format!("{}…", &basename[..available - 1])
-        } else if basename.len() > available {
-            basename[..available.min(basename.len())].to_string()
+        let basename_chars = basename.chars().count();
+        let name: String = if available == 0 {
+            String::new()
+        } else if basename_chars > available && available > 3 {
+            format!("{}…", truncate_chars(basename, available - 1))
+        } else if basename_chars > available {
+            truncate_chars(basename, available)
         } else {
             basename.to_string()
         };
 
-        let padding = inner_w.saturating_sub(prefix_len + name.len() + stat_len);
+        let name_chars = name.chars().count();
+        let padding = inner_w.saturating_sub(prefix_len + name_chars + stat_len);
         let pad_str: String = " ".repeat(padding);
 
         let mut spans = vec![
@@ -1015,5 +1029,72 @@ mod tests {
         let output = buffer_to_string(&terminal);
 
         insta::assert_snapshot!(output);
+    }
+
+    // ── diff tree resilience tests ──────────────────────────────────
+
+    #[test]
+    fn diff_tree_utf8_filename() {
+        // Non-ASCII filename that would panic with byte slicing
+        let files = vec![crate::app::DiffFile {
+            path: "src/café.rs".into(),
+            insertions: 5,
+            deletions: 2,
+            untracked: false,
+        }];
+        // Width narrow enough to force truncation
+        let lines = super::build_diff_tree_lines(&files, 10);
+        assert!(!lines.is_empty(), "should produce lines for UTF-8 filenames");
+    }
+
+    #[test]
+    fn diff_tree_width_zero() {
+        let files = vec![crate::app::DiffFile {
+            path: "src/app.rs".into(),
+            insertions: 1,
+            deletions: 0,
+            untracked: false,
+        }];
+        // width=0 should not panic
+        let lines = super::build_diff_tree_lines(&files, 0);
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn diff_tree_width_one() {
+        let files = vec![crate::app::DiffFile {
+            path: "src/app.rs".into(),
+            insertions: 1,
+            deletions: 0,
+            untracked: false,
+        }];
+        // width=1 should not panic
+        let lines = super::build_diff_tree_lines(&files, 1);
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn diff_tree_trailing_slash_path() {
+        let files = vec![crate::app::DiffFile {
+            path: "src/".into(),
+            insertions: 1,
+            deletions: 0,
+            untracked: false,
+        }];
+        // Trailing slash produces empty basename — should be skipped
+        let lines = super::build_diff_tree_lines(&files, 40);
+        assert!(lines.is_empty(), "trailing-slash path should be skipped");
+    }
+
+    #[test]
+    fn truncate_chars_ascii() {
+        assert_eq!(super::truncate_chars("hello", 3), "hel");
+        assert_eq!(super::truncate_chars("hi", 10), "hi");
+    }
+
+    #[test]
+    fn truncate_chars_unicode() {
+        assert_eq!(super::truncate_chars("café", 3), "caf");
+        assert_eq!(super::truncate_chars("日本語テスト", 3), "日本語");
     }
 }

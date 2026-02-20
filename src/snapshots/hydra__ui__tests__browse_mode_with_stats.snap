@@ -21,8 +21,8 @@ expression: output
 ┌ Changes ─────┐│                                                              │
 │ README.md +8 ││                                                              │
 │ src/         ││                                                              │
-│  app…+45-12  ││                                                              │
-│  new_mo…new  ││                                                              │
+│  app… +45-12 ││                                                              │
+│  new_mo… new ││                                                              │
 │  ui.rs +30-5 ││                                                              │
 └──────────────┘└──────────────────────────────────────────────────────────────┘
  j/k: navigate  Enter: attach  n: new  d: delete  q: quit

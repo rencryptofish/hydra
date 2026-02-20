@@ -298,7 +298,11 @@ pub async fn capture_pane_scrollback(tmux_name: &str) -> Result<String> {
         return Ok(String::from("[session not available]"));
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    // Trim trailing blank lines — tmux pads the capture to the full pane
+    // height, which makes short output appear to start halfway up the preview.
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let trimmed = raw.trim_end_matches('\n');
+    Ok(trimmed.to_string())
 }
 
 /// Send a key to a tmux session via `tmux send-keys`.
