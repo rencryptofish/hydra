@@ -42,22 +42,16 @@ Run multiple Claude and Codex agents in parallel, each in its own tmux session, 
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rencryptofish/hydra/main/scripts/install.sh | bash
+cargo install --locked --force --git ssh://git@github.com/rencryptofish/hydra.git hydra
 ```
 
-What this does:
-- Installs Rust (`cargo`) if it is not already installed
-- Installs/updates `hydra` from `rencryptofish/hydra`
-- Warns if `tmux` is missing (required at runtime)
-
-Manual install from source:
+If you don't have Rust installed yet:
 
 ```bash
-git clone https://github.com/rencryptofish/hydra.git
-cd hydra
-cargo build --release
-cp target/release/hydra ~/.local/bin/  # or anywhere on your PATH
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && . "$HOME/.cargo/env" && cargo install --locked --force --git ssh://git@github.com/rencryptofish/hydra.git hydra
 ```
+
+Requires SSH access to the repo. To update later, run `hydra update`.
 
 ## Usage
 
