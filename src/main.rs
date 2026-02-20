@@ -48,6 +48,8 @@ enum Commands {
     },
     /// List sessions for the current project
     Ls,
+    /// Update hydra to the latest version from GitHub
+    Update,
 }
 
 #[tokio::main]
@@ -64,6 +66,7 @@ async fn main() -> Result<()> {
         Some(Commands::New { agent, name }) => cmd_new(&pid, &name, &agent, &cwd).await,
         Some(Commands::Kill { name }) => cmd_kill(&pid, &name).await,
         Some(Commands::Ls) => cmd_ls(&pid).await,
+        Some(Commands::Update) => cmd_update().await,
         None => run_tui(pid, cwd).await,
     }
 }
@@ -100,6 +103,25 @@ async fn cmd_ls(project_id: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn cmd_update() -> Result<()> {
+    println!("Updating hydra from GitHub...");
+    let status = std::process::Command::new("cargo")
+        .args([
+            "install", "--locked", "--force", "--git",
+            "https://github.com/rencryptofish/hydra.git",
+            "hydra",
+        ])
+        .status()
+        .context("Failed to run cargo install — is cargo on PATH?")?;
+
+    if status.success() {
+        println!("hydra updated successfully.");
+        Ok(())
+    } else {
+        anyhow::bail!("Update failed (cargo exited with {}).", status);
+    }
 }
 
 async fn run_tui(project_id: String, cwd: String) -> Result<()> {
