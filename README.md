@@ -48,7 +48,7 @@
 Run multiple Claude and Codex agents in parallel, each in its own tmux session, managed from a single TUI.
 
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-253_passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-456_passing-brightgreen.svg)](#testing)
 [![Coverage](https://img.shields.io/badge/coverage-65%25-yellow.svg)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -60,6 +60,7 @@ Run multiple Claude and Codex agents in parallel, each in its own tmux session, 
 
 - **Sidebar + Preview layout** — browse all agent sessions in a list, see live output in the preview pane
 - **Embedded attach** — jump into any session with Enter, type directly to the agent, Esc to detach
+- **Low-latency attached typing** — attached mode forces live pane refresh on keypress for near real-time echo
 - **Status indicators** — green (idle), red (running), yellow (exited) dots per session
 - **Task timer** — tracks elapsed time for the current running task per agent
 - **Last message preview** — shows the last assistant response in the sidebar (reads Claude Code JSONL logs)
@@ -142,7 +143,7 @@ Key design decisions:
 
 ## Testing
 
-253 tests across unit, snapshot, and CLI integration:
+456 tests across unit, snapshot, and CLI integration:
 
 ```bash
 cargo test                # run all tests

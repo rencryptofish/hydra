@@ -134,9 +134,11 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
                 if key.kind == KeyEventKind::Press {
                     let was_attached = app.mode == Mode::Attached;
                     app.handle_key(key).await;
-                    // In Attached mode, avoid one tmux preview capture per keypress.
-                    // Tick refreshes keep the preview live without input lag.
-                    if !was_attached {
+                    if was_attached && app.mode == Mode::Attached {
+                        // Force a live pane capture on typed input so attached-mode
+                        // echo feels immediate rather than waiting for the tick.
+                        app.refresh_preview_live().await;
+                    } else if !was_attached {
                         app.refresh_preview().await;
                     }
                 }

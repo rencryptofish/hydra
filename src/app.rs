@@ -404,6 +404,16 @@ impl App {
     }
 
     pub async fn refresh_preview(&mut self) {
+        self.refresh_preview_impl(false).await;
+    }
+
+    /// Refresh preview with a forced live pane capture (bypasses cache/idle skip).
+    /// Used for attached-mode typing where low input-to-echo latency matters.
+    pub async fn refresh_preview_live(&mut self) {
+        self.refresh_preview_impl(true).await;
+    }
+
+    async fn refresh_preview_impl(&mut self, force_live_capture: bool) {
         let tmux_name = self
             .sessions
             .get(self.selected)
@@ -419,7 +429,8 @@ impl App {
             }
 
             // Skip no-op refreshes for unchanged live view.
-            if same_session
+            if !force_live_capture
+                && same_session
                 && !wants_scrollback
                 && !self.preview_has_scrollback
                 && self.idle_ticks.get(&tmux_name).copied().unwrap_or(0) >= 1
@@ -435,8 +446,18 @@ impl App {
                         self.set_preview_content(String::from("[unable to capture pane]"), true)
                     }
                 }
-            } else if let Some(content) = self.latest_pane_captures.get(&tmux_name) {
-                self.set_preview_content(content.clone(), false);
+            } else if !force_live_capture {
+                if let Some(content) = self.latest_pane_captures.get(&tmux_name) {
+                    self.set_preview_content(content.clone(), false);
+                } else {
+                    let result = self.manager.capture_pane(&tmux_name).await;
+                    match result {
+                        Ok(content) => self.set_preview_content(content, false),
+                        Err(_) => {
+                            self.set_preview_content(String::from("[unable to capture pane]"), false)
+                        }
+                    }
+                }
             } else {
                 let result = self.manager.capture_pane(&tmux_name).await;
                 match result {
