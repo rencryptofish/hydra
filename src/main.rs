@@ -115,10 +115,12 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
     let mut events = EventHandler::new(Duration::from_millis(250));
     let mut prev_mouse_captured = true;
 
-    // Main loop
-    loop {
-        terminal.draw(|frame| ui::draw(frame, &app))?;
+    // Draw initial frame before entering event loop
+    terminal.draw(|frame| ui::draw(frame, &app))?;
 
+    // Main loop: process events first, then draw — eliminates 0-250ms
+    // input→display latency from the old draw-then-wait pattern.
+    loop {
         if app.should_quit {
             break;
         }
@@ -146,7 +148,7 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
             Some(Event::Tick) => {
                 app.refresh_sessions().await;
                 app.refresh_preview().await;
-                app.refresh_messages().await;
+                app.refresh_messages();
             }
             Some(Event::Resize) => {}
             None => break,
@@ -161,6 +163,9 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
             }
             prev_mouse_captured = app.mouse_captured;
         }
+
+        // Draw after event handling — user sees result immediately
+        terminal.draw(|frame| ui::draw(frame, &app))?;
     }
 
     // Restore terminal

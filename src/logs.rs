@@ -25,7 +25,7 @@ async fn run_cmd_timeout(cmd: &mut Command) -> AnyhowResult<std::process::Output
 
 /// Per-session stats aggregated from Claude Code JSONL logs.
 /// Updated incrementally — only new bytes are parsed on each refresh.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SessionStats {
     pub turns: u32,
     pub tokens_in: u64,
@@ -263,7 +263,7 @@ fn update_session_stats_from_path(path: &std::path::Path, stats: &mut SessionSta
 
 /// Machine-wide stats for today, aggregated across all Claude Code JSONL logs.
 /// Updated incrementally — only new bytes are parsed on each refresh.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GlobalStats {
     pub tokens_in: u64,
     pub tokens_out: u64,
@@ -2059,6 +2059,84 @@ mod tests {
         let output = "node  12345 user  txt  REG  /home/.claude/tasks/not-a-valid-uuid-at-all-really-nope/file\n";
         let result = parse_uuid_from_lsof_output(output);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn update_global_stats_outer_covers_today_and_delegates() {
+        let _lock = HOME_LOCK.lock().unwrap();
+        let orig_home = std::env::var("HOME").ok();
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create a projects dir with a jsonl file for today
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let projects_dir = dir.path().join(".claude").join("projects").join("proj");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let line = format!(
+            r#"{{"type":"assistant","timestamp":"{today}T12:00:00Z","message":{{"usage":{{"input_tokens":100,"output_tokens":50}},"content":[]}}}}"#,
+        );
+        std::fs::write(projects_dir.join("s.jsonl"), format!("{line}\n")).unwrap();
+
+        std::env::set_var("HOME", dir.path());
+        let mut stats = GlobalStats::default();
+        update_global_stats(&mut stats);
+
+        assert_eq!(stats.tokens_in, 100, "should read tokens from HOME-based path");
+        assert_eq!(stats.date, today, "should set today's date");
+
+        if let Some(h) = orig_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn update_global_stats_outer_resets_on_date_change() {
+        let _lock = HOME_LOCK.lock().unwrap();
+        let orig_home = std::env::var("HOME").ok();
+        let dir = tempfile::tempdir().unwrap();
+
+        // No projects dir needed — we just want to test the reset logic
+        std::env::set_var("HOME", dir.path());
+
+        let mut stats = GlobalStats::default();
+        stats.date = "1999-01-01".to_string(); // old date
+        stats.tokens_in = 500;
+        stats.tokens_out = 200;
+        stats.tokens_cache_read = 100;
+        stats.tokens_cache_write = 50;
+
+        update_global_stats(&mut stats);
+
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert_eq!(stats.date, today, "date should be updated to today");
+        assert_eq!(stats.tokens_in, 0, "tokens_in should be reset on date change");
+        assert_eq!(stats.tokens_out, 0, "tokens_out should be reset on date change");
+
+        if let Some(h) = orig_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn global_stats_inner_false_positive_assistant_line_skipped() {
+        // A line that contains "assistant" and "usage" text but has wrong type
+        let dir = tempfile::tempdir().unwrap();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        let subdir = dir.path().join("proj");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let line = format!(
+            r#"{{"type":"system","text":"assistant usage stats for {today}","message":{{"usage":{{"input_tokens":999}}}}}}"#,
+        );
+        std::fs::write(subdir.join("s.jsonl"), format!("{line}\n")).unwrap();
+
+        let mut stats = GlobalStats::default();
+        stats.date = today.clone();
+        update_global_stats_inner(&mut stats, &today, Some(dir.path()));
+        assert_eq!(stats.tokens_in, 0, "should skip lines where type != assistant");
     }
 
     // ── read_last_assistant_message via temp files ──

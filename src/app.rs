@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -8,6 +8,15 @@ use ratatui::layout::{Position, Rect};
 
 use crate::logs::{GlobalStats, SessionStats};
 use crate::session::{AgentType, Session, SessionStatus};
+
+/// Results from a background message/stats refresh task.
+pub struct MessageRefreshResult {
+    pub log_uuids: HashMap<String, String>,
+    pub last_messages: HashMap<String, String>,
+    pub session_stats: HashMap<String, SessionStats>,
+    pub global_stats: GlobalStats,
+    pub diff_files: Vec<DiffFile>,
+}
 use crate::tmux::{SessionManager, TmuxSessionManager};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +43,8 @@ pub struct App {
     pub preview_area: Cell<Rect>,
     pub preview_scroll_offset: u16,
     prev_captures: HashMap<String, String>,
+    /// Raw (un-normalized) pane captures for skip-normalization optimization.
+    raw_captures: HashMap<String, String>,
     /// Consecutive ticks with unchanged pane content (for Running→Idle debounce).
     idle_ticks: HashMap<String, u8>,
     /// Consecutive ticks with changed pane content (for Idle→Running debounce).
@@ -59,6 +70,11 @@ pub struct App {
     pub pending_literal_keys: Option<(String, String)>,
     /// When false, mouse capture is disabled so the terminal handles text selection natively.
     pub mouse_captured: bool,
+    /// Cached diff tree lines: (diff_files, width, rendered lines).
+    /// Updated lazily in draw_sidebar to avoid recomputing on every frame.
+    pub diff_tree_cache: RefCell<(Vec<DiffFile>, usize, Vec<ratatui::text::Line<'static>>)>,
+    /// Background refresh channel for async message/stats/diff updates.
+    bg_refresh_rx: Option<tokio::sync::oneshot::Receiver<MessageRefreshResult>>,
 }
 
 impl App {
@@ -86,6 +102,7 @@ impl App {
             preview_area: Cell::new(Rect::default()),
             preview_scroll_offset: 0,
             prev_captures: HashMap::new(),
+            raw_captures: HashMap::new(),
             idle_ticks: HashMap::new(),
             changed_ticks: HashMap::new(),
             task_starts: HashMap::new(),
@@ -102,6 +119,8 @@ impl App {
             preview_has_scrollback: false,
             pending_literal_keys: None,
             mouse_captured: true,
+            diff_tree_cache: RefCell::new((Vec::new(), 0, Vec::new())),
+            bg_refresh_rx: None,
         }
     }
 
@@ -164,11 +183,23 @@ impl App {
                     let idle_threshold: u8 = if log_idle { 3 } else { 12 };
 
                     if let Some(content) = captures.get(&name) {
-                        let normalized = normalize_capture(content);
-                        let prev = self.prev_captures.get(&name);
-                        let first_capture = prev.is_none();
-                        let unchanged = prev.is_some_and(|p| *p == normalized);
-                        self.prev_captures.insert(name.clone(), normalized);
+                        let raw_prev = self.raw_captures.get(&name);
+                        let first_capture = raw_prev.is_none();
+                        let raw_unchanged =
+                            !first_capture && raw_prev.unwrap() == content;
+                        self.raw_captures.insert(name.clone(), content.clone());
+
+                        // If raw content is identical, skip normalization entirely.
+                        // Only normalize when raw differs (to filter spinner noise).
+                        let unchanged = if raw_unchanged {
+                            true
+                        } else {
+                            let normalized = normalize_capture(content);
+                            let prev = self.prev_captures.get(&name);
+                            let result = prev.is_some_and(|p| *p == normalized);
+                            self.prev_captures.insert(name.clone(), normalized);
+                            result
+                        };
 
                         if first_capture {
                             // Brand-new session — assume Running until debounce says otherwise.
@@ -272,6 +303,7 @@ impl App {
             let live_keys: std::collections::HashSet<&String> =
                 self.sessions.iter().map(|s| &s.tmux_name).collect();
             self.prev_captures.retain(|k, _| live_keys.contains(k));
+            self.raw_captures.retain(|k, _| live_keys.contains(k));
             self.idle_ticks.retain(|k, _| live_keys.contains(k));
             self.changed_ticks.retain(|k, _| live_keys.contains(k));
             self.task_starts.retain(|k, _| live_keys.contains(k));
@@ -341,41 +373,63 @@ impl App {
         }
     }
 
-    pub async fn refresh_messages(&mut self) {
+    /// Poll for background refresh results and spawn new background tasks.
+    /// Non-blocking: spawns heavy I/O (JSONL parsing, git diff, UUID resolution)
+    /// on a background tokio task and polls results via oneshot channel.
+    pub fn refresh_messages(&mut self) {
+        // Always poll for completed background results
+        if let Some(mut rx) = self.bg_refresh_rx.take() {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.log_uuids.extend(result.log_uuids);
+                    self.last_messages.extend(result.last_messages);
+                    self.session_stats = result.session_stats;
+                    self.global_stats = result.global_stats;
+                    self.diff_files = result.diff_files;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    // Still running, put it back
+                    self.bg_refresh_rx = Some(rx);
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    // Task panicked or was dropped
+                }
+            }
+        }
+
         self.message_tick = self.message_tick.wrapping_add(1);
         // Run every 20 ticks (~5 seconds at 250ms interval)
         if self.message_tick % 20 != 0 {
             return;
         }
 
-        for session in &self.sessions {
-            let tmux_name = &session.tmux_name;
-
-            // Try to resolve UUID if not cached
-            if !self.log_uuids.contains_key(tmux_name) {
-                if let Some(uuid) = crate::logs::resolve_session_uuid(tmux_name).await {
-                    self.log_uuids.insert(tmux_name.clone(), uuid);
-                }
-            }
-
-            // Read last message and update stats if UUID is known
-            if let Some(uuid) = self.log_uuids.get(tmux_name).cloned() {
-                if let Some(msg) = crate::logs::read_last_assistant_message(&self.cwd, &uuid) {
-                    self.last_messages.insert(tmux_name.clone(), msg);
-                }
-                let stats = self
-                    .session_stats
-                    .entry(tmux_name.clone())
-                    .or_default();
-                crate::logs::update_session_stats(&self.cwd, &uuid, stats);
-            }
+        // Don't start a new background task if one is already running
+        if self.bg_refresh_rx.is_some() {
+            return;
         }
 
-        // Refresh machine-wide stats for today
-        crate::logs::update_global_stats(&mut self.global_stats);
+        // Clone data for background task
+        let tmux_names: Vec<String> =
+            self.sessions.iter().map(|s| s.tmux_name.clone()).collect();
+        let log_uuids = self.log_uuids.clone();
+        let session_stats = self.session_stats.clone();
+        let global_stats = self.global_stats.clone();
+        let cwd = self.cwd.clone();
 
-        // Refresh per-file git diff stats
-        self.diff_files = get_git_diff_numstat(&self.cwd).await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.bg_refresh_rx = Some(rx);
+
+        tokio::spawn(async move {
+            let result = compute_message_refresh(
+                tmux_names,
+                log_uuids,
+                session_stats,
+                global_stats,
+                cwd,
+            )
+            .await;
+            let _ = tx.send(result);
+        });
     }
 
     pub fn select_next(&mut self) {
@@ -758,6 +812,50 @@ pub struct DiffFile {
     pub untracked: bool,
 }
 
+/// Background task: compute message refresh results off the main event loop.
+/// Runs UUID resolution, JSONL parsing, global stats, and git diff in a background task.
+async fn compute_message_refresh(
+    tmux_names: Vec<String>,
+    mut log_uuids: HashMap<String, String>,
+    mut session_stats: HashMap<String, SessionStats>,
+    mut global_stats: GlobalStats,
+    cwd: String,
+) -> MessageRefreshResult {
+    let mut last_messages = HashMap::new();
+
+    for tmux_name in &tmux_names {
+        // Try to resolve UUID if not cached
+        if !log_uuids.contains_key(tmux_name) {
+            if let Some(uuid) = crate::logs::resolve_session_uuid(tmux_name).await {
+                log_uuids.insert(tmux_name.clone(), uuid);
+            }
+        }
+
+        // Read last message and update stats if UUID is known
+        if let Some(uuid) = log_uuids.get(tmux_name).cloned() {
+            if let Some(msg) = crate::logs::read_last_assistant_message(&cwd, &uuid) {
+                last_messages.insert(tmux_name.clone(), msg);
+            }
+            let stats = session_stats.entry(tmux_name.clone()).or_default();
+            crate::logs::update_session_stats(&cwd, &uuid, stats);
+        }
+    }
+
+    // Refresh machine-wide stats for today
+    crate::logs::update_global_stats(&mut global_stats);
+
+    // Refresh per-file git diff stats
+    let diff_files = get_git_diff_numstat(&cwd).await;
+
+    MessageRefreshResult {
+        log_uuids,
+        last_messages,
+        session_stats,
+        global_stats,
+        diff_files,
+    }
+}
+
 /// Normalize captured pane content to reduce noise from spinners and cursors.
 /// Strips braille spinner characters (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏), common line-drawing
 /// spinners (|/-\), trailing whitespace, and ANSI escape sequences so that
@@ -882,6 +980,11 @@ mod tests {
 
     /// Configurable mock that covers all SessionManager error/success paths.
     /// Use builder methods to override specific behaviors; defaults return Ok.
+    /// Unified mock that handles all SessionManager test scenarios:
+    /// - Error injection via `with_*_error()` builders
+    /// - Call tracking for send_keys/send_keys_literal via shared Arc<Mutex<Vec>>
+    /// - Capture call counting via AtomicUsize
+    /// - Dynamic capture responses via `capture_fn`
     struct MockSessionManager {
         sessions: Vec<Session>,
         create_result: Result<String, String>,
@@ -889,6 +992,13 @@ mod tests {
         capture_result: Option<Result<String, String>>,
         kill_result: Option<Result<(), String>>,
         scrollback_result: Option<Result<String, String>>,
+        // Call tracking
+        sent_keys: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        sent_literals: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        capture_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        scrollback_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        // Dynamic capture: if set, capture_pane calls this with the call index
+        capture_fn: Option<std::sync::Arc<dyn Fn(usize) -> String + Send + Sync>>,
     }
 
     impl MockSessionManager {
@@ -900,17 +1010,17 @@ mod tests {
                 capture_result: None,
                 kill_result: None,
                 scrollback_result: None,
+                sent_keys: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                sent_literals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                capture_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                scrollback_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                capture_fn: None,
             }
         }
         fn with_sessions(sessions: Vec<Session>) -> Self {
-            Self {
-                sessions,
-                create_result: Ok("mock-session".to_string()),
-                list_result: None,
-                capture_result: None,
-                kill_result: None,
-                scrollback_result: None,
-            }
+            let mut m = Self::new();
+            m.sessions = sessions;
+            m
         }
         fn with_list_error(mut self, msg: &str) -> Self {
             self.list_result = Some(Err(msg.to_string()));
@@ -926,6 +1036,13 @@ mod tests {
         }
         fn with_kill_error(mut self, msg: &str) -> Self {
             self.kill_result = Some(Err(msg.to_string()));
+            self
+        }
+        fn with_capture_fn<F>(mut self, f: F) -> Self
+        where
+            F: Fn(usize) -> String + Send + Sync + 'static,
+        {
+            self.capture_fn = Some(std::sync::Arc::new(f));
             self
         }
     }
@@ -949,9 +1066,16 @@ mod tests {
             self.create_result.clone().map_err(|e| anyhow::anyhow!(e))
         }
         async fn capture_pane(&self, _tmux_name: &str) -> anyhow::Result<String> {
+            let n = self.capture_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             match &self.capture_result {
                 Some(Err(msg)) => Err(anyhow::anyhow!("{}", msg)),
-                _ => Ok("mock pane content".to_string()),
+                _ => {
+                    if let Some(f) = &self.capture_fn {
+                        Ok(f(n))
+                    } else {
+                        Ok("mock pane content".to_string())
+                    }
+                }
             }
         }
         async fn kill_session(&self, _tmux_name: &str) -> anyhow::Result<()> {
@@ -960,10 +1084,16 @@ mod tests {
                 _ => Ok(()),
             }
         }
-        async fn send_keys(&self, _tmux_name: &str, _key: &str) -> anyhow::Result<()> {
+        async fn send_keys(&self, tmux_name: &str, key: &str) -> anyhow::Result<()> {
+            self.sent_keys.lock().unwrap().push((tmux_name.to_string(), key.to_string()));
+            Ok(())
+        }
+        async fn send_keys_literal(&self, tmux_name: &str, text: &str) -> anyhow::Result<()> {
+            self.sent_literals.lock().unwrap().push((tmux_name.to_string(), text.to_string()));
             Ok(())
         }
         async fn capture_pane_scrollback(&self, _tmux_name: &str) -> anyhow::Result<String> {
+            self.scrollback_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             match &self.scrollback_result {
                 Some(Err(msg)) => Err(anyhow::anyhow!("{}", msg)),
                 _ => Ok("mock pane content".to_string()),
@@ -1010,53 +1140,6 @@ mod tests {
             status,
             task_elapsed: None,
             _alive: true,
-        }
-    }
-
-    // ── Shared inline mocks for tests that need call tracking ────────
-
-    /// Mock that records every `send_keys` call for verification.
-    struct TrackingManager {
-        sent_keys: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
-    }
-    #[async_trait::async_trait]
-    impl SessionManager for TrackingManager {
-        async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> { Ok(vec![]) }
-        async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
-            Ok(String::new())
-        }
-        async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-        async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn send_keys(&self, tmux_name: &str, key: &str) -> anyhow::Result<()> {
-            self.sent_keys.lock().unwrap().push((tmux_name.to_string(), key.to_string()));
-            Ok(())
-        }
-        async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-    }
-
-    /// Mock that counts `capture_pane` and `capture_pane_scrollback` calls.
-    struct CaptureCounter {
-        sessions: Vec<Session>,
-        pane_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        scrollback_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    }
-    #[async_trait::async_trait]
-    impl SessionManager for CaptureCounter {
-        async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> {
-            Ok(self.sessions.clone())
-        }
-        async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
-            Ok(String::new())
-        }
-        async fn capture_pane(&self, _: &str) -> anyhow::Result<String> {
-            self.pane_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok("pane-capture".to_string())
-        }
-        async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> {
-            self.scrollback_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok("scrollback-capture".to_string())
         }
     }
 
@@ -1970,7 +2053,7 @@ mod tests {
     async fn refresh_messages_only_runs_every_20_ticks() {
         let mut app = test_app();
         // message_tick starts at 0, first call increments to 1
-        app.refresh_messages().await;
+        app.refresh_messages();
         // No panic, no messages (no sessions)
         assert_eq!(app.message_tick, 1);
     }
@@ -2434,7 +2517,8 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let sent_keys = Arc::new(Mutex::new(Vec::new()));
-        let manager = TrackingManager { sent_keys: sent_keys.clone() };
+        let mut manager = MockSessionManager::new();
+        manager.sent_keys = sent_keys.clone();
 
         let mut app = App::new_with_manager(
             "testid".to_string(),
@@ -2458,7 +2542,8 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let sent_keys = Arc::new(Mutex::new(Vec::new()));
-        let manager = TrackingManager { sent_keys: sent_keys.clone() };
+        let mut manager = MockSessionManager::new();
+        manager.sent_keys = sent_keys.clone();
 
         let mut app = App::new_with_manager(
             "testid".to_string(),
@@ -2627,7 +2712,8 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let sent_keys = Arc::new(Mutex::new(Vec::new()));
-        let manager = TrackingManager { sent_keys: sent_keys.clone() };
+        let mut manager = MockSessionManager::new();
+        manager.sent_keys = sent_keys.clone();
 
         let mut app = App::new_with_manager(
             "testid".to_string(),
@@ -2718,16 +2804,85 @@ mod tests {
         let mut app = test_app();
         // Start at tick 19 so the next call (tick 20) triggers the inner loop
         app.message_tick = 19;
-        app.refresh_messages().await;
+        app.refresh_messages();
         assert_eq!(app.message_tick, 20);
         // No panic and no sessions to process — this just covers the tick check
+    }
+
+    #[tokio::test]
+    async fn refresh_messages_applies_completed_bg_result() {
+        let mut app = test_app();
+
+        // Create a completed oneshot with a MessageRefreshResult
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut result = MessageRefreshResult {
+            log_uuids: std::collections::HashMap::new(),
+            last_messages: std::collections::HashMap::new(),
+            session_stats: std::collections::HashMap::new(),
+            global_stats: crate::logs::GlobalStats::default(),
+            diff_files: vec![],
+        };
+        result.last_messages.insert("test-session".to_string(), "hello world".to_string());
+        tx.send(result).ok(); // ignore error (can't unwrap without Debug on the error type)
+
+        app.bg_refresh_rx = Some(rx);
+        app.refresh_messages();
+
+        assert_eq!(
+            app.last_messages.get("test-session").map(|s| s.as_str()),
+            Some("hello world"),
+            "should apply completed background result"
+        );
+        assert!(app.bg_refresh_rx.is_none(), "should consume the channel");
+    }
+
+    #[tokio::test]
+    async fn refresh_messages_keeps_pending_bg_task() {
+        let mut app = test_app();
+
+        // Create a oneshot where we keep the sender (task still running)
+        let (tx, rx) = tokio::sync::oneshot::channel::<MessageRefreshResult>();
+        app.bg_refresh_rx = Some(rx);
+        app.refresh_messages();
+
+        assert!(app.bg_refresh_rx.is_some(), "should put receiver back when task is still running");
+        drop(tx); // cleanup
+    }
+
+    #[tokio::test]
+    async fn refresh_messages_handles_dropped_bg_task() {
+        let mut app = test_app();
+
+        // Create a oneshot and immediately drop the sender (simulates task panic)
+        let (_tx, rx) = tokio::sync::oneshot::channel::<MessageRefreshResult>();
+        drop(_tx);
+        app.bg_refresh_rx = Some(rx);
+        app.refresh_messages();
+
+        assert!(app.bg_refresh_rx.is_none(), "should clear channel when task was dropped");
+    }
+
+    #[tokio::test]
+    async fn refresh_messages_skips_spawn_when_bg_task_running() {
+        let mut app = test_app();
+        // Simulate a running background task with a pending oneshot
+        let (_tx, rx) = tokio::sync::oneshot::channel::<MessageRefreshResult>();
+        app.bg_refresh_rx = Some(rx);
+
+        // Set tick to 19 so next call would normally trigger a new bg task
+        app.message_tick = 19;
+        app.refresh_messages();
+        assert_eq!(app.message_tick, 20);
+        // bg_refresh_rx should still be set (the pending one, not a new one)
+        assert!(app.bg_refresh_rx.is_some(), "should not start new bg task when one is running");
+        drop(_tx);
     }
 
     #[tokio::test]
     async fn refresh_messages_wraps_tick_counter() {
         let mut app = test_app();
         app.message_tick = 255; // u8::MAX
-        app.refresh_messages().await;
+        app.refresh_messages();
         assert_eq!(app.message_tick, 0, "tick counter should wrap around");
     }
 
@@ -3160,37 +3315,9 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_sessions_changed_content_triggers_running_after_two_ticks() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-
-        // A manager that returns alternating capture content so content changes each tick
-        struct AlternatingManager {
-            sessions: Vec<Session>,
-            call_count: Arc<AtomicUsize>,
-        }
-        #[async_trait::async_trait]
-        impl SessionManager for AlternatingManager {
-            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> {
-                Ok(self.sessions.clone())
-            }
-            async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
-                Ok(String::new())
-            }
-            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> {
-                let n = self.call_count.fetch_add(1, Ordering::SeqCst);
-                Ok(format!("output {n}"))
-            }
-            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-        }
-
         let sessions = vec![make_session("s1", AgentType::Claude)];
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let manager = AlternatingManager {
-            sessions: sessions.clone(),
-            call_count: call_count.clone(),
-        };
+        let manager = MockSessionManager::with_sessions(sessions)
+            .with_capture_fn(|n| format!("output {n}"));
 
         let mut app = App::new_with_manager(
             "testid".to_string(),
@@ -3215,43 +3342,16 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_sessions_changed_after_idle_resets_idle_ticks() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-
-        // Manager returns same content for first N calls, then starts changing
-        struct PhaseManager {
-            sessions: Vec<Session>,
-            call_count: Arc<AtomicUsize>,
-        }
-        #[async_trait::async_trait]
-        impl SessionManager for PhaseManager {
-            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> {
-                Ok(self.sessions.clone())
-            }
-            async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
-                Ok(String::new())
-            }
-            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> {
-                let n = self.call_count.fetch_add(1, Ordering::SeqCst);
-                // First 14 calls return same content (to get to Idle),
-                // then alternate to trigger changed_ticks
-                if n < 14 {
-                    Ok("stable".to_string())
-                } else {
-                    Ok(format!("changing {n}"))
-                }
-            }
-            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-        }
-
         let sessions = vec![make_session("s1", AgentType::Claude)];
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let manager = PhaseManager {
-            sessions: sessions.clone(),
-            call_count: call_count.clone(),
-        };
+        // First 14 calls return same content (to get to Idle),
+        // then alternate to trigger changed_ticks
+        let manager = MockSessionManager::with_sessions(sessions).with_capture_fn(|n| {
+            if n < 14 {
+                "stable".to_string()
+            } else {
+                format!("changing {n}")
+            }
+        });
 
         let mut app = App::new_with_manager(
             "testid".to_string(),
@@ -3327,17 +3427,13 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_preview_uses_cached_pane_capture_from_refresh_sessions() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
 
         let sessions = vec![make_session("s1", AgentType::Claude)];
-        let pane_calls = Arc::new(AtomicUsize::new(0));
-        let scrollback_calls = Arc::new(AtomicUsize::new(0));
-        let manager = CaptureCounter {
-            sessions: sessions.clone(),
-            pane_calls: pane_calls.clone(),
-            scrollback_calls: scrollback_calls.clone(),
-        };
+        let manager = MockSessionManager::with_sessions(sessions)
+            .with_capture_fn(|_| "pane-capture".to_string());
+        let pane_calls = manager.capture_count.clone();
+        let scrollback_calls = manager.scrollback_count.clone();
         let mut app = App::new_with_manager(
             "testid".to_string(),
             "/tmp/test".to_string(),
@@ -3363,17 +3459,13 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_preview_scrollback_captured_once_while_scrolled() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
 
         let sessions = vec![make_session("s1", AgentType::Claude)];
-        let pane_calls = Arc::new(AtomicUsize::new(0));
-        let scrollback_calls = Arc::new(AtomicUsize::new(0));
-        let manager = CaptureCounter {
-            sessions: sessions.clone(),
-            pane_calls: pane_calls.clone(),
-            scrollback_calls: scrollback_calls.clone(),
-        };
+        let manager = MockSessionManager::with_sessions(sessions)
+            .with_capture_fn(|_| "pane-capture".to_string());
+        let pane_calls = manager.capture_count.clone();
+        let scrollback_calls = manager.scrollback_count.clone();
         let mut app = App::new_with_manager(
             "testid".to_string(),
             "/tmp/test".to_string(),
@@ -3386,7 +3478,7 @@ mod tests {
 
         app.preview_scroll_offset = 1;
         app.refresh_preview().await;
-        assert_eq!(app.preview, "scrollback-capture");
+        assert_eq!(app.preview, "mock pane content"); // scrollback returns default
         assert_eq!(
             scrollback_calls.load(Ordering::SeqCst),
             1,
@@ -3418,29 +3510,8 @@ mod tests {
 
     #[tokio::test]
     async fn flush_pending_keys_sends_and_clears() {
-        use std::sync::{Arc, Mutex};
-
-        struct LiteralTracker {
-            sent: Arc<Mutex<Vec<(String, String)>>>,
-        }
-        #[async_trait::async_trait]
-        impl SessionManager for LiteralTracker {
-            async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> { Ok(vec![]) }
-            async fn create_session(&self, _: &str, _: &str, _: &AgentType, _: &str, _: Option<&str>) -> anyhow::Result<String> {
-                Ok(String::new())
-            }
-            async fn capture_pane(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-            async fn kill_session(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
-            async fn send_keys_literal(&self, tmux_name: &str, text: &str) -> anyhow::Result<()> {
-                self.sent.lock().unwrap().push((tmux_name.to_string(), text.to_string()));
-                Ok(())
-            }
-            async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> { Ok(String::new()) }
-        }
-
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let manager = LiteralTracker { sent: sent.clone() };
+        let manager = MockSessionManager::new();
+        let sent = manager.sent_literals.clone();
 
         let mut app = App::new_with_manager(
             "testid".to_string(),

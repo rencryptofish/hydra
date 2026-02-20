@@ -54,7 +54,21 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
 
     let stats_height = if has_stats { 3 } else { 0 }; // 1 line + top/bottom border
 
-    let tree_lines = build_diff_tree_lines(&app.diff_files, area.width.saturating_sub(2) as usize);
+    // Update diff tree cache if inputs changed (diff_files or sidebar width).
+    // Avoids recomputing sort + format on every frame (~4+ FPS) when data
+    // only changes every ~5 seconds.
+    let width = area.width.saturating_sub(2) as usize;
+    {
+        let mut cache = app.diff_tree_cache.borrow_mut();
+        if cache.0 != app.diff_files || cache.1 != width {
+            cache.2 = build_diff_tree_lines(&app.diff_files, width);
+            cache.0 = app.diff_files.clone();
+            cache.1 = width;
+        }
+    }
+    let cache = app.diff_tree_cache.borrow();
+    let tree_lines = &cache.2;
+
     let max_tree_rows: u16 = 8;
     let tree_height = if tree_lines.is_empty() {
         0
@@ -81,7 +95,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     // `selected_visual_row` maps app.selected (session index) to the
     // visual row in the list (accounting for header items).
     let inner_width = list_area.width.saturating_sub(2) as usize; // inside border
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(Color::White);
     let mut items: Vec<ListItem> = Vec::new();
     let mut selected_visual_row: usize = 0;
     let mut current_group: Option<u8> = None;
@@ -100,7 +114,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             let header_spans = vec![
                 Span::styled(dashes_left, dim),
                 Span::styled("● ", Style::default().fg(dot_color)),
-                Span::styled(label, dim),
+                Span::styled(label, Style::default().fg(Color::White)),
                 Span::styled(dashes_right, dim),
             ];
             items.push(ListItem::new(Line::from(header_spans)));
@@ -126,7 +140,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         if let Some(elapsed) = session.task_elapsed {
             spans.push(Span::styled(
                 format!(" {}", format_duration(elapsed)),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::White),
             ));
         }
         let mut lines = vec![Line::from(spans)];
@@ -140,7 +154,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             };
             lines.push(Line::from(Span::styled(
                 display,
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::White),
             )));
         }
         items.push(ListItem::new(lines));
@@ -186,12 +200,12 @@ fn truncate_chars(s: &str, max: usize) -> String {
 ///    app.rs       +45-12
 ///    ui.rs        +30-5
 ///   README.md     +3
-fn build_diff_tree_lines<'a>(diff_files: &[crate::app::DiffFile], width: usize) -> Vec<Line<'a>> {
+pub fn build_diff_tree_lines(diff_files: &[crate::app::DiffFile], width: usize) -> Vec<Line<'static>> {
     if diff_files.is_empty() {
         return vec![];
     }
 
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(Color::White);
     let green = Style::default().fg(Color::Green);
     let red = Style::default().fg(Color::Red);
     let cyan = Style::default().fg(Color::Cyan);
@@ -261,7 +275,7 @@ fn build_diff_tree_lines<'a>(diff_files: &[crate::app::DiffFile], width: usize) 
         let pad_str: String = " ".repeat(padding);
 
         let mut spans = vec![
-            Span::styled(format!("{indent}{name}{pad_str}"), dim),
+            Span::styled(format!("{indent}{name}{pad_str}"), Style::default().fg(Color::White)),
         ];
 
         if f.untracked {
@@ -317,7 +331,7 @@ fn draw_stats(frame: &mut Frame, app: &App, area: Rect) {
     // Edits are hydra-specific (per-session)
     let total_edits: u16 = app.session_stats.values().map(|s| s.edits).sum();
 
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(Color::White);
     let val = Style::default().fg(Color::White);
 
     // Total diff across all files

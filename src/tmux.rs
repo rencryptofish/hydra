@@ -6,8 +6,11 @@ use tokio::process::Command;
 
 use crate::session::{parse_session_name, AgentType, Session, SessionStatus};
 
-/// Default timeout for subprocess calls (5 seconds).
-const CMD_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default timeout for subprocess calls (2 seconds).
+const CMD_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Longer timeout for scrollback capture (can be large).
+const CMD_TIMEOUT_LONG: Duration = Duration::from_secs(5);
 
 /// Run a Command with a timeout, returning its Output.
 /// On timeout or spawn failure, returns an anyhow error.
@@ -288,13 +291,22 @@ pub async fn capture_pane(tmux_name: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
-/// Capture the full scrollback buffer of a tmux session.
+/// Capture the scrollback buffer of a tmux session (last 5000 lines).
 pub async fn capture_pane_scrollback(tmux_name: &str) -> Result<String> {
-    let output = run_cmd_timeout(
-        Command::new("tmux").args(["capture-pane", "-t", tmux_name, "-p", "-S", "-"]),
+    let output = match tokio::time::timeout(
+        CMD_TIMEOUT_LONG,
+        Command::new("tmux")
+            .args(["capture-pane", "-t", tmux_name, "-p", "-S", "-5000"])
+            .output(),
     )
     .await
-    .context("Failed to capture tmux pane scrollback")?;
+    {
+        Ok(result) => result.context("Failed to capture tmux pane scrollback")?,
+        Err(_) => bail!(
+            "capture_pane_scrollback timed out after {}s",
+            CMD_TIMEOUT_LONG.as_secs()
+        ),
+    };
 
     if !output.status.success() {
         return Ok(String::from("[session not available]"));
@@ -308,32 +320,29 @@ pub async fn capture_pane_scrollback(tmux_name: &str) -> Result<String> {
 }
 
 /// Send a key to a tmux session via `tmux send-keys`.
+/// Fire-and-forget: spawns the subprocess and reaps it in the background.
+/// The exit code provides no actionable info (session-not-found is discovered on next tick).
 pub async fn send_keys(tmux_name: &str, key: &str) -> Result<()> {
-    let status = run_status_timeout(
-        Command::new("tmux").args(["send-keys", "-t", tmux_name, key]),
-    )
-    .await
-    .context("Failed to send keys to tmux session")?;
-
-    if !status.success() {
-        bail!("tmux send-keys failed for '{tmux_name}'");
-    }
-
+    let mut child = Command::new("tmux")
+        .args(["send-keys", "-t", tmux_name, key])
+        .spawn()
+        .context("Failed to spawn tmux send-keys")?;
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
+    });
     Ok(())
 }
 
 /// Send literal text (including raw escape sequences) to a tmux session.
+/// Fire-and-forget: spawns the subprocess and reaps it in the background.
 pub async fn send_keys_literal(tmux_name: &str, text: &str) -> Result<()> {
-    let status = run_status_timeout(
-        Command::new("tmux").args(["send-keys", "-t", tmux_name, "-l", text]),
-    )
-    .await
-    .context("Failed to send literal keys to tmux session")?;
-
-    if !status.success() {
-        bail!("tmux send-keys -l failed for '{tmux_name}'");
-    }
-
+    let mut child = Command::new("tmux")
+        .args(["send-keys", "-t", tmux_name, "-l", text])
+        .spawn()
+        .context("Failed to spawn tmux send-keys -l")?;
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
+    });
     Ok(())
 }
 
