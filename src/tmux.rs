@@ -41,7 +41,21 @@ pub trait SessionManager: Send + Sync {
     async fn capture_pane(&self, tmux_name: &str) -> Result<String>;
     async fn kill_session(&self, tmux_name: &str) -> Result<()>;
     async fn send_keys(&self, tmux_name: &str, key: &str) -> Result<()>;
+    /// Send literal text (including escape sequences) via `tmux send-keys -l`.
+    async fn send_keys_literal(&self, _tmux_name: &str, _text: &str) -> Result<()> {
+        Ok(())
+    }
     async fn capture_pane_scrollback(&self, tmux_name: &str) -> Result<String>;
+
+    /// Batch-capture pane content for multiple sessions. Default impl is sequential;
+    /// `TmuxSessionManager` overrides with parallel subprocess calls.
+    async fn capture_panes(&self, names: &[String]) -> Vec<Result<String>> {
+        let mut results = Vec::with_capacity(names.len());
+        for name in names {
+            results.push(self.capture_pane(name).await);
+        }
+        results
+    }
 }
 
 pub struct TmuxSessionManager {
@@ -76,8 +90,9 @@ impl SessionManager for TmuxSessionManager {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let prefix = format!("hydra-{project_id}-");
-        let mut sessions = Vec::new();
 
+        // Pass 1: Parse session names and resolve agent types (cached, no subprocess)
+        let mut parsed: Vec<(String, String, AgentType)> = Vec::new();
         for line in stdout.lines() {
             let tmux_name = line.trim();
             if !tmux_name.starts_with(&prefix) {
@@ -104,22 +119,33 @@ impl SessionManager for TmuxSessionManager {
                 }
             };
 
-            let status = if is_pane_dead(tmux_name).await {
-                SessionStatus::Exited
-            } else {
-                // Default to Idle; App will upgrade to Running via content comparison
-                SessionStatus::Idle
-            };
-
-            sessions.push(Session {
-                name,
-                tmux_name: tmux_name.to_string(),
-                agent_type,
-                status,
-                task_elapsed: None,
-                _alive: true,
-            });
+            parsed.push((name, tmux_name.to_string(), agent_type));
         }
+
+        // Pass 2: Run all is_pane_dead checks in parallel
+        let dead_futures = parsed.iter().map(|(_, tmux_name, _)| is_pane_dead(tmux_name));
+        let dead_results = futures::future::join_all(dead_futures).await;
+
+        let sessions = parsed
+            .into_iter()
+            .zip(dead_results)
+            .map(|((name, tmux_name, agent_type), dead)| {
+                let status = if dead {
+                    SessionStatus::Exited
+                } else {
+                    // Default to Idle; App will upgrade to Running via content comparison
+                    SessionStatus::Idle
+                };
+                Session {
+                    name,
+                    tmux_name,
+                    agent_type,
+                    status,
+                    task_elapsed: None,
+                    _alive: true,
+                }
+            })
+            .collect();
 
         Ok(sessions)
     }
@@ -144,12 +170,21 @@ impl SessionManager for TmuxSessionManager {
         capture_pane(tmux_name).await
     }
 
+    async fn capture_panes(&self, names: &[String]) -> Vec<Result<String>> {
+        let futs = names.iter().map(|n| capture_pane(n));
+        futures::future::join_all(futs).await
+    }
+
     async fn kill_session(&self, tmux_name: &str) -> Result<()> {
         kill_session(tmux_name).await
     }
 
     async fn send_keys(&self, tmux_name: &str, key: &str) -> Result<()> {
         send_keys(tmux_name, key).await
+    }
+
+    async fn send_keys_literal(&self, tmux_name: &str, text: &str) -> Result<()> {
+        send_keys_literal(tmux_name, text).await
     }
 
     async fn capture_pane_scrollback(&self, tmux_name: &str) -> Result<String> {
@@ -276,6 +311,21 @@ pub async fn send_keys(tmux_name: &str, key: &str) -> Result<()> {
 
     if !status.success() {
         bail!("tmux send-keys failed for '{tmux_name}'");
+    }
+
+    Ok(())
+}
+
+/// Send literal text (including raw escape sequences) to a tmux session.
+pub async fn send_keys_literal(tmux_name: &str, text: &str) -> Result<()> {
+    let status = run_status_timeout(
+        Command::new("tmux").args(["send-keys", "-t", tmux_name, "-l", text]),
+    )
+    .await
+    .context("Failed to send literal keys to tmux session")?;
+
+    if !status.success() {
+        bail!("tmux send-keys -l failed for '{tmux_name}'");
     }
 
     Ok(())

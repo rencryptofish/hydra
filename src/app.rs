@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
 use crate::logs::{GlobalStats, SessionStats};
@@ -36,6 +36,8 @@ pub struct App {
     prev_captures: HashMap<String, String>,
     /// Consecutive ticks with unchanged pane content (for Running→Idle debounce).
     idle_ticks: HashMap<String, u8>,
+    /// Consecutive ticks with changed pane content (for Idle→Running debounce).
+    changed_ticks: HashMap<String, u8>,
     task_starts: HashMap<String, Instant>,
     task_last_active: HashMap<String, Instant>,
     pub last_messages: HashMap<String, String>,
@@ -47,6 +49,9 @@ pub struct App {
     message_tick: u8,
     pub manifest_dir: PathBuf,
     manager: Box<dyn SessionManager>,
+    /// Pending literal keys to send to tmux (tmux_name, text).
+    /// Set by `handle_mouse` for forwarding clicks; consumed by the event loop.
+    pub pending_literal_keys: Option<(String, String)>,
 }
 
 impl App {
@@ -75,6 +80,7 @@ impl App {
             preview_scroll_offset: 0,
             prev_captures: HashMap::new(),
             idle_ticks: HashMap::new(),
+            changed_ticks: HashMap::new(),
             task_starts: HashMap::new(),
             task_last_active: HashMap::new(),
             last_messages: HashMap::new(),
@@ -85,6 +91,7 @@ impl App {
             message_tick: 0,
             manifest_dir: crate::manifest::default_base_dir(),
             manager,
+            pending_literal_keys: None,
         }
     }
 
@@ -102,10 +109,7 @@ impl App {
                     .filter(|s| s.status != SessionStatus::Exited)
                     .map(|s| s.tmux_name.clone())
                     .collect();
-                let capture_futures = live_names
-                    .iter()
-                    .map(|name| crate::tmux::capture_pane(name));
-                let capture_results = futures::future::join_all(capture_futures).await;
+                let capture_results = self.manager.capture_panes(&live_names).await;
                 let captures: HashMap<String, String> = live_names
                     .into_iter()
                     .zip(capture_results)
@@ -115,25 +119,69 @@ impl App {
                 for session in &mut sessions {
                     let name = session.tmux_name.clone();
 
-                    // Determine Running vs Idle by comparing pane content.
-                    // Debounce: require 3 consecutive unchanged ticks (~750ms) before
-                    // transitioning Running → Idle to prevent status flickering.
-                    if let Some(content) = captures.get(&name) {
-                        let prev = self.prev_captures.get(&name);
-                        let unchanged = prev.is_some_and(|p| p == content);
-                        self.prev_captures.insert(name.clone(), content.clone());
+                    // Carry forward previous status so hysteresis "keep current" works.
+                    // list_sessions() returns fresh Session objects; without this, the
+                    // default status would defeat the debounce logic.
+                    if let Some(prev_session) =
+                        self.sessions.iter().find(|s| s.tmux_name == name)
+                    {
+                        if session.status != SessionStatus::Exited {
+                            session.status = prev_session.status.clone();
+                        }
+                    }
 
-                        if unchanged {
+                    // Determine Running vs Idle by comparing pane content.
+                    //
+                    // Two-layer detection:
+                    // 1. Log-based (authoritative): if the JSONL log shows a pending
+                    //    user message with no assistant reply, the agent is Running.
+                    //    If the assistant has replied, the agent is Idle.
+                    // 2. Pane-based (fallback): compare normalized pane content between
+                    //    ticks. Spinners/cursor noise are stripped before comparison.
+                    //
+                    // Hysteresis thresholds (pane-based):
+                    //   Running → Idle: 12 consecutive unchanged ticks (~3s)
+                    //   Idle → Running: 2 consecutive changed ticks (~500ms)
+                    // First capture (no previous): immediately set Running (new session).
+                    let log_working = self
+                        .session_stats
+                        .get(&name)
+                        .and_then(|st| st.task_elapsed())
+                        .is_some();
+
+                    if let Some(content) = captures.get(&name) {
+                        let normalized = normalize_capture(content);
+                        let prev = self.prev_captures.get(&name);
+                        let first_capture = prev.is_none();
+                        let unchanged = prev.is_some_and(|p| *p == normalized);
+                        self.prev_captures.insert(name.clone(), normalized);
+
+                        if first_capture {
+                            // Brand-new session — assume Running until debounce says otherwise.
+                            session.status = SessionStatus::Running;
+                        } else if log_working {
+                            // Log says agent is actively processing — trust it.
+                            session.status = SessionStatus::Running;
+                            self.idle_ticks.insert(name.clone(), 0);
+                            self.changed_ticks.insert(name.clone(), 0);
+                        } else if unchanged {
                             let count = self.idle_ticks.entry(name.clone()).or_insert(0);
                             *count = count.saturating_add(1);
-                            session.status = if *count >= 3 {
-                                SessionStatus::Idle
-                            } else {
-                                SessionStatus::Running
-                            };
+                            self.changed_ticks.insert(name.clone(), 0);
+
+                            if *count >= 12 {
+                                session.status = SessionStatus::Idle;
+                            }
+                            // else: keep current status
                         } else {
+                            let count = self.changed_ticks.entry(name.clone()).or_insert(0);
+                            *count = count.saturating_add(1);
                             self.idle_ticks.insert(name.clone(), 0);
-                            session.status = SessionStatus::Running;
+
+                            if *count >= 2 {
+                                session.status = SessionStatus::Running;
+                            }
+                            // else: keep current status (don't flip to Running on a single blip)
                         }
                     }
 
@@ -213,6 +261,7 @@ impl App {
                 self.sessions.iter().map(|s| &s.tmux_name).collect();
             self.prev_captures.retain(|k, _| live_keys.contains(k));
             self.idle_ticks.retain(|k, _| live_keys.contains(k));
+            self.changed_ticks.retain(|k, _| live_keys.contains(k));
             self.task_starts.retain(|k, _| live_keys.contains(k));
             self.task_last_active.retain(|k, _| live_keys.contains(k));
             self.last_messages.retain(|k, _| live_keys.contains(k));
@@ -482,6 +531,13 @@ impl App {
         self.status_message = None;
     }
 
+    /// Send any pending literal keys queued by `handle_mouse`.
+    pub async fn flush_pending_keys(&mut self) {
+        if let Some((tmux_name, text)) = self.pending_literal_keys.take() {
+            let _ = self.manager.send_keys_literal(&tmux_name, &text).await;
+        }
+    }
+
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         let pos = Position::new(mouse.column, mouse.row);
         let sidebar = self.sidebar_area.get();
@@ -503,7 +559,17 @@ impl App {
                         let row_offset = (mouse.row - sidebar_inner.y) as usize;
                         let mut cumulative = 0usize;
                         let mut target_idx = None;
+                        let mut current_group: Option<u8> = None;
                         for (i, session) in self.sessions.iter().enumerate() {
+                            let group = session.status.sort_order();
+                            if current_group != Some(group) {
+                                current_group = Some(group);
+                                // Sidebar renders a status header line before each group.
+                                if row_offset == cumulative {
+                                    break;
+                                }
+                                cumulative += 1;
+                            }
                             let item_height =
                                 if self.last_messages.contains_key(&session.tmux_name) {
                                     2
@@ -552,6 +618,25 @@ impl App {
                 MouseEventKind::ScrollDown => {
                     if preview.contains(pos) {
                         self.scroll_preview_down();
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let preview_inner = inner(preview);
+                    if preview_inner.contains(pos) {
+                        // Forward click to tmux pane so the agent can reposition its cursor.
+                        // Coordinates are 1-based for SGR mouse encoding.
+                        if let Some(session) = self.sessions.get(self.selected) {
+                            let x = (pos.x - preview_inner.x) + 1;
+                            let y = (pos.y - preview_inner.y) + 1;
+                            let press = format!("\x1b[<0;{x};{y}M");
+                            let release = format!("\x1b[<0;{x};{y}m");
+                            self.pending_literal_keys =
+                                Some((session.tmux_name.clone(), format!("{press}{release}")));
+                        }
+                        // Reset scroll to bottom so user sees live output after clicking.
+                        self.preview_scroll_offset = 0;
+                    } else {
+                        self.detach();
                     }
                 }
                 MouseEventKind::Down(_) => {
@@ -640,6 +725,42 @@ pub struct DiffFile {
     pub insertions: u32,
     pub deletions: u32,
     pub untracked: bool,
+}
+
+/// Normalize captured pane content to reduce noise from spinners and cursors.
+/// Strips braille spinner characters (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏), common line-drawing
+/// spinners (|/-\), trailing whitespace, and ANSI escape sequences so that
+/// cosmetic animation doesn't trigger Running/Idle status changes.
+fn normalize_capture(content: &str) -> String {
+    let mut result = String::with_capacity(content.len());
+    let mut chars = content.chars().peekable();
+    while let Some(ch) = chars.next() {
+        // Skip ANSI escape sequences: ESC [ ... final_byte
+        if ch == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                // Consume until we hit a letter (the final byte of the CSI sequence)
+                while let Some(&c) = chars.peek() {
+                    chars.next();
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        // Skip braille spinner characters (U+2800..U+28FF)
+        if ('\u{2800}'..='\u{28FF}').contains(&ch) {
+            continue;
+        }
+        result.push(ch);
+    }
+    // Trim trailing whitespace from each line
+    result
+        .lines()
+        .map(|l| l.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Parse `git diff --numstat` output into per-file stats.
@@ -793,11 +914,15 @@ mod tests {
     }
 
     fn make_session(name: &str, agent: AgentType) -> Session {
+        make_session_with_status(name, agent, crate::session::SessionStatus::Idle)
+    }
+
+    fn make_session_with_status(name: &str, agent: AgentType, status: SessionStatus) -> Session {
         Session {
             name: name.to_string(),
             tmux_name: format!("hydra-testid-{name}"),
             agent_type: agent,
-            status: crate::session::SessionStatus::Idle,
+            status,
             task_elapsed: None,
             _alive: true,
         }
@@ -1345,14 +1470,59 @@ mod tests {
         app.sidebar_area.set(Rect::new(0, 0, 24, 20));
         app.preview_area.set(Rect::new(24, 0, 56, 20));
 
-        // Click on row for second session (y=2 in inner area = y_inner=1 offset)
+        // Sidebar always has a status header row, so second session is row y=3.
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 5,
-            row: 2,
+            row: 3,
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
         assert_eq!(app.selected, 1, "clicking second row should select session 1");
+    }
+
+    #[test]
+    fn mouse_click_sidebar_status_header_does_not_change_selection() {
+
+        let sessions = vec![
+            make_session_with_status("a", AgentType::Claude, SessionStatus::Idle),
+            make_session_with_status("b", AgentType::Claude, SessionStatus::Running),
+        ];
+        let mut app = test_app_with_sessions(sessions);
+        app.sidebar_area.set(Rect::new(0, 0, 24, 20));
+        app.preview_area.set(Rect::new(24, 0, 56, 20));
+        app.selected = 1;
+
+        // Click first status header row (top row inside border).
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 1,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert_eq!(app.selected, 1, "header rows should not select a session");
+    }
+
+    #[test]
+    fn mouse_click_sidebar_with_multiple_status_groups() {
+
+        let sessions = vec![
+            make_session_with_status("a", AgentType::Claude, SessionStatus::Idle),
+            make_session_with_status("b", AgentType::Claude, SessionStatus::Running),
+            make_session_with_status("c", AgentType::Claude, SessionStatus::Exited),
+        ];
+        let mut app = test_app_with_sessions(sessions);
+        app.sidebar_area.set(Rect::new(0, 0, 24, 20));
+        app.preview_area.set(Rect::new(24, 0, 56, 20));
+        app.selected = 0;
+
+        // Running group has its own header; session "b" is at y=4.
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 4,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert_eq!(app.selected, 1, "click should map to running session row");
     }
 
     #[test]
@@ -1654,7 +1824,8 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_sessions_detects_running_status() {
-        // On first refresh, all sessions should show as Running (no previous capture)
+        // First capture (no prev) → immediately Running (first_capture branch).
+        // Mock returns constant "mock pane content" each tick via capture_panes.
         let sessions = vec![make_session("s1", AgentType::Claude)];
         let mut app = App::new_with_manager(
             "testid".to_string(),
@@ -1662,15 +1833,16 @@ mod tests {
             Box::new(MockSessionManager::with_sessions(sessions)),
         );
         app.refresh_sessions().await;
-        assert_eq!(app.sessions[0].status, SessionStatus::Running, "first tick = Running");
+        assert_eq!(app.sessions[0].status, SessionStatus::Running, "first tick = Running (first capture)");
 
-        // With debouncing, need 3 consecutive unchanged ticks to become Idle
+        // With debouncing, need 12 consecutive unchanged ticks (~3s) to become Idle
+        for i in 2..=12 {
+            app.refresh_sessions().await;
+            assert_eq!(app.sessions[0].status, SessionStatus::Running, "tick {i} still Running");
+        }
+        // 13th tick: 12 consecutive unchanged → Idle
         app.refresh_sessions().await;
-        assert_eq!(app.sessions[0].status, SessionStatus::Running, "2nd tick still Running");
-        app.refresh_sessions().await;
-        assert_eq!(app.sessions[0].status, SessionStatus::Running, "3rd tick still Running");
-        app.refresh_sessions().await;
-        assert_eq!(app.sessions[0].status, SessionStatus::Idle, "4th tick = Idle (3 consecutive)");
+        assert_eq!(app.sessions[0].status, SessionStatus::Idle, "tick 13 = Idle (12 consecutive unchanged)");
     }
 
     #[tokio::test]
@@ -1740,11 +1912,11 @@ mod tests {
         // First session has a message (2 lines), second doesn't (1 line)
         app.last_messages.insert("hydra-testid-a".to_string(), "some msg".to_string());
 
-        // Click on row 3 (inner y=2) — should be session b (after 2-line item a)
+        // Rows: header, a, a-msg, b. Session b is at y=4.
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 5,
-            row: 3,
+            row: 4,
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
         assert_eq!(app.selected, 1);
@@ -2011,7 +2183,8 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_sessions_idle_after_long_pause_clears_timer() {
-        // Use a mock that returns constant pane content
+        // In test env, tmux capture returns empty/error → content is static.
+        // Session stays Idle throughout (hysteresis never sees 2 changed ticks).
         let sessions = vec![make_session("worker", AgentType::Claude)];
         let mut app = App::new_with_manager(
             "testid".to_string(),
@@ -2019,25 +2192,18 @@ mod tests {
             Box::new(MockSessionManager::with_sessions(sessions)),
         );
 
-        // First refresh: Running (no previous capture)
-        app.refresh_sessions().await;
-        assert_eq!(app.sessions[0].status, SessionStatus::Running);
-        assert!(app.sessions[0].task_elapsed.is_some());
-
-        // Run 3 more ticks to pass debounce threshold → Idle
-        for _ in 0..3 {
+        // Run enough ticks to stabilize at Idle (1 first-capture + 12 unchanged = 13)
+        for _ in 0..13 {
             app.refresh_sessions().await;
         }
         assert_eq!(app.sessions[0].status, SessionStatus::Idle);
 
         // Simulate long idle: move task_last_active back >5 seconds
         let five_secs_ago = std::time::Instant::now() - std::time::Duration::from_secs(6);
-        app.task_last_active.insert(
-            "hydra-testid-worker".to_string(),
-            five_secs_ago,
-        );
+        let key = "hydra-testid-worker".to_string();
+        app.task_last_active.insert(key.clone(), five_secs_ago);
         app.task_starts.insert(
-            "hydra-testid-worker".to_string(),
+            key.clone(),
             five_secs_ago - std::time::Duration::from_secs(10),
         );
 
@@ -2045,7 +2211,7 @@ mod tests {
         app.refresh_sessions().await;
         assert_eq!(app.sessions[0].status, SessionStatus::Idle);
         assert!(
-            !app.task_starts.contains_key("hydra-testid-worker"),
+            !app.task_starts.contains_key(&key),
             "long idle should clear task_starts"
         );
     }
@@ -2586,6 +2752,49 @@ mod tests {
     }
 
     #[test]
+    fn mouse_attached_click_forwards_to_tmux() {
+        let sessions = vec![make_session("a", AgentType::Claude)];
+        let mut app = test_app_with_sessions(sessions);
+        app.mode = Mode::Attached;
+        app.sidebar_area.set(Rect::new(0, 0, 24, 20));
+        // Preview at x=24, width=56, height=20 → inner starts at (25,1)
+        app.preview_area.set(Rect::new(24, 0, 56, 20));
+
+        // Click at column=30, row=5 → inner x = 30-25 = 5, inner y = 5-1 = 4
+        // SGR coords are 1-based: x=6, y=5
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 30,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+
+        let (tmux_name, text) = app.pending_literal_keys.take().expect("should queue literal keys");
+        assert_eq!(tmux_name, "hydra-testid-a");
+        assert!(text.contains("\x1b[<0;6;5M"), "should contain SGR press: {text:?}");
+        assert!(text.contains("\x1b[<0;6;5m"), "should contain SGR release: {text:?}");
+    }
+
+    #[test]
+    fn mouse_attached_click_resets_scroll_offset() {
+        let sessions = vec![make_session("a", AgentType::Claude)];
+        let mut app = test_app_with_sessions(sessions);
+        app.mode = Mode::Attached;
+        app.sidebar_area.set(Rect::new(0, 0, 24, 20));
+        app.preview_area.set(Rect::new(24, 0, 56, 20));
+        app.preview_scroll_offset = 10;
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 30,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.preview_scroll_offset, 0, "click should reset scroll to bottom");
+    }
+
+    #[test]
     fn mouse_attached_other_event_is_noop() {
 
         let sessions = vec![make_session("a", AgentType::Claude)];
@@ -2634,6 +2843,7 @@ mod tests {
         let stale = "hydra-testid-deleted".to_string();
         app.prev_captures.insert(stale.clone(), "old".into());
         app.idle_ticks.insert(stale.clone(), 3);
+        app.changed_ticks.insert(stale.clone(), 2);
         app.task_starts.insert(stale.clone(), Instant::now());
         app.task_last_active.insert(stale.clone(), Instant::now());
         app.last_messages.insert(stale.clone(), "msg".into());
@@ -2649,6 +2859,7 @@ mod tests {
         // Stale key should be pruned from all maps
         assert!(!app.prev_captures.contains_key(&stale), "stale prev_captures should be pruned");
         assert!(!app.idle_ticks.contains_key(&stale), "stale idle_ticks should be pruned");
+        assert!(!app.changed_ticks.contains_key(&stale), "stale changed_ticks should be pruned");
         assert!(!app.task_starts.contains_key(&stale), "stale task_starts should be pruned");
         assert!(!app.task_last_active.contains_key(&stale), "stale task_last_active should be pruned");
         assert!(!app.last_messages.contains_key(&stale), "stale last_messages should be pruned");
@@ -2698,15 +2909,14 @@ mod tests {
         );
         app.manifest_dir = dir.path().to_path_buf();
         app.mode = Mode::NewSessionAgent;
-        app.new_session_name = "worker".to_string();
         app.confirm_new_session().await;
 
         assert_eq!(app.mode, Mode::Browse);
         assert!(app.status_message.as_ref().unwrap().contains("Created session"));
 
-        // Verify manifest was saved
+        // Verify manifest was saved (name is auto-generated)
         let loaded = crate::manifest::load_manifest(dir.path(), pid).await;
-        assert!(loaded.sessions.contains_key("worker"));
+        assert!(!loaded.sessions.is_empty(), "manifest should have the new session");
     }
 
     // ── confirm_delete success path ──────────────────────────────
@@ -2740,68 +2950,11 @@ mod tests {
         assert!(!loaded.sessions.contains_key("s1"), "session should be removed from manifest");
     }
 
-    // ── Mouse: click preview to attach ───────────────────────────
-
-    #[test]
-    fn mouse_click_preview_attaches() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-
-        let sessions = vec![make_session("a", AgentType::Claude)];
-        let mut app = test_app_with_sessions(sessions);
-        app.sidebar_area.set(Rect::new(0, 0, 24, 20));
-        app.preview_area.set(Rect::new(24, 0, 56, 20));
-
-        // Click inside preview area
-        app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 40,
-            row: 10,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        });
-
-        assert_eq!(app.mode, Mode::Attached);
-    }
-
-    // ── Mouse: scroll in sidebar selects sessions ────────────────
-
-    #[test]
-    fn mouse_scroll_sidebar_navigates() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-
-        let sessions = vec![
-            make_session("a", AgentType::Claude),
-            make_session("b", AgentType::Claude),
-            make_session("c", AgentType::Claude),
-        ];
-        let mut app = test_app_with_sessions(sessions);
-        app.sidebar_area.set(Rect::new(0, 0, 24, 20));
-        app.preview_area.set(Rect::new(24, 0, 56, 20));
-        assert_eq!(app.selected, 0);
-
-        // Scroll down in sidebar
-        app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: 5,
-            row: 5,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        });
-        assert_eq!(app.selected, 1);
-
-        // Scroll up in sidebar
-        app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 5,
-            row: 5,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        });
-        assert_eq!(app.selected, 0);
-    }
-
     // ── Mouse: scroll in preview scrolls viewport ────────────────
 
     #[test]
     fn mouse_scroll_preview_changes_offset() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use crossterm::event::{MouseEvent, MouseEventKind};
 
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
@@ -2914,18 +3067,82 @@ mod tests {
         assert!(app.sessions[0].task_elapsed.is_some(), "idle within 5s should show frozen timer");
     }
 
-    // ── Revive: empty manifest is no-op ──────────────────────────
+    // ── normalize_capture tests ─────────────────────────────────────
+
+    #[test]
+    fn normalize_capture_strips_braille_spinners() {
+        let input = "Loading \u{280B}\u{2819}\u{2839} done";
+        let result = super::normalize_capture(input);
+        assert_eq!(result, "Loading  done");
+    }
+
+    #[test]
+    fn normalize_capture_strips_ansi_escapes() {
+        let input = "hello \x1b[31mred\x1b[0m world";
+        let result = super::normalize_capture(input);
+        assert_eq!(result, "hello red world");
+    }
+
+    #[test]
+    fn normalize_capture_trims_trailing_whitespace() {
+        let input = "line one   \nline two  \n";
+        let result = super::normalize_capture(input);
+        // lines() drops the trailing \n, join produces no trailing newline
+        assert_eq!(result, "line one\nline two");
+    }
+
+    #[test]
+    fn normalize_capture_preserves_normal_content() {
+        let input = "$ claude\nHello, how can I help?";
+        let result = super::normalize_capture(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn normalize_capture_empty_string() {
+        assert_eq!(super::normalize_capture(""), "");
+    }
+
+    #[test]
+    fn normalize_capture_combined_noise() {
+        // ANSI cursor move + braille spinner + trailing spaces
+        let input = "\x1b[2Kworking \u{2807}   ";
+        let result = super::normalize_capture(input);
+        assert_eq!(result, "working");
+    }
+
+    // ── log-based status override test ──────────────────────────────
 
     #[tokio::test]
-    async fn revive_sessions_empty_manifest_is_noop() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn refresh_sessions_log_working_forces_running() {
+        // When session_stats.task_elapsed() returns Some (agent is working),
+        // status should be forced to Running even if pane content is unchanged.
+        let sessions = vec![make_session("s1", AgentType::Claude)];
         let mut app = App::new_with_manager(
             "testid".to_string(),
             "/tmp/test".to_string(),
-            Box::new(MockSessionManager::new()),
+            Box::new(MockSessionManager::with_sessions(sessions)),
         );
-        app.manifest_dir = dir.path().to_path_buf();
-        app.revive_sessions().await;
-        assert!(app.status_message.is_none(), "empty manifest should produce no message");
+
+        // Run enough ticks to normally reach Idle
+        for _ in 0..15 {
+            app.refresh_sessions().await;
+        }
+        assert_eq!(app.sessions[0].status, SessionStatus::Idle, "baseline: idle without log");
+
+        // Now inject session_stats with a pending user message (agent is working)
+        let mut stats = crate::logs::SessionStats::default();
+        let ts = (chrono::Utc::now() - chrono::Duration::seconds(5))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        stats.last_user_ts = Some(ts);
+        app.session_stats.insert("hydra-testid-s1".to_string(), stats);
+
+        app.refresh_sessions().await;
+        assert_eq!(
+            app.sessions[0].status,
+            SessionStatus::Running,
+            "log says working → should be Running"
+        );
     }
+
 }

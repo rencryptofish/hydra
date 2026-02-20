@@ -27,10 +27,10 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 
 - **SessionManager trait**: All tmux interaction goes through `#[async_trait] trait SessionManager: Send + Sync` so tests can use mock/noop impls. `App::new_with_manager()` is the test constructor. Async methods that call the manager must clone fields (e.g. `project_id`) before `.await` to avoid borrow conflicts across await points.
 - **Auto-generated session names**: Session names are auto-assigned from the NATO phonetic alphabet (alpha, bravo, charlie, ...). The `generate_name()` function in `session.rs` picks the first unused name, filling gaps. Falls back to `agent-N` if all 26 are taken.
-- **Content-change detection**: Session status (Running/Idle/Exited) is determined by comparing `capture-pane` output between ticks, not `session_activity` (which only tracks client input, not pane output for detached sessions). Running→Idle is **debounced**: requires 3 consecutive unchanged ticks (~750ms) to prevent flickering. Idle→Running is instant (any content change).
+- **Content-change detection**: Session status (Running/Idle/Exited) uses two layers: (1) **Log-based** (authoritative) — if `session_stats.task_elapsed()` returns Some (pending user message, no assistant reply), force Running; (2) **Pane-based** (fallback) — compare `normalize_capture()`-cleaned pane content between ticks. `normalize_capture()` strips braille spinners (U+2800–U+28FF), ANSI escape sequences, and trailing whitespace to reduce noise. **Hysteresis** debounces both directions: Running→Idle requires 12 consecutive unchanged ticks (~3s); Idle→Running requires 2 consecutive changed ticks (~500ms). First capture of a new session immediately sets Running.
 - **Sidebar grouping**: Sessions are grouped by status (Idle → Running → Exited) with dim header rows (e.g. `── ● Idle ──`), then sorted alphabetically within each group. The explicit headers make the grouping intentional rather than chaotic. `SessionStatus::sort_order()` defines the group ordering. The `selected` index maps to `app.sessions` (not visual rows); the UI calculates the visual row by counting header items.
 - **Status indicator lights**: Each session shows a colored `●` dot in the sidebar:
-  - **Green** = Idle (ready for input, pane content unchanged for 3+ ticks)
+  - **Green** = Idle (ready for input, pane content unchanged for 12+ ticks)
   - **Red** = Running (busy, pane content changed recently)
   - **Yellow** = Exited (agent process ended, pane is dead)
 - **Task elapsed timer**: Tracks per-session `Instant` timestamps in App. Running starts the clock; Idle <5s shows frozen duration (same task); Idle >5s clears it (new task).
@@ -61,11 +61,13 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 - Mouse handling lives in `App::handle_mouse()` (moved from `main.rs` to `app.rs`)
 - **Preview scrolling**: `preview_scroll_offset: u16` tracks lines scrolled up from bottom (0 = bottom). Scroll wheel over preview adjusts by 3 lines/tick. Offset resets on session selection change. Rendering uses `Paragraph::scroll()` with math: `scroll_y = max_scroll_offset - capped_offset` so offset 0 shows latest output.
 - **Scrollback capture**: `capture_pane_scrollback()` uses `tmux capture-pane -p -S -` to get full history (used for preview display). Regular `capture_pane()` (visible pane only) is used for status comparison — keeps status detection lightweight.
-- **No mouse forwarding to tmux**: SGR mouse sequences and arrow-key forwarding for scroll were removed — agents don't support mouse input, and forwarding caused garbled text. Mouse clicks/scroll in the preview are handled locally (scroll viewport, attach/detach).
+- **Mouse click forwarding**: In Attached mode, left-clicking inside the preview inner area forwards the click to the tmux pane as SGR mouse press+release escape sequences (`\x1b[<0;x;yM` + `\x1b[<0;x;ym`) via `send_keys_literal`. This lets agents like Claude Code reposition their input cursor on click. Coordinates are computed relative to the preview inner area (1-based for SGR). The click also resets `preview_scroll_offset` to 0. Non-left clicks and clicks outside the inner area still detach. Scroll events are handled locally (not forwarded).
+- **Pending action pattern**: `handle_mouse()` is synchronous (to avoid converting 15+ tests to async), so it can't call async trait methods directly. Instead it sets `App.pending_literal_keys: Option<(String, String)>` which the event loop consumes via `flush_pending_keys()`. This pattern keeps mouse tests simple while supporting async I/O.
+- **Literal key sending**: `send_keys_literal()` on `SessionManager` sends raw text/escape sequences via `tmux send-keys -l` (literal mode). Has a default no-op impl in the trait so mock impls don't need to override it. Used for mouse click forwarding.
 
 ## Common Changes
 
 - **Add agent type**: Add variant to `AgentType` in `session.rs`, implement `command()`, `Display`, `FromStr`, update `all()`, update tests
 - **Add UI mode**: Add variant to `Mode` in `app.rs`, add key handler in `main.rs`, add draw function in `ui.rs`, add snapshot test
-- **Add SessionManager method**: Update trait in `tmux.rs`, implement on `TmuxSessionManager`, update mocks in `app.rs` and `ui.rs` test modules
+- **Add SessionManager method**: Update trait in `tmux.rs`, implement on `TmuxSessionManager`, update mocks in `app.rs` and `ui.rs` test modules. If the method has a sensible default (e.g. no-op), provide a default impl in the trait to avoid updating every mock.
 - **Change status colors**: Edit `status_color()` in `ui.rs` — maps `SessionStatus` → `ratatui::Color`

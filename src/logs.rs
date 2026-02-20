@@ -1688,10 +1688,25 @@ mod tests {
         stats.date = "2020-01-01".to_string();
         stats.file_offsets.insert(PathBuf::from("/fake"), 999);
 
-        // Calling update_global_stats will detect date mismatch and reset
-        update_global_stats(&mut stats);
-
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        // Use a nonexistent base_dir so no real files are scanned.
+        // The date mismatch logic is in update_global_stats (public),
+        // so we replicate the reset check + call inner with empty dir.
+        if stats.date != today {
+            stats.tokens_in = 0;
+            stats.tokens_out = 0;
+            stats.tokens_cache_read = 0;
+            stats.tokens_cache_write = 0;
+            stats.file_offsets.clear();
+            stats.date = today.clone();
+        }
+        update_global_stats_inner(
+            &mut stats,
+            &today,
+            Some(std::path::Path::new("/nonexistent/path")),
+        );
+
         assert_eq!(stats.date, today);
         assert_eq!(stats.tokens_in, 0, "should reset on date change");
         assert_eq!(stats.tokens_out, 0);

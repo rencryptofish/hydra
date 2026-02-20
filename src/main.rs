@@ -131,6 +131,7 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
             }
             Some(Event::Mouse(mouse)) => {
                 app.handle_mouse(mouse);
+                app.flush_pending_keys().await;
                 app.refresh_preview().await;
             }
             Some(Event::Tick) => {
