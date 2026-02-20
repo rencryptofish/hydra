@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::app::{App, Mode};
+use crate::logs::{format_cost, format_tokens};
 use crate::session::{format_duration, AgentType, SessionStatus};
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -21,7 +22,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     // Main layout: sidebar | preview
     let panels = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .constraints([Constraint::Percentage(20), Constraint::Percentage(80)])
         .split(main_area);
 
     app.sidebar_area.set(panels[0]);
@@ -33,7 +34,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     // Draw modal overlays
     match app.mode {
-        Mode::NewSessionName => draw_name_input(frame, app),
         Mode::NewSessionAgent => draw_agent_select(frame, app),
         Mode::ConfirmDelete => draw_confirm_delete(frame, app),
         Mode::Browse | Mode::Attached => {}
@@ -49,6 +49,38 @@ fn status_color(status: &SessionStatus) -> Color {
 }
 
 fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
+    // Check if any session has stats to show
+    let has_stats = app.session_stats.values().any(|st| st.turns > 0);
+
+    // Collect recent files across all sessions, merged by recency
+    let recent_files = if has_stats {
+        aggregate_recent_files(app)
+    } else {
+        vec![]
+    };
+
+    let stats_height = if has_stats { 3 } else { 0 }; // 1 line + top/bottom border
+    let max_file_rows = 6;
+    let files_height = if recent_files.is_empty() {
+        0
+    } else {
+        (recent_files.len() as u16).min(max_file_rows)
+    };
+
+    let sidebar_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(stats_height),
+            Constraint::Length(files_height),
+        ])
+        .split(area);
+
+    let list_area = sidebar_chunks[0];
+    let stats_area = sidebar_chunks[1];
+    let files_area = sidebar_chunks[2];
+
+    // Draw session list
     let items: Vec<ListItem> = app
         .sessions
         .iter()
@@ -100,7 +132,113 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             .border_style(Style::default().fg(Color::Cyan)),
     );
 
-    frame.render_widget(list, area);
+    frame.render_widget(list, list_area);
+
+    // Draw aggregate stats across all sessions
+    if has_stats {
+        draw_stats(frame, app, stats_area);
+    }
+
+    // Draw recent files
+    if !recent_files.is_empty() {
+        draw_recent_files(frame, &recent_files, files_area);
+    }
+}
+
+/// Merge recent files from all sessions into one list, most-recent-last.
+/// Each file appears once; if touched by multiple sessions, uses latest position.
+fn aggregate_recent_files(app: &App) -> Vec<String> {
+    let mut merged: Vec<String> = Vec::new();
+
+    // Iterate sessions in sorted key order for deterministic output
+    let mut keys: Vec<&String> = app.session_stats.keys().collect();
+    keys.sort();
+
+    for key in keys {
+        if let Some(stats) = app.session_stats.get(key) {
+            for f in &stats.recent_files {
+                if let Some(pos) = merged.iter().position(|x| x == f) {
+                    merged.remove(pos);
+                }
+                merged.push(f.clone());
+            }
+        }
+    }
+
+    merged
+}
+
+fn draw_recent_files(frame: &mut Frame, files: &[String], area: Rect) {
+    let dim = Style::default().fg(Color::DarkGray);
+    let inner_width = area.width.saturating_sub(1) as usize; // 1 char left margin
+
+    // Show most recent files last (bottom), take the tail that fits
+    let max_rows = area.height as usize;
+    let start = files.len().saturating_sub(max_rows);
+
+    let lines: Vec<Line> = files[start..]
+        .iter()
+        .map(|path| {
+            // Show basename, fallback to full path if no separator
+            let basename = path.rsplit('/').next().unwrap_or(path);
+            let display = if basename.len() > inner_width {
+                format!("{}", &basename[..inner_width])
+            } else {
+                format!(" {basename}")
+            };
+            Line::from(Span::styled(display, dim))
+        })
+        .collect();
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_stats(frame: &mut Frame, app: &App, area: Rect) {
+    // Aggregate across all sessions
+    let mut total_cost = 0.0;
+    let mut total_tokens = 0u64;
+    let mut total_edits = 0u16;
+
+    for stats in app.session_stats.values() {
+        total_cost += stats.cost_usd();
+        total_tokens += stats.tokens_in + stats.tokens_out;
+        total_edits += stats.edits;
+    }
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let val = Style::default().fg(Color::White);
+
+    let mut spans = vec![
+        Span::styled(format_cost(total_cost), Style::default().fg(Color::Green)),
+        Span::styled(format!(" {}", format_tokens(total_tokens)), val),
+        Span::styled(format!(" {}✎", total_edits), val),
+    ];
+
+    // Git diff stat
+    if let Some((ins, del)) = app.diff_stat {
+        let diff_str = if ins > 0 && del > 0 {
+            format!(" +{ins}-{del}")
+        } else if ins > 0 {
+            format!(" +{ins}")
+        } else if del > 0 {
+            format!(" -{del}")
+        } else {
+            String::new()
+        };
+        if !diff_str.is_empty() {
+            spans.push(Span::styled(diff_str, dim));
+        }
+    }
+
+    let line = Line::from(spans);
+
+    let block = Block::default()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let paragraph = Paragraph::new(line).block(block);
+    frame.render_widget(paragraph, area);
 }
 
 fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
@@ -144,7 +282,6 @@ fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
     let help_text = match app.mode {
         Mode::Browse => "j/k: navigate  Enter: attach  n: new  d: delete  q: quit",
         Mode::Attached => "Esc: detach  (keys forwarded to session)",
-        Mode::NewSessionName => "Enter: confirm  Esc: cancel",
         Mode::NewSessionAgent => "j/k: select agent  Enter: confirm  Esc: cancel",
         Mode::ConfirmDelete => "y: confirm delete  Esc: cancel",
     };
@@ -170,20 +307,6 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     Rect::new(x, y, width.min(area.width), height.min(area.height))
-}
-
-fn draw_name_input(frame: &mut Frame, app: &App) {
-    let area = centered_rect(40, 5, frame.area());
-    frame.render_widget(Clear, area);
-
-    let text = format!(" > {}_", app.input);
-    let input = Paragraph::new(text).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" New Session Name ")
-            .border_style(Style::default().fg(Color::Yellow)),
-    );
-    frame.render_widget(input, area);
 }
 
 fn draw_agent_select(frame: &mut Frame, app: &App) {
@@ -263,6 +386,7 @@ mod tests {
             _: &str,
             _: &AgentType,
             _: &str,
+            _: Option<&str>,
         ) -> anyhow::Result<String> {
             Ok(String::new())
         }
@@ -356,21 +480,6 @@ mod tests {
     }
 
     #[test]
-    fn new_session_name_modal() {
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        let mut app = make_app();
-        app.mode = Mode::NewSessionName;
-        app.input = "my-session".to_string();
-
-        terminal.draw(|f| super::draw(f, &app)).unwrap();
-        let output = buffer_to_string(&terminal);
-
-        insta::assert_snapshot!(output);
-    }
-
-    #[test]
     fn new_session_agent_modal() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -430,6 +539,222 @@ mod tests {
         let mut app = make_app();
         app.status_message = Some("Created session 'worker-1' with Claude".to_string());
         app.preview = "No sessions. Press 'n' to create one.".to_string();
+
+        terminal.draw(|f| super::draw(f, &app)).unwrap();
+        let output = buffer_to_string(&terminal);
+
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn browse_mode_with_all_statuses() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = make_app();
+        app.sessions = vec![
+            make_session_with_status("idle-one", AgentType::Claude, SessionStatus::Idle),
+            make_session_with_status("running-one", AgentType::Codex, SessionStatus::Running),
+            make_session_with_status("exited-one", AgentType::Claude, SessionStatus::Exited),
+        ];
+        app.selected = 1;
+        app.preview = "running session output".to_string();
+
+        terminal.draw(|f| super::draw(f, &app)).unwrap();
+        let output = buffer_to_string(&terminal);
+
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn browse_mode_with_task_elapsed() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = make_app();
+        let mut session = make_session("worker-1", AgentType::Claude);
+        session.status = SessionStatus::Running;
+        session.task_elapsed = Some(std::time::Duration::from_secs(125));
+        app.sessions = vec![session];
+        app.selected = 0;
+        app.preview = "working...".to_string();
+
+        terminal.draw(|f| super::draw(f, &app)).unwrap();
+        let output = buffer_to_string(&terminal);
+
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn browse_mode_with_last_messages() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = make_app();
+        app.sessions = vec![
+            make_session("worker-1", AgentType::Claude),
+            make_session("worker-2", AgentType::Codex),
+        ];
+        app.selected = 0;
+        app.preview = "preview".to_string();
+        app.last_messages.insert(
+            "hydra-testproj-worker-1".to_string(),
+            "I'll help you with that task.".to_string(),
+        );
+
+        terminal.draw(|f| super::draw(f, &app)).unwrap();
+        let output = buffer_to_string(&terminal);
+
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn browse_mode_with_long_last_message_truncated() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = make_app();
+        app.sessions = vec![make_session("worker-1", AgentType::Claude)];
+        app.selected = 0;
+        app.preview = "preview".to_string();
+        app.last_messages.insert(
+            "hydra-testproj-worker-1".to_string(),
+            "This is a very long message that should be truncated at fifty characters to fit sidebar".to_string(),
+        );
+
+        terminal.draw(|f| super::draw(f, &app)).unwrap();
+        let output = buffer_to_string(&terminal);
+
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn preview_scrolling_renders() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = make_app();
+        app.sessions = vec![make_session("s1", AgentType::Claude)];
+        app.selected = 0;
+        // Create content taller than the preview area
+        app.preview = (0..50).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        app.preview_scroll_offset = 10;
+
+        terminal.draw(|f| super::draw(f, &app)).unwrap();
+        let output = buffer_to_string(&terminal);
+
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn agent_select_second_highlighted() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = make_app();
+        app.mode = Mode::NewSessionAgent;
+        app.agent_selection = 1; // Select Codex
+
+        terminal.draw(|f| super::draw(f, &app)).unwrap();
+        let output = buffer_to_string(&terminal);
+
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn confirm_delete_no_sessions() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = make_app();
+        app.mode = Mode::ConfirmDelete;
+        // No sessions — should show "?"
+
+        terminal.draw(|f| super::draw(f, &app)).unwrap();
+        let output = buffer_to_string(&terminal);
+
+        insta::assert_snapshot!(output);
+    }
+
+    // ── Unit tests for helper functions ───────────────────────────────
+
+    #[test]
+    fn status_color_maps_correctly() {
+        assert_eq!(super::status_color(&SessionStatus::Idle), ratatui::style::Color::Green);
+        assert_eq!(super::status_color(&SessionStatus::Running), ratatui::style::Color::Red);
+        assert_eq!(super::status_color(&SessionStatus::Exited), ratatui::style::Color::Yellow);
+    }
+
+    #[test]
+    fn centered_rect_normal() {
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let result = super::centered_rect(40, 10, area);
+        assert_eq!(result.width, 40);
+        assert_eq!(result.height, 10);
+        assert_eq!(result.x, 20); // (80 - 40) / 2
+        assert_eq!(result.y, 7);  // (24 - 10) / 2
+    }
+
+    #[test]
+    fn centered_rect_larger_than_area() {
+        let area = ratatui::layout::Rect::new(0, 0, 20, 10);
+        let result = super::centered_rect(40, 20, area);
+        // Width and height clamped to area
+        assert_eq!(result.width, 20);
+        assert_eq!(result.height, 10);
+    }
+
+    #[test]
+    fn centered_rect_with_offset() {
+        let area = ratatui::layout::Rect::new(10, 5, 60, 20);
+        let result = super::centered_rect(20, 10, area);
+        assert_eq!(result.x, 30); // 10 + (60-20)/2
+        assert_eq!(result.y, 10); // 5 + (20-10)/2
+    }
+
+    #[test]
+    fn centered_rect_zero_size_area() {
+        let area = ratatui::layout::Rect::new(0, 0, 0, 0);
+        let result = super::centered_rect(40, 10, area);
+        assert_eq!(result.width, 0);
+        assert_eq!(result.height, 0);
+    }
+
+    #[test]
+    fn browse_mode_with_stats() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = make_app();
+        app.sessions = vec![
+            make_session("worker-1", AgentType::Claude),
+        ];
+        app.selected = 0;
+        app.preview = "some preview content".to_string();
+
+        // Populate stats for multiple sessions (aggregated in display)
+        let mut stats1 = crate::logs::SessionStats::default();
+        stats1.turns = 12;
+        stats1.tokens_in = 18200;
+        stats1.tokens_out = 4500;
+        stats1.edits = 5;
+        stats1.bash_cmds = 3;
+        stats1.touch_file("/src/main.rs".to_string());
+        stats1.touch_file("/src/app.rs".to_string());
+        app.session_stats.insert("hydra-testproj-worker-1".to_string(), stats1);
+
+        let mut stats2 = crate::logs::SessionStats::default();
+        stats2.turns = 8;
+        stats2.tokens_in = 10000;
+        stats2.tokens_out = 2000;
+        stats2.edits = 3;
+        stats2.bash_cmds = 2;
+        stats2.touch_file("/src/main.rs".to_string()); // overlaps with worker-1
+        stats2.touch_file("/src/ui.rs".to_string());
+        app.session_stats.insert("hydra-testproj-worker-2".to_string(), stats2);
+
+        // Git diff stat
+        app.diff_stat = Some((45, 12));
 
         terminal.draw(|f| super::draw(f, &app)).unwrap();
         let output = buffer_to_string(&terminal);

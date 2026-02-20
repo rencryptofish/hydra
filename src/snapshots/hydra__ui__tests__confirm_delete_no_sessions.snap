@@ -2,10 +2,7 @@
 source: src/ui.rs
 expression: output
 ---
-┌ Sessions (3) ┐┌ worker-1 ────────────────────────────────────────────────────┐
-│>> ● worker-1 ││some preview content                                          │
-│   ● worker-2 ││                                                              │
-│   ● research ││                                                              │
+┌ Sessions (0) ┐┌ Preview ─────────────────────────────────────────────────────┐
 │              ││                                                              │
 │              ││                                                              │
 │              ││                                                              │
@@ -14,8 +11,11 @@ expression: output
 │              ││                                                              │
 │              ││                                                              │
 │              ││                                                              │
-│              ││                                                              │
-│              ││                                                              │
+│              ││   ┌ Confirm Delete ──────────────────────┐                   │
+│              ││   │ Kill session '?'? (y/n)              │                   │
+│              ││   │                                      │                   │
+│              ││   │                                      │                   │
+│              ││   └──────────────────────────────────────┘                   │
 │              ││                                                              │
 │              ││                                                              │
 │              ││                                                              │
@@ -25,4 +25,4 @@ expression: output
 │              ││                                                              │
 │              ││                                                              │
 └──────────────┘└──────────────────────────────────────────────────────────────┘
- j/k: navigate  Enter: attach  n: new  d: delete  q: quit
+ y: confirm delete  Esc: cancel

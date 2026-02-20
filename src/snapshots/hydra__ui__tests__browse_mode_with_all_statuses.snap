@@ -2,10 +2,10 @@
 source: src/ui.rs
 expression: output
 ---
-┌ Sessions (3) ┐┌ worker-1 ────────────────────────────────────────────────────┐
-│>> ● worker-1 ││some preview content                                          │
-│   ● worker-2 ││                                                              │
-│   ● research ││                                                              │
+┌ Sessions (3) ┐┌ running-one ─────────────────────────────────────────────────┐
+│   ● idle-one ││running session output                                        │
+│>> ● running-o││                                                              │
+│   ● exited-on││                                                              │
 │              ││                                                              │
 │              ││                                                              │
 │              ││                                                              │

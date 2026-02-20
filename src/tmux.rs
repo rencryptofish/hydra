@@ -14,6 +14,7 @@ pub trait SessionManager: Send + Sync {
         name: &str,
         agent: &AgentType,
         cwd: &str,
+        command_override: Option<&str>,
     ) -> Result<String>;
     async fn capture_pane(&self, tmux_name: &str) -> Result<String>;
     async fn kill_session(&self, tmux_name: &str) -> Result<()>;
@@ -115,8 +116,9 @@ impl SessionManager for TmuxSessionManager {
         name: &str,
         agent: &AgentType,
         cwd: &str,
+        command_override: Option<&str>,
     ) -> Result<String> {
-        let tmux_name = create_session(project_id, name, agent, cwd).await?;
+        let tmux_name = create_session(project_id, name, agent, cwd, command_override).await?;
         self.agent_cache
             .lock()
             .unwrap()
@@ -180,13 +182,16 @@ async fn get_agent_type(tmux_name: &str) -> Option<AgentType> {
 }
 
 /// Create a new detached tmux session running the given agent command.
+/// If `command_override` is provided, it is used instead of `agent.command()`.
 pub async fn create_session(
     project_id: &str,
     name: &str,
     agent: &AgentType,
     cwd: &str,
+    command_override: Option<&str>,
 ) -> Result<String> {
     let tmux_name = crate::session::tmux_session_name(project_id, name);
+    let cmd = command_override.unwrap_or(agent.command());
 
     let status = Command::new("tmux")
         .args([
@@ -196,7 +201,7 @@ pub async fn create_session(
             &tmux_name,
             "-c",
             cwd,
-            agent.command(),
+            cmd,
         ])
         .status()
         .await
@@ -374,4 +379,163 @@ pub async fn kill_session(tmux_name: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    // ── keycode_to_tmux: character keys ──────────────────────────────
+
+    #[test]
+    fn char_key_no_modifiers() {
+        assert_eq!(keycode_to_tmux(KeyCode::Char('a'), KeyModifiers::NONE), Some("a".into()));
+    }
+
+    #[test]
+    fn char_key_uppercase() {
+        assert_eq!(keycode_to_tmux(KeyCode::Char('A'), KeyModifiers::SHIFT), Some("A".into()));
+    }
+
+    #[test]
+    fn char_key_ctrl() {
+        assert_eq!(keycode_to_tmux(KeyCode::Char('c'), KeyModifiers::CONTROL), Some("C-c".into()));
+    }
+
+    #[test]
+    fn char_key_alt() {
+        assert_eq!(keycode_to_tmux(KeyCode::Char('x'), KeyModifiers::ALT), Some("M-x".into()));
+    }
+
+    // ── keycode_to_tmux: special keys ────────────────────────────────
+
+    #[test]
+    fn enter_key() {
+        assert_eq!(keycode_to_tmux(KeyCode::Enter, KeyModifiers::NONE), Some("Enter".into()));
+    }
+
+    #[test]
+    fn backspace_key() {
+        assert_eq!(keycode_to_tmux(KeyCode::Backspace, KeyModifiers::NONE), Some("BSpace".into()));
+    }
+
+    #[test]
+    fn tab_key() {
+        assert_eq!(keycode_to_tmux(KeyCode::Tab, KeyModifiers::NONE), Some("Tab".into()));
+    }
+
+    #[test]
+    fn backtab_key() {
+        assert_eq!(keycode_to_tmux(KeyCode::BackTab, KeyModifiers::NONE), Some("BTab".into()));
+    }
+
+    #[test]
+    fn arrow_keys() {
+        assert_eq!(keycode_to_tmux(KeyCode::Up, KeyModifiers::NONE), Some("Up".into()));
+        assert_eq!(keycode_to_tmux(KeyCode::Down, KeyModifiers::NONE), Some("Down".into()));
+        assert_eq!(keycode_to_tmux(KeyCode::Left, KeyModifiers::NONE), Some("Left".into()));
+        assert_eq!(keycode_to_tmux(KeyCode::Right, KeyModifiers::NONE), Some("Right".into()));
+    }
+
+    #[test]
+    fn home_end_keys() {
+        assert_eq!(keycode_to_tmux(KeyCode::Home, KeyModifiers::NONE), Some("Home".into()));
+        assert_eq!(keycode_to_tmux(KeyCode::End, KeyModifiers::NONE), Some("End".into()));
+    }
+
+    #[test]
+    fn page_up_down_keys() {
+        assert_eq!(keycode_to_tmux(KeyCode::PageUp, KeyModifiers::NONE), Some("PageUp".into()));
+        assert_eq!(keycode_to_tmux(KeyCode::PageDown, KeyModifiers::NONE), Some("PageDown".into()));
+    }
+
+    #[test]
+    fn delete_insert_keys() {
+        assert_eq!(keycode_to_tmux(KeyCode::Delete, KeyModifiers::NONE), Some("DC".into()));
+        assert_eq!(keycode_to_tmux(KeyCode::Insert, KeyModifiers::NONE), Some("IC".into()));
+    }
+
+    #[test]
+    fn function_keys() {
+        assert_eq!(keycode_to_tmux(KeyCode::F(1), KeyModifiers::NONE), Some("F1".into()));
+        assert_eq!(keycode_to_tmux(KeyCode::F(12), KeyModifiers::NONE), Some("F12".into()));
+    }
+
+    #[test]
+    fn esc_returns_none() {
+        assert_eq!(keycode_to_tmux(KeyCode::Esc, KeyModifiers::NONE), None);
+    }
+
+    // ── keycode_to_tmux: modifiers on special keys ───────────────────
+
+    #[test]
+    fn ctrl_arrow() {
+        assert_eq!(keycode_to_tmux(KeyCode::Up, KeyModifiers::CONTROL), Some("C-Up".into()));
+    }
+
+    #[test]
+    fn alt_arrow() {
+        assert_eq!(keycode_to_tmux(KeyCode::Left, KeyModifiers::ALT), Some("M-Left".into()));
+    }
+
+    #[test]
+    fn shift_arrow() {
+        assert_eq!(keycode_to_tmux(KeyCode::Right, KeyModifiers::SHIFT), Some("S-Right".into()));
+    }
+
+    #[test]
+    fn ctrl_shift_function_key() {
+        assert_eq!(
+            keycode_to_tmux(KeyCode::F(5), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            Some("C-S-F5".into())
+        );
+    }
+
+    #[test]
+    fn all_modifiers_on_special_key() {
+        let mods = KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT;
+        assert_eq!(
+            keycode_to_tmux(KeyCode::Enter, mods),
+            Some("C-M-S-Enter".into())
+        );
+    }
+
+    // ── apply_tmux_modifiers ─────────────────────────────────────────
+
+    #[test]
+    fn apply_no_modifiers() {
+        assert_eq!(apply_tmux_modifiers("Enter", KeyModifiers::NONE), "Enter");
+    }
+
+    #[test]
+    fn apply_shift_only() {
+        assert_eq!(apply_tmux_modifiers("Up", KeyModifiers::SHIFT), "S-Up");
+    }
+
+    #[test]
+    fn apply_alt_only() {
+        assert_eq!(apply_tmux_modifiers("Tab", KeyModifiers::ALT), "M-Tab");
+    }
+
+    #[test]
+    fn apply_ctrl_only() {
+        assert_eq!(apply_tmux_modifiers("Left", KeyModifiers::CONTROL), "C-Left");
+    }
+
+    #[test]
+    fn apply_modifier_ordering_ctrl_alt_shift() {
+        let mods = KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT;
+        // Shift applied first (innermost), then Alt, then Ctrl (outermost)
+        assert_eq!(apply_tmux_modifiers("F1", mods), "C-M-S-F1");
+    }
+
+    // ── TmuxSessionManager agent cache ───────────────────────────────
+
+    #[test]
+    fn tmux_session_manager_new_has_empty_cache() {
+        let mgr = TmuxSessionManager::new();
+        let cache = mgr.agent_cache.lock().unwrap();
+        assert!(cache.is_empty());
+    }
 }

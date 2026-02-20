@@ -1,6 +1,7 @@
 mod app;
 mod event;
 mod logs;
+mod manifest;
 mod session;
 mod tmux;
 mod ui;
@@ -8,7 +9,7 @@ mod ui;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEvent, KeyEventKind},
+    event::{DisableMouseCapture, EnableMouseCapture, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -17,7 +18,7 @@ use ratatui::Terminal;
 use std::io;
 use std::time::Duration;
 
-use app::{App, Mode};
+use app::App;
 use event::{Event, EventHandler};
 use session::{project_id, AgentType};
 
@@ -66,7 +67,12 @@ async fn main() -> Result<()> {
 
 async fn cmd_new(project_id: &str, name: &str, agent_str: &str, cwd: &str) -> Result<()> {
     let agent: AgentType = agent_str.parse()?;
-    let tmux_name = tmux::create_session(project_id, name, &agent, cwd).await?;
+    let record = manifest::SessionRecord::for_new_session(name, &agent, cwd);
+    let cmd = record.create_command();
+    let base_dir = manifest::default_base_dir();
+
+    let tmux_name = tmux::create_session(project_id, name, &agent, cwd, Some(&cmd)).await?;
+    manifest::add_session(&base_dir, project_id, record).await?;
     println!("Created session: {tmux_name}");
     Ok(())
 }
@@ -74,6 +80,8 @@ async fn cmd_new(project_id: &str, name: &str, agent_str: &str, cwd: &str) -> Re
 async fn cmd_kill(project_id: &str, name: &str) -> Result<()> {
     let tmux_name = session::tmux_session_name(project_id, name);
     tmux::kill_session(&tmux_name).await?;
+    let base_dir = manifest::default_base_dir();
+    let _ = manifest::remove_session(&base_dir, project_id, name).await;
     println!("Killed session: {tmux_name}");
     Ok(())
 }
@@ -100,6 +108,7 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(project_id, cwd);
+    app.revive_sessions().await;
     app.refresh_sessions().await;
     app.refresh_preview().await;
 
@@ -116,7 +125,7 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
         match events.next().await {
             Some(Event::Key(key)) => {
                 if key.kind == KeyEventKind::Press {
-                    handle_key(&mut app, key).await;
+                    app.handle_key(key).await;
                     app.refresh_preview().await;
                 }
             }
@@ -146,74 +155,4 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
     Ok(())
 }
 
-async fn handle_key(app: &mut App, key: KeyEvent) {
-    match app.mode {
-        Mode::Browse => handle_browse_key(app, key.code),
-        Mode::Attached => handle_attached_key(app, key).await,
-        Mode::NewSessionName => handle_name_input_key(app, key.code),
-        Mode::NewSessionAgent => handle_agent_select_key(app, key.code).await,
-        Mode::ConfirmDelete => handle_confirm_delete_key(app, key.code).await,
-    }
-}
-
-fn handle_browse_key(app: &mut App, code: KeyCode) {
-    match code {
-        KeyCode::Char('q') => app.should_quit = true,
-        KeyCode::Char('j') | KeyCode::Down => app.select_next(),
-        KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
-        KeyCode::Enter => app.attach_selected(),
-        KeyCode::Char('n') => app.start_new_session(),
-        KeyCode::Char('d') => app.request_delete(),
-        _ => {}
-    }
-}
-
-fn handle_name_input_key(app: &mut App, code: KeyCode) {
-    match code {
-        KeyCode::Enter => app.submit_session_name(),
-        KeyCode::Esc => app.cancel_mode(),
-        KeyCode::Backspace => {
-            app.input.pop();
-        }
-        KeyCode::Char(c) => {
-            // Only allow valid tmux session name chars
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                app.input.push(c);
-            }
-        }
-        _ => {}
-    }
-}
-
-async fn handle_agent_select_key(app: &mut App, code: KeyCode) {
-    match code {
-        KeyCode::Enter => app.confirm_new_session().await,
-        KeyCode::Esc => app.cancel_mode(),
-        KeyCode::Char('j') | KeyCode::Down => app.agent_select_next(),
-        KeyCode::Char('k') | KeyCode::Up => app.agent_select_prev(),
-        _ => {}
-    }
-}
-
-async fn handle_attached_key(app: &mut App, key: KeyEvent) {
-    if key.code == KeyCode::Esc {
-        app.detach();
-        return;
-    }
-
-    if let Some(session) = app.sessions.get(app.selected) {
-        if let Some(tmux_key) = tmux::keycode_to_tmux(key.code, key.modifiers) {
-            let tmux_name = session.tmux_name.clone();
-            let _ = tmux::send_keys(&tmux_name, &tmux_key).await;
-        }
-    }
-}
-
-async fn handle_confirm_delete_key(app: &mut App, code: KeyCode) {
-    match code {
-        KeyCode::Char('y') => app.confirm_delete().await,
-        KeyCode::Esc | KeyCode::Char('n') => app.cancel_mode(),
-        _ => {}
-    }
-}
 
