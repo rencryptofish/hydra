@@ -49,6 +49,17 @@ pub enum SessionStatus {
     Exited,
 }
 
+impl SessionStatus {
+    /// Sort priority: Idle (needs input) first, then Running, then Exited.
+    pub fn sort_order(&self) -> u8 {
+        match self {
+            SessionStatus::Idle => 0,
+            SessionStatus::Running => 1,
+            SessionStatus::Exited => 2,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Session {
     pub name: String,
@@ -87,6 +98,29 @@ pub fn tmux_session_name(project_id: &str, name: &str) -> String {
 pub fn parse_session_name(tmux_name: &str, project_id: &str) -> Option<String> {
     let prefix = format!("hydra-{project_id}-");
     tmux_name.strip_prefix(&prefix).map(|s| s.to_string())
+}
+
+const AUTO_NAMES: &[&str] = &[
+    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet",
+    "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango",
+    "uniform", "victor", "whiskey", "xray", "yankee", "zulu",
+];
+
+/// Generate the next available session name from the NATO phonetic alphabet.
+pub fn generate_name(existing: &[String]) -> String {
+    for name in AUTO_NAMES {
+        if !existing.iter().any(|n| n == name) {
+            return name.to_string();
+        }
+    }
+    let mut i = AUTO_NAMES.len() + 1;
+    loop {
+        let name = format!("agent-{i}");
+        if !existing.iter().any(|n| *n == name) {
+            return name;
+        }
+        i += 1;
+    }
 }
 
 #[cfg(test)]
@@ -247,5 +281,103 @@ mod tests {
     fn agent_type_from_str_empty_returns_error() {
         let result = AgentType::from_str("");
         assert!(result.is_err());
+    }
+
+    // ── generate_name tests ──────────────────────────────────────────
+
+    #[test]
+    fn generate_name_first_is_alpha() {
+        let name = generate_name(&[]);
+        assert_eq!(name, "alpha");
+    }
+
+    #[test]
+    fn generate_name_skips_existing() {
+        let existing = vec!["alpha".to_string(), "bravo".to_string()];
+        let name = generate_name(&existing);
+        assert_eq!(name, "charlie");
+    }
+
+    #[test]
+    fn generate_name_fills_gaps() {
+        let existing = vec!["alpha".to_string(), "charlie".to_string()];
+        let name = generate_name(&existing);
+        assert_eq!(name, "bravo");
+    }
+
+    #[test]
+    fn generate_name_fallback_when_all_taken() {
+        let all_taken: Vec<String> = AUTO_NAMES.iter().map(|s| s.to_string()).collect();
+        let name = generate_name(&all_taken);
+        assert_eq!(name, "agent-27");
+    }
+
+    #[test]
+    fn generate_name_fallback_skips_existing() {
+        let mut names: Vec<String> = AUTO_NAMES.iter().map(|s| s.to_string()).collect();
+        names.push("agent-27".to_string());
+        let name = generate_name(&names);
+        assert_eq!(name, "agent-28");
+    }
+
+    // ── format_duration tests ────────────────────────────────────────
+
+    #[test]
+    fn format_duration_seconds_only() {
+        assert_eq!(format_duration(Duration::from_secs(0)), "0s");
+        assert_eq!(format_duration(Duration::from_secs(1)), "1s");
+        assert_eq!(format_duration(Duration::from_secs(59)), "59s");
+    }
+
+    #[test]
+    fn format_duration_minutes_and_seconds() {
+        assert_eq!(format_duration(Duration::from_secs(60)), "1m 00s");
+        assert_eq!(format_duration(Duration::from_secs(90)), "1m 30s");
+        assert_eq!(format_duration(Duration::from_secs(3599)), "59m 59s");
+    }
+
+    #[test]
+    fn format_duration_hours_and_minutes() {
+        assert_eq!(format_duration(Duration::from_secs(3600)), "1h 00m");
+        assert_eq!(format_duration(Duration::from_secs(3661)), "1h 01m");
+        assert_eq!(format_duration(Duration::from_secs(7200)), "2h 00m");
+    }
+
+    #[test]
+    fn format_duration_ignores_subsecond() {
+        assert_eq!(format_duration(Duration::from_millis(999)), "0s");
+        assert_eq!(format_duration(Duration::from_millis(1500)), "1s");
+    }
+
+    // ── SessionStatus::sort_order tests ─────────────────────────────
+
+    #[test]
+    fn sort_order_idle_is_lowest() {
+        assert_eq!(SessionStatus::Idle.sort_order(), 0);
+    }
+
+    #[test]
+    fn sort_order_running_is_middle() {
+        assert_eq!(SessionStatus::Running.sort_order(), 1);
+    }
+
+    #[test]
+    fn sort_order_exited_is_highest() {
+        assert_eq!(SessionStatus::Exited.sort_order(), 2);
+    }
+
+    #[test]
+    fn sort_order_produces_correct_ordering() {
+        let mut statuses = vec![
+            SessionStatus::Exited,
+            SessionStatus::Running,
+            SessionStatus::Idle,
+        ];
+        statuses.sort_by_key(|s| s.sort_order());
+        assert_eq!(statuses, vec![
+            SessionStatus::Idle,
+            SessionStatus::Running,
+            SessionStatus::Exited,
+        ]);
     }
 }
