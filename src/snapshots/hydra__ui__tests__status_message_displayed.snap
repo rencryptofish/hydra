@@ -1,0 +1,29 @@
+---
+source: src/ui.rs
+assertion_line: 376
+expression: output
+---
+┌ Sessions (0) ────────┐┌ Preview ─────────────────────────────────────────────┐
+│                      ││No sessions. Press 'n' to create one.                 │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+└──────────────────────┘└──────────────────────────────────────────────────────┘
+ Created session 'worker-1' with Claude | j/k: navigate  Enter: attach  n: new

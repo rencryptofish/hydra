@@ -1,0 +1,22 @@
+[package]
+name = "hydra"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures = "0.3"
+hex = "0.4"
+ratatui = "0.29"
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+insta = "1"
+assert_cmd = "2"
+predicates = "3"
