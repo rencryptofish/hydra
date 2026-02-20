@@ -1,9 +1,31 @@
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Duration;
 use tokio::process::Command;
 
 use crate::session::{parse_session_name, AgentType, Session, SessionStatus};
+
+/// Default timeout for subprocess calls (5 seconds).
+const CMD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run a Command with a timeout, returning its Output.
+/// On timeout or spawn failure, returns an anyhow error.
+pub async fn run_cmd_timeout(cmd: &mut Command) -> Result<std::process::Output> {
+    match tokio::time::timeout(CMD_TIMEOUT, cmd.output()).await {
+        Ok(result) => result.context("subprocess failed to execute"),
+        Err(_) => bail!("subprocess timed out after {}s", CMD_TIMEOUT.as_secs()),
+    }
+}
+
+/// Run a Command with a timeout, returning its ExitStatus.
+/// On timeout or spawn failure, returns an anyhow error.
+pub async fn run_status_timeout(cmd: &mut Command) -> Result<std::process::ExitStatus> {
+    match tokio::time::timeout(CMD_TIMEOUT, cmd.status()).await {
+        Ok(result) => result.context("subprocess failed to execute"),
+        Err(_) => bail!("subprocess timed out after {}s", CMD_TIMEOUT.as_secs()),
+    }
+}
 
 #[async_trait::async_trait]
 pub trait SessionManager: Send + Sync {
@@ -45,10 +67,10 @@ impl TmuxSessionManager {
 #[async_trait::async_trait]
 impl SessionManager for TmuxSessionManager {
     async fn list_sessions(&self, project_id: &str) -> Result<Vec<Session>> {
-        let output = Command::new("tmux")
-            .args(["list-sessions", "-F", "#{session_name}"])
-            .output()
-            .await;
+        let output = run_cmd_timeout(
+            Command::new("tmux").args(["list-sessions", "-F", "#{session_name}"]),
+        )
+        .await;
 
         let output = match output {
             Ok(o) => o,
@@ -155,25 +177,30 @@ impl SessionManager for TmuxSessionManager {
 }
 
 /// Check if the pane in a tmux session has exited (requires remain-on-exit).
+/// Returns `true` when the session can't be queried (gone/dead) — a session
+/// we can't reach is effectively dead rather than silently "Idle".
 async fn is_pane_dead(tmux_name: &str) -> bool {
-    let output = Command::new("tmux")
-        .args(["list-panes", "-t", tmux_name, "-F", "#{pane_dead}"])
-        .output()
-        .await;
+    let output = run_cmd_timeout(
+        Command::new("tmux").args(["list-panes", "-t", tmux_name, "-F", "#{pane_dead}"]),
+    )
+    .await;
 
     match output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim() == "1",
-        _ => false,
+        Ok(o) if o.status.success() => {
+            // Only treat as alive when we get a definitive "not dead" answer
+            String::from_utf8_lossy(&o.stdout).trim() != "0"
+        }
+        _ => true, // Can't reach session → treat as dead
     }
 }
 
 /// Read the HYDRA_AGENT_TYPE env var from the tmux session.
 async fn get_agent_type(tmux_name: &str) -> Option<AgentType> {
-    let output = Command::new("tmux")
-        .args(["show-environment", "-t", tmux_name, "HYDRA_AGENT_TYPE"])
-        .output()
-        .await
-        .ok()?;
+    let output = run_cmd_timeout(
+        Command::new("tmux").args(["show-environment", "-t", tmux_name, "HYDRA_AGENT_TYPE"]),
+    )
+    .await
+    .ok()?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Output format: HYDRA_AGENT_TYPE=claude
@@ -193,41 +220,37 @@ pub async fn create_session(
     let tmux_name = crate::session::tmux_session_name(project_id, name);
     let cmd = command_override.unwrap_or(agent.command());
 
-    let status = Command::new("tmux")
-        .args([
-            "new-session",
-            "-d",
-            "-s",
-            &tmux_name,
-            "-c",
-            cwd,
-            cmd,
-        ])
-        .status()
-        .await
-        .context("Failed to create tmux session")?;
+    let status = run_status_timeout(Command::new("tmux").args([
+        "new-session",
+        "-d",
+        "-s",
+        &tmux_name,
+        "-c",
+        cwd,
+        cmd,
+    ]))
+    .await
+    .context("Failed to create tmux session")?;
 
     if !status.success() {
         bail!("tmux new-session failed for '{tmux_name}'");
     }
 
     // Keep pane alive after command exits so we can detect Exited status
-    let _ = Command::new("tmux")
-        .args(["set-option", "-t", &tmux_name, "remain-on-exit", "on"])
-        .status()
-        .await;
+    let _ = run_status_timeout(
+        Command::new("tmux").args(["set-option", "-t", &tmux_name, "remain-on-exit", "on"]),
+    )
+    .await;
 
     // Store agent type as env var on the session
-    let _ = Command::new("tmux")
-        .args([
-            "set-environment",
-            "-t",
-            &tmux_name,
-            "HYDRA_AGENT_TYPE",
-            &agent.to_string().to_lowercase(),
-        ])
-        .status()
-        .await;
+    let _ = run_status_timeout(Command::new("tmux").args([
+        "set-environment",
+        "-t",
+        &tmux_name,
+        "HYDRA_AGENT_TYPE",
+        &agent.to_string().to_lowercase(),
+    ]))
+    .await;
 
     Ok(tmux_name)
 }
