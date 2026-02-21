@@ -19,8 +19,8 @@ use hydra::event::{Event, EventHandler};
 use hydra::session::{self, project_id, AgentType};
 use hydra::{manifest, tmux, ui};
 
-const EVENT_TICK_RATE: Duration = Duration::from_millis(100);
-const SESSION_REFRESH_INTERVAL_TICKS: u8 = 2;
+const EVENT_TICK_RATE: Duration = Duration::from_millis(50);
+const SESSION_REFRESH_INTERVAL_TICKS: u8 = 1;
 
 // Minisign Ed25519 public key for verifying release binaries.
 // This is the second line (base64 key data) from the .pub file.
