@@ -26,6 +26,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 insta = "1"
 assert_cmd = "2"
 predicates = "3"
+proptest = "1"
 tempfile = "3"
 
 [[bench]]

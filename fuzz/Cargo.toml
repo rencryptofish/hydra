@@ -1,0 +1,40 @@
+[package]
+name = "hydra-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+tempfile = "3"
+
+[dependencies.hydra]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_normalize_capture"
+path = "fuzz_targets/fuzz_normalize_capture.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_jsonl_parsing"
+path = "fuzz_targets/fuzz_jsonl_parsing.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_extract_message"
+path = "fuzz_targets/fuzz_extract_message.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_diff_numstat"
+path = "fuzz_targets/fuzz_diff_numstat.rs"
+doc = false

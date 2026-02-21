@@ -3165,4 +3165,393 @@ mod tests {
         );
         assert_eq!(escape_project_path("no-slashes"), "no-slashes");
     }
+
+    // ── extract_assistant_message_text edge cases ──
+
+    #[test]
+    fn extract_assistant_message_text_no_content_field() {
+        let v = serde_json::json!({"message": {"role": "assistant"}});
+        assert_eq!(extract_assistant_message_text(&v), None);
+    }
+
+    #[test]
+    fn extract_assistant_message_text_no_text_items() {
+        let v = serde_json::json!({
+            "message": {
+                "content": [
+                    {"type": "tool_use", "name": "Bash", "input": {}}
+                ]
+            }
+        });
+        assert_eq!(extract_assistant_message_text(&v), None);
+    }
+
+    #[test]
+    fn extract_assistant_message_text_multiple_parts() {
+        let v = serde_json::json!({
+            "message": {
+                "content": [
+                    {"type": "text", "text": "Hello"},
+                    {"type": "tool_use", "name": "Bash", "input": {}},
+                    {"type": "text", "text": "World"}
+                ]
+            }
+        });
+        assert_eq!(extract_assistant_message_text(&v), Some("Hello World".to_string()));
+    }
+
+    #[test]
+    fn extract_assistant_message_text_empty_content_array() {
+        let v = serde_json::json!({"message": {"content": []}});
+        assert_eq!(extract_assistant_message_text(&v), None);
+    }
+
+    #[test]
+    fn extract_assistant_message_text_no_message_field() {
+        let v = serde_json::json!({"type": "assistant"});
+        assert_eq!(extract_assistant_message_text(&v), None);
+    }
+
+    // ── add_claude_usage / add_codex_usage direct tests ──
+
+    #[test]
+    fn add_claude_usage_accumulates() {
+        let mut stats = GlobalStats::default();
+        add_claude_usage(&mut stats, 100, 50, 20, 10);
+        add_claude_usage(&mut stats, 200, 100, 30, 20);
+        assert_eq!(stats.tokens_in, 300);
+        assert_eq!(stats.tokens_out, 150);
+        assert_eq!(stats.tokens_cache_read, 50);
+        assert_eq!(stats.tokens_cache_write, 30);
+        assert_eq!(stats.claude_tokens_in, 300);
+        assert_eq!(stats.claude_tokens_out, 150);
+        assert_eq!(stats.claude_tokens_cache_read, 50);
+        assert_eq!(stats.claude_tokens_cache_write, 30);
+    }
+
+    #[test]
+    fn add_codex_usage_accumulates() {
+        let mut stats = GlobalStats::default();
+        add_codex_usage(&mut stats, 100, 50, 20);
+        add_codex_usage(&mut stats, 200, 100, 30);
+        assert_eq!(stats.tokens_in, 300);
+        assert_eq!(stats.tokens_out, 150);
+        assert_eq!(stats.tokens_cache_read, 50);
+        assert_eq!(stats.codex_tokens_in, 300);
+        assert_eq!(stats.codex_tokens_out, 150);
+        assert_eq!(stats.codex_tokens_cache_read, 50);
+    }
+
+    #[test]
+    fn add_mixed_usage_separates_providers() {
+        let mut stats = GlobalStats::default();
+        add_claude_usage(&mut stats, 100, 50, 20, 10);
+        add_codex_usage(&mut stats, 200, 100, 30);
+        // Combined totals
+        assert_eq!(stats.tokens_in, 300);
+        assert_eq!(stats.tokens_out, 150);
+        // Provider-specific
+        assert_eq!(stats.claude_tokens_in, 100);
+        assert_eq!(stats.codex_tokens_in, 200);
+    }
+
+    // ── process_claude_global_file tests ──
+
+    #[test]
+    fn process_claude_global_file_incremental_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        // Write one line
+        let line1 = format!(
+            r#"{{"type":"assistant","timestamp":"{today}T10:00:00Z","message":{{"usage":{{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":10,"cache_creation_input_tokens":5}},"content":[]}}}}"#
+        );
+        std::fs::write(&path, format!("{line1}\n")).unwrap();
+
+        let mut stats = GlobalStats::default();
+        stats.date = today.clone();
+        let pb = std::path::PathBuf::from(&path);
+        process_claude_global_file(&pb, &mut stats, &today);
+        assert_eq!(stats.tokens_in, 100);
+        assert_eq!(stats.tokens_out, 50);
+        let offset1 = stats.file_offsets[&pb];
+
+        // Append a second line
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let line2 = format!(
+            r#"{{"type":"assistant","timestamp":"{today}T11:00:00Z","message":{{"usage":{{"input_tokens":200,"output_tokens":100,"cache_read_input_tokens":20,"cache_creation_input_tokens":10}},"content":[]}}}}"#
+        );
+        writeln!(file, "{line2}").unwrap();
+
+        // Second call reads only new bytes
+        process_claude_global_file(&pb, &mut stats, &today);
+        assert_eq!(stats.tokens_in, 300); // 100 + 200
+        assert_eq!(stats.tokens_out, 150); // 50 + 100
+        assert!(stats.file_offsets[&pb] > offset1);
+    }
+
+    #[test]
+    fn process_claude_global_file_skips_non_assistant_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        let lines = format!(
+            r#"{{"type":"human","timestamp":"{today}T10:00:00Z","message":{{"usage":{{"input_tokens":500,"output_tokens":500}},"content":[]}}}}"#
+        );
+        std::fs::write(&path, format!("{lines}\n")).unwrap();
+
+        let mut stats = GlobalStats::default();
+        stats.date = today.clone();
+        process_claude_global_file(&std::path::PathBuf::from(&path), &mut stats, &today);
+        assert_eq!(stats.tokens_in, 0, "non-assistant lines should be skipped");
+    }
+
+    #[test]
+    fn process_claude_global_file_skips_other_dates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        // Line from yesterday — doesn't contain today's date
+        let line = r#"{"type":"assistant","timestamp":"1999-01-01T10:00:00Z","message":{"usage":{"input_tokens":500,"output_tokens":500},"content":[]}}"#;
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+
+        let mut stats = GlobalStats::default();
+        stats.date = today.clone();
+        process_claude_global_file(&std::path::PathBuf::from(&path), &mut stats, &today);
+        assert_eq!(stats.tokens_in, 0, "other dates should be skipped");
+    }
+
+    // ── process_codex_global_file tests ──
+
+    #[test]
+    fn process_codex_global_file_basic_token_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        let line = format!(
+            r#"{{"type":"event_msg","timestamp":"{today}T10:00:00Z","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":100,"output_tokens":50,"cached_input_tokens":10,"total_tokens":150}}}}}}}}"#
+        );
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+
+        let mut stats = GlobalStats::default();
+        stats.date = today.clone();
+        process_codex_global_file(&std::path::PathBuf::from(&path), &mut stats, &today);
+        assert_eq!(stats.codex_tokens_in, 100);
+        assert_eq!(stats.codex_tokens_out, 50);
+        assert_eq!(stats.codex_tokens_cache_read, 10);
+    }
+
+    #[test]
+    fn process_codex_global_file_non_event_msg_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        let line = format!(
+            r#"{{"type":"other_type","timestamp":"{today}T10:00:00Z","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":100,"output_tokens":50,"total_tokens":150}}}}}}}}"#
+        );
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+
+        let mut stats = GlobalStats::default();
+        stats.date = today.clone();
+        process_codex_global_file(&std::path::PathBuf::from(&path), &mut stats, &today);
+        assert_eq!(stats.codex_tokens_in, 0, "non-event_msg should be skipped");
+    }
+
+    #[test]
+    fn process_codex_global_file_missing_payload_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        // Has token_count and total_token_usage in text to pass quick filter, but no payload field
+        let line = format!(
+            r#"{{"type":"event_msg","timestamp":"{today}T10:00:00Z","data":"token_count total_token_usage"}}"#
+        );
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+
+        let mut stats = GlobalStats::default();
+        stats.date = today.clone();
+        process_codex_global_file(&std::path::PathBuf::from(&path), &mut stats, &today);
+        assert_eq!(stats.codex_tokens_in, 0);
+    }
+
+    #[test]
+    fn process_codex_global_file_non_token_count_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        // payload type is not "token_count" (but text contains both quick-filter strings)
+        let line = format!(
+            r#"{{"type":"event_msg","timestamp":"{today}T10:00:00Z","payload":{{"type":"other","info":{{"total_token_usage":{{"input_tokens":100,"output_tokens":50,"total_tokens":150}}}}}}}}"#
+        );
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+
+        let mut stats = GlobalStats::default();
+        stats.date = today.clone();
+        process_codex_global_file(&std::path::PathBuf::from(&path), &mut stats, &today);
+        assert_eq!(stats.codex_tokens_in, 0, "non-token_count payload should be skipped");
+    }
+
+    #[test]
+    fn process_codex_global_file_not_today_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        // First line with yesterday's timestamp — should be tracked for delta but not added to today's tokens
+        let line = format!(
+            r#"{{"type":"event_msg","timestamp":"1999-01-01T10:00:00Z","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":100,"output_tokens":50,"cached_input_tokens":0,"total_tokens":150}}}}}}}}"#
+        );
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+
+        let mut stats = GlobalStats::default();
+        stats.date = today.clone();
+        process_codex_global_file(&std::path::PathBuf::from(&path), &mut stats, &today);
+        assert_eq!(stats.codex_tokens_in, 0, "yesterday's tokens should not count for today");
+    }
+
+    // ── update_global_stats date change ──
+
+    #[test]
+    fn update_global_stats_inner_resets_on_date_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::set(dir.path());
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        let mut stats = GlobalStats::default();
+        stats.date = "1999-01-01".to_string();
+        stats.tokens_in = 999;
+        stats.tokens_out = 999;
+        stats.claude_tokens_in = 500;
+        stats.codex_tokens_in = 499;
+        stats.codex_file_states.insert(
+            std::path::PathBuf::from("/old/file"),
+            CodexFileState {
+                read_offset: 100,
+                last_total_tokens: 50,
+                last_input_tokens: 30,
+                last_output_tokens: 20,
+                last_cached_input_tokens: 0,
+            },
+        );
+        stats.file_offsets.insert(std::path::PathBuf::from("/old/claude"), 200);
+
+        // Call with the real today — should reset everything
+        update_global_stats(&mut stats);
+
+        assert_eq!(stats.date, today);
+        assert_eq!(stats.tokens_in, 0);
+        assert_eq!(stats.tokens_out, 0);
+        assert_eq!(stats.claude_tokens_in, 0);
+        assert_eq!(stats.codex_tokens_in, 0);
+        assert!(stats.codex_file_states.is_empty());
+        assert!(stats.file_offsets.is_empty());
+    }
+
+    // ── proptest ──────────────────────────────────────────────────────
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn extract_assistant_message_text_never_panics(json_str in ".*") {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                    let _ = extract_assistant_message_text(&v);
+                }
+            }
+
+            #[test]
+            fn extract_with_valid_structure(text in "[a-zA-Z0-9 .!?]{1,100}") {
+                let v: serde_json::Value = serde_json::json!({
+                    "message": {
+                        "content": [{"text": text}]
+                    }
+                });
+                let result = extract_assistant_message_text(&v);
+                prop_assert_eq!(result, Some(text));
+            }
+
+            #[test]
+            fn extract_with_multiple_blocks(
+                text1 in "[a-zA-Z0-9]{1,30}",
+                text2 in "[a-zA-Z0-9]{1,30}"
+            ) {
+                let v: serde_json::Value = serde_json::json!({
+                    "message": {
+                        "content": [{"text": &text1}, {"text": &text2}]
+                    }
+                });
+                let result = extract_assistant_message_text(&v);
+                prop_assert_eq!(result, Some(format!("{text1} {text2}")));
+            }
+
+            #[test]
+            fn escape_project_path_replaces_all_slashes(path in "/[a-zA-Z0-9/]{1,50}") {
+                let escaped = escape_project_path(&path);
+                prop_assert!(!escaped.contains('/'));
+            }
+
+            #[test]
+            fn stats_from_valid_jsonl_never_panics(
+                tokens_in in 0u64..1_000_000,
+                tokens_out in 0u64..1_000_000
+            ) {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("test.jsonl");
+                let line = serde_json::json!({
+                    "type": "assistant",
+                    "timestamp": "2025-01-01T00:00:00Z",
+                    "message": {
+                        "content": [{"text": "hello"}],
+                        "usage": {
+                            "input_tokens": tokens_in,
+                            "output_tokens": tokens_out
+                        }
+                    }
+                });
+                std::fs::write(&path, format!("{}\n", line)).unwrap();
+                let mut stats = SessionStats::default();
+                let _ = update_session_stats_from_path_and_last_message(&path, &mut stats);
+                prop_assert_eq!(stats.tokens_in, tokens_in);
+                prop_assert_eq!(stats.tokens_out, tokens_out);
+                prop_assert_eq!(stats.turns, 1);
+            }
+
+            #[test]
+            fn stats_incremental_reads_accumulate(n in 1u32..10) {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("test.jsonl");
+                let mut content = String::new();
+                for i in 0..n {
+                    let line = serde_json::json!({
+                        "type": "assistant",
+                        "timestamp": format!("2025-01-01T00:00:{:02}Z", i),
+                        "message": {
+                            "content": [{"text": "msg"}],
+                            "usage": {
+                                "input_tokens": 100,
+                                "output_tokens": 50
+                            }
+                        }
+                    });
+                    content.push_str(&format!("{}\n", line));
+                }
+                std::fs::write(&path, &content).unwrap();
+                let mut stats = SessionStats::default();
+                let _ = update_session_stats_from_path_and_last_message(&path, &mut stats);
+                prop_assert_eq!(stats.turns, n);
+                prop_assert_eq!(stats.tokens_in, 100 * n as u64);
+                prop_assert_eq!(stats.tokens_out, 50 * n as u64);
+            }
+        }
+    }
 }

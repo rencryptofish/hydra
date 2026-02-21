@@ -547,7 +547,7 @@ fn draw_confirm_delete(frame: &mut Frame, app: &App) {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{backend::TestBackend, layout::Rect, Terminal};
 
     use crate::app::{App, Mode};
     use crate::session::{AgentType, Session, SessionStatus};
@@ -1255,5 +1255,35 @@ mod tests {
         let output = buffer_to_string(&terminal);
 
         insta::assert_snapshot!(output);
+    }
+
+    // ── inset_rect tests ──
+
+    #[test]
+    fn inset_rect_basic() {
+        let area = Rect::new(10, 20, 100, 50);
+        let inset = super::inset_rect(area, 5);
+        assert_eq!(inset.x, 15);
+        assert_eq!(inset.y, 25);
+        assert_eq!(inset.width, 90);
+        assert_eq!(inset.height, 40);
+    }
+
+    #[test]
+    fn inset_rect_zero_margin() {
+        let area = Rect::new(0, 0, 80, 24);
+        let inset = super::inset_rect(area, 0);
+        assert_eq!(inset, area);
+    }
+
+    #[test]
+    fn inset_rect_margin_exceeds_size() {
+        let area = Rect::new(0, 0, 10, 8);
+        let inset = super::inset_rect(area, 20);
+        // saturating_sub means width and height become 0
+        assert_eq!(inset.width, 0);
+        assert_eq!(inset.height, 0);
+        assert_eq!(inset.x, 20); // saturating_add
+        assert_eq!(inset.y, 20);
     }
 }

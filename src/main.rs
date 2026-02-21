@@ -33,13 +33,13 @@ const GITHUB_RELEASES_URL: &str =
     "https://api.github.com/repos/rencryptofish/hydra/releases/latest";
 
 #[derive(Parser)]
-#[command(name = "hydra", about = "AI Agent tmux session manager")]
+#[command(name = "hydra", version, about = "AI Agent tmux session manager")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Commands {
     /// Create a new agent session
     New {
@@ -263,10 +263,15 @@ fn replace_binary(new_binary: &[u8]) -> Result<()> {
     let current = current
         .canonicalize()
         .context("Failed to canonicalize executable path")?;
+    replace_binary_at(new_binary, &current)
+}
 
-    let dir = current
+/// Atomically replaces the binary at `target` with the new bytes.
+/// Writes to a temp file in the same directory, sets permissions, then renames.
+fn replace_binary_at(new_binary: &[u8], target: &std::path::Path) -> Result<()> {
+    let dir = target
         .parent()
-        .context("Executable has no parent directory")?;
+        .context("Target path has no parent directory")?;
 
     let tmp_name = format!(".hydra-update-{}.tmp", std::process::id());
     let tmp_path = dir.join(&tmp_name);
@@ -294,12 +299,12 @@ fn replace_binary(new_binary: &[u8]) -> Result<()> {
     }
 
     // Atomic rename
-    if let Err(e) = std::fs::rename(&tmp_path, &current) {
+    if let Err(e) = std::fs::rename(&tmp_path, target) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e).with_context(|| {
             format!(
                 "Failed to replace binary at {}. You may need to run with sudo.",
-                current.display()
+                target.display()
             )
         });
     }
@@ -510,5 +515,152 @@ mod update_tests {
 
         let result = verify_signature(binary, bad_sig);
         assert!(result.is_err(), "should reject invalid signature");
+    }
+
+    // ── find_asset_urls edge cases ────────────────────────────────────
+
+    #[test]
+    fn test_find_asset_urls_missing_tag_name() {
+        let json = serde_json::json!({
+            "assets": [{"name": "hydra-darwin-aarch64", "browser_download_url": "https://example.com/bin"}]
+        });
+        let err = find_asset_urls(&json, "hydra-darwin-aarch64").unwrap_err();
+        assert!(err.to_string().contains("tag_name"));
+    }
+
+    #[test]
+    fn test_find_asset_urls_missing_assets_array() {
+        let json = serde_json::json!({
+            "tag_name": "v1.0.0"
+        });
+        let err = find_asset_urls(&json, "hydra-darwin-aarch64").unwrap_err();
+        assert!(err.to_string().contains("assets"));
+    }
+
+    #[test]
+    fn test_find_asset_urls_asset_without_download_url() {
+        let json = serde_json::json!({
+            "tag_name": "v1.0.0",
+            "assets": [
+                {"name": "hydra-darwin-aarch64"},
+                {"name": "hydra-darwin-aarch64.minisig"}
+            ]
+        });
+        let err = find_asset_urls(&json, "hydra-darwin-aarch64").unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_find_asset_urls_empty_assets() {
+        let json = serde_json::json!({
+            "tag_name": "v1.0.0",
+            "assets": []
+        });
+        let err = find_asset_urls(&json, "hydra-darwin-aarch64").unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    // ── verify_signature edge cases ──────────────────────────────────
+
+    #[test]
+    fn test_verify_signature_non_utf8_sig() {
+        let binary = b"fake binary";
+        let bad_sig: &[u8] = &[0xFF, 0xFE, 0xFD]; // invalid UTF-8
+        let result = verify_signature(binary, bad_sig);
+        assert!(result.is_err());
+        // May fail on UTF-8 or on public key decode (placeholder key)
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("UTF-8") || msg.contains("public key"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_verify_signature_empty_sig() {
+        let binary = b"fake binary";
+        let result = verify_signature(binary, b"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_signature_garbage_text() {
+        let binary = b"fake binary";
+        let result = verify_signature(binary, b"this is not a minisig signature at all");
+        assert!(result.is_err());
+    }
+
+    // ── replace_binary_at tests ──────────────────────────────────────
+
+    #[test]
+    fn test_replace_binary_at_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("hydra-test-bin");
+        std::fs::write(&target, b"old content").unwrap();
+
+        let new_content = b"new binary content here";
+        replace_binary_at(new_content, &target).unwrap();
+
+        let written = std::fs::read(&target).unwrap();
+        assert_eq!(written, new_content);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_replace_binary_at_sets_executable_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("hydra-test-bin-perms");
+        std::fs::write(&target, b"old").unwrap();
+
+        replace_binary_at(b"new", &target).unwrap();
+
+        let meta = std::fs::metadata(&target).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "should have 0o755 permissions");
+    }
+
+    #[test]
+    fn test_replace_binary_at_nonexistent_parent_dir() {
+        let target = std::path::Path::new("/nonexistent/dir/hydra-bin");
+        let result = replace_binary_at(b"content", target);
+        assert!(result.is_err());
+    }
+
+    // ── CLI parsing tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_cli_parsing_new_command() {
+        let cli = Cli::parse_from(["hydra", "new", "claude", "alpha"]);
+        match cli.command {
+            Some(Commands::New { agent, name }) => {
+                assert_eq!(agent, "claude");
+                assert_eq!(name, "alpha");
+            }
+            other => panic!("expected New, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parsing_kill_command() {
+        let cli = Cli::parse_from(["hydra", "kill", "alpha"]);
+        match cli.command {
+            Some(Commands::Kill { name }) => assert_eq!(name, "alpha"),
+            other => panic!("expected Kill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parsing_ls_command() {
+        let cli = Cli::parse_from(["hydra", "ls"]);
+        assert!(matches!(cli.command, Some(Commands::Ls)));
+    }
+
+    #[test]
+    fn test_cli_parsing_update_command() {
+        let cli = Cli::parse_from(["hydra", "update"]);
+        assert!(matches!(cli.command, Some(Commands::Update)));
+    }
+
+    #[test]
+    fn test_cli_parsing_no_command() {
+        let cli = Cli::parse_from(["hydra"]);
+        assert!(cli.command.is_none());
     }
 }

@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -29,6 +29,220 @@ pub enum Mode {
     ConfirmDelete,
 }
 
+/// Tracks per-session pane content changes and debounces status transitions.
+pub(crate) struct StatusDetector {
+    pub(crate) prev_captures: HashMap<String, String>,
+    pub(crate) raw_captures: HashMap<String, String>,
+    pub(crate) idle_ticks: HashMap<String, u8>,
+    pub(crate) changed_ticks: HashMap<String, u8>,
+    pub(crate) dead_ticks: HashMap<String, u8>,
+    pub(crate) latest_pane_captures: HashMap<String, String>,
+}
+
+impl StatusDetector {
+    /// Consecutive dead ticks required before accepting Exited (~600ms at 200ms/refresh).
+    pub(crate) const DEAD_TICK_THRESHOLD: u8 = 3;
+    /// Extended dead tick threshold when subagents are active (~3s), allowing orchestration to settle.
+    pub(crate) const DEAD_TICK_SUBAGENT_THRESHOLD: u8 = 15;
+
+    fn new() -> Self {
+        Self {
+            prev_captures: HashMap::new(),
+            raw_captures: HashMap::new(),
+            idle_ticks: HashMap::new(),
+            changed_ticks: HashMap::new(),
+            dead_ticks: HashMap::new(),
+            latest_pane_captures: HashMap::new(),
+        }
+    }
+
+    /// Determine Running/Idle/Exited for each session based on pane content changes.
+    pub(crate) fn update_statuses(
+        &mut self,
+        sessions: &mut [Session],
+        captures: &HashMap<String, String>,
+        prev_statuses: &HashMap<String, SessionStatus>,
+        session_stats: &HashMap<String, SessionStats>,
+    ) {
+        for session in sessions.iter_mut() {
+            let name = session.tmux_name.clone();
+
+            let has_active_subagents = session_stats
+                .get(&name)
+                .map(|st| st.active_subagents > 0)
+                .unwrap_or(false);
+
+            // Debounce Exited: require consecutive dead ticks before accepting.
+            if session.status == SessionStatus::Exited {
+                let count = self.dead_ticks.entry(name.clone()).or_insert(0);
+                *count = count.saturating_add(1);
+                let threshold = if has_active_subagents {
+                    Self::DEAD_TICK_SUBAGENT_THRESHOLD
+                } else {
+                    Self::DEAD_TICK_THRESHOLD
+                };
+                if *count < threshold {
+                    session.status = prev_statuses
+                        .get(&name)
+                        .filter(|s| **s != SessionStatus::Exited)
+                        .cloned()
+                        .unwrap_or(SessionStatus::Idle);
+                }
+            } else {
+                self.dead_ticks.insert(name.clone(), 0);
+            }
+
+            // Carry forward previous status for hysteresis.
+            if let Some(prev_status) = prev_statuses.get(&name) {
+                if session.status == SessionStatus::Exited {
+                    // Pane is confirmed dead (passed debounce); keep Exited
+                } else if *prev_status == SessionStatus::Exited {
+                    // Pane was dead, now alive: clear stale caches for fresh start
+                    self.prev_captures.remove(&name);
+                    self.raw_captures.remove(&name);
+                    self.idle_ticks.remove(&name);
+                    self.changed_ticks.remove(&name);
+                } else {
+                    // Normal: carry forward prev status for hysteresis
+                    session.status = prev_status.clone();
+                }
+            }
+
+            // Determine Running vs Idle by comparing pane content.
+            let log_idle = session_stats
+                .get(&name)
+                .map(|st| st.task_elapsed().is_none())
+                .unwrap_or(false);
+            let idle_threshold: u8 = if log_idle { 8 } else { 30 };
+
+            if let Some(content) = captures.get(&name) {
+                let raw_prev = self.raw_captures.get(&name);
+                let first_capture = raw_prev.is_none();
+                let raw_unchanged = !first_capture && raw_prev.unwrap() == content;
+                self.raw_captures.insert(name.clone(), content.clone());
+
+                let (unchanged, raw_changed_but_normalized_same) = if raw_unchanged {
+                    (true, false)
+                } else {
+                    let normalized = normalize_capture(content);
+                    let prev = self.prev_captures.get(&name);
+                    let normalized_unchanged = prev.is_some_and(|p| *p == normalized);
+                    self.prev_captures.insert(name.clone(), normalized);
+                    (normalized_unchanged, normalized_unchanged)
+                };
+
+                let changed = !unchanged
+                    || (session.agent_type == AgentType::Codex
+                        && raw_changed_but_normalized_same);
+
+                if first_capture {
+                    session.status = SessionStatus::Running;
+                } else if !changed {
+                    let count = self.idle_ticks.entry(name.clone()).or_insert(0);
+                    *count = count.saturating_add(1);
+                    self.changed_ticks.insert(name.clone(), 0);
+
+                    if has_active_subagents {
+                        session.status = SessionStatus::Running;
+                    } else if *count >= idle_threshold {
+                        session.status = SessionStatus::Idle;
+                    }
+                } else {
+                    let count = self.changed_ticks.entry(name.clone()).or_insert(0);
+                    *count = count.saturating_add(1);
+                    self.idle_ticks.insert(name.clone(), 0);
+
+                    if *count >= 5 {
+                        session.status = SessionStatus::Running;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Remove entries for sessions that no longer exist.
+    pub(crate) fn prune(&mut self, live_keys: &HashSet<&String>) {
+        self.prev_captures.retain(|k, _| live_keys.contains(k));
+        self.raw_captures.retain(|k, _| live_keys.contains(k));
+        self.idle_ticks.retain(|k, _| live_keys.contains(k));
+        self.changed_ticks.retain(|k, _| live_keys.contains(k));
+        self.dead_ticks.retain(|k, _| live_keys.contains(k));
+        self.latest_pane_captures.retain(|k, _| live_keys.contains(k));
+    }
+
+    /// Get idle tick count for a session (used by preview refresh skip logic).
+    pub(crate) fn idle_ticks_for(&self, name: &str) -> u8 {
+        self.idle_ticks.get(name).copied().unwrap_or(0)
+    }
+}
+
+/// Tracks per-session task start/last-active timestamps for elapsed timer display.
+pub(crate) struct TaskTimers {
+    pub(crate) task_starts: HashMap<String, Instant>,
+    pub(crate) task_last_active: HashMap<String, Instant>,
+}
+
+impl TaskTimers {
+    fn new() -> Self {
+        Self {
+            task_starts: HashMap::new(),
+            task_last_active: HashMap::new(),
+        }
+    }
+
+    /// Update task_elapsed on each session based on its status and timestamps.
+    pub(crate) fn update(
+        &mut self,
+        sessions: &mut [Session],
+        session_stats: &HashMap<String, SessionStats>,
+        now: Instant,
+    ) {
+        for session in sessions.iter_mut() {
+            let name = session.tmux_name.clone();
+
+            let log_elapsed = session_stats
+                .get(&name)
+                .and_then(|st| st.task_elapsed());
+
+            match session.status {
+                SessionStatus::Running => {
+                    self.task_starts.entry(name.clone()).or_insert(now);
+                    self.task_last_active.insert(name.clone(), now);
+                    session.task_elapsed = log_elapsed.or_else(|| {
+                        let start = self.task_starts[&name];
+                        Some(now.duration_since(start))
+                    });
+                }
+                SessionStatus::Idle => {
+                    if log_elapsed.is_some() {
+                        session.task_elapsed = log_elapsed;
+                    } else if let (Some(&start), Some(&last)) = (
+                        self.task_starts.get(&name),
+                        self.task_last_active.get(&name),
+                    ) {
+                        if now.duration_since(last).as_secs() < 5 {
+                            session.task_elapsed = Some(last.duration_since(start));
+                        } else {
+                            self.task_starts.remove(&name);
+                            self.task_last_active.remove(&name);
+                        }
+                    }
+                }
+                SessionStatus::Exited => {
+                    self.task_starts.remove(&name);
+                    self.task_last_active.remove(&name);
+                }
+            }
+        }
+    }
+
+    /// Remove entries for sessions that no longer exist.
+    pub(crate) fn prune(&mut self, live_keys: &HashSet<&String>) {
+        self.task_starts.retain(|k, _| live_keys.contains(k));
+        self.task_last_active.retain(|k, _| live_keys.contains(k));
+    }
+}
+
 pub struct App {
     pub sessions: Vec<Session>,
     pub selected: usize,
@@ -48,17 +262,8 @@ pub struct App {
     pub sidebar_area: Cell<Rect>,
     pub preview_area: Cell<Rect>,
     pub preview_scroll_offset: u16,
-    prev_captures: HashMap<String, String>,
-    /// Raw (un-normalized) pane captures for skip-normalization optimization.
-    raw_captures: HashMap<String, String>,
-    /// Consecutive ticks with unchanged pane content (for Running→Idle debounce).
-    idle_ticks: HashMap<String, u8>,
-    /// Consecutive ticks with changed pane content (for Idle→Running debounce).
-    changed_ticks: HashMap<String, u8>,
-    /// Consecutive refresh ticks where is_pane_dead() reported dead (for Exited debounce).
-    dead_ticks: HashMap<String, u8>,
-    task_starts: HashMap<String, Instant>,
-    task_last_active: HashMap<String, Instant>,
+    pub(crate) status: StatusDetector,
+    pub(crate) timers: TaskTimers,
     pub last_messages: HashMap<String, String>,
     pub session_stats: HashMap<String, SessionStats>,
     pub global_stats: GlobalStats,
@@ -67,9 +272,6 @@ pub struct App {
     log_uuids: HashMap<String, String>,
     /// Per-session cooldown (in refresh cycles) before retrying UUID resolution.
     uuid_retry_cooldowns: HashMap<String, u8>,
-    /// Latest per-session pane captures from `refresh_sessions` tick.
-    /// Used by preview refresh to avoid redundant tmux calls.
-    latest_pane_captures: HashMap<String, String>,
     message_tick: u8,
     pub manifest_dir: PathBuf,
     manager: Box<dyn SessionManager>,
@@ -88,11 +290,6 @@ pub struct App {
 }
 
 impl App {
-    /// Consecutive dead ticks required before accepting Exited (~600ms at 200ms/refresh).
-    const DEAD_TICK_THRESHOLD: u8 = 3;
-    /// Extended dead tick threshold when subagents are active (~3s), allowing orchestration to settle.
-    const DEAD_TICK_SUBAGENT_THRESHOLD: u8 = 15;
-
     pub fn new(project_id: String, cwd: String) -> Self {
         Self::new_with_manager(project_id, cwd, Box::new(TmuxSessionManager::new()))
     }
@@ -118,20 +315,14 @@ impl App {
             sidebar_area: Cell::new(Rect::default()),
             preview_area: Cell::new(Rect::default()),
             preview_scroll_offset: 0,
-            prev_captures: HashMap::new(),
-            raw_captures: HashMap::new(),
-            idle_ticks: HashMap::new(),
-            changed_ticks: HashMap::new(),
-            dead_ticks: HashMap::new(),
-            task_starts: HashMap::new(),
-            task_last_active: HashMap::new(),
+            status: StatusDetector::new(),
+            timers: TaskTimers::new(),
             last_messages: HashMap::new(),
             session_stats: HashMap::new(),
             global_stats: GlobalStats::default(),
             diff_files: Vec::new(),
             log_uuids: HashMap::new(),
             uuid_retry_cooldowns: HashMap::new(),
-            latest_pane_captures: HashMap::new(),
             message_tick: 0,
             manifest_dir: crate::manifest::default_base_dir(),
             manager,
@@ -182,172 +373,14 @@ impl App {
                     .map(|(name, res)| (name, res.unwrap_or_default()))
                     .collect();
 
-                for session in &mut sessions {
-                    let name = session.tmux_name.clone();
+                self.status.update_statuses(
+                    &mut sessions,
+                    &captures,
+                    &prev_statuses,
+                    &self.session_stats,
+                );
 
-                    let has_active_subagents = self
-                        .session_stats
-                        .get(&name)
-                        .map(|st| st.active_subagents > 0)
-                        .unwrap_or(false);
-
-                    // Debounce Exited: require consecutive dead ticks before accepting.
-                    // A single is_pane_dead()=true (e.g. timeout during heavy I/O) should
-                    // not permanently mark a session as Exited.
-                    if session.status == SessionStatus::Exited {
-                        let count = self.dead_ticks.entry(name.clone()).or_insert(0);
-                        *count = count.saturating_add(1);
-                        let threshold = if has_active_subagents {
-                            Self::DEAD_TICK_SUBAGENT_THRESHOLD
-                        } else {
-                            Self::DEAD_TICK_THRESHOLD
-                        };
-                        if *count < threshold {
-                            // Not enough consecutive dead ticks — keep previous non-Exited status
-                            session.status = prev_statuses
-                                .get(&name)
-                                .filter(|s| **s != SessionStatus::Exited)
-                                .cloned()
-                                .unwrap_or(SessionStatus::Idle);
-                        }
-                    } else {
-                        self.dead_ticks.insert(name.clone(), 0);
-                    }
-
-                    // Carry forward previous status for hysteresis.
-                    // list_sessions() returns fresh Session objects; without this, the
-                    // default status would defeat the debounce logic.
-                    if let Some(prev_status) = prev_statuses.get(&name) {
-                        if session.status == SessionStatus::Exited {
-                            // Pane is confirmed dead (passed debounce); keep Exited
-                        } else if *prev_status == SessionStatus::Exited {
-                            // Pane was dead, now alive: clear stale caches for fresh start
-                            self.prev_captures.remove(&name);
-                            self.raw_captures.remove(&name);
-                            self.idle_ticks.remove(&name);
-                            self.changed_ticks.remove(&name);
-                            // Keep Idle from list_sessions(); content comparison will see
-                            // first_capture and immediately set Running
-                        } else {
-                            // Normal: carry forward prev status for hysteresis
-                            session.status = prev_status.clone();
-                        }
-                    }
-
-                    // Determine Running vs Idle by comparing pane content.
-                    //
-                    // Pane content is normalized (strip spinners, ANSI, trailing
-                    // whitespace) then compared against the previous tick.
-                    //
-                    // Log signal (`task_elapsed`) is used only to *accelerate*
-                    // Idle detection: when the log confirms the agent finished
-                    // (assistant replied), the idle threshold drops from 30 to 8
-                    // ticks. The log is never used to force Running — it updates
-                    // too infrequently (~5s) and stale data would keep sessions
-                    // stuck in Running after the agent finishes.
-                    //
-                    // Hysteresis thresholds (pane-based):
-                    //   Running → Idle: 30 ticks (~3s), or 8 ticks if log says idle
-                    //   Idle → Running: 5 consecutive changed ticks (~500ms)
-                    // First capture (no previous): immediately set Running.
-                    let log_idle = self
-                        .session_stats
-                        .get(&name)
-                        .map(|st| st.task_elapsed().is_none())
-                        .unwrap_or(false);
-                    let idle_threshold: u8 = if log_idle { 8 } else { 30 };
-
-                    if let Some(content) = captures.get(&name) {
-                        let raw_prev = self.raw_captures.get(&name);
-                        let first_capture = raw_prev.is_none();
-                        let raw_unchanged = !first_capture && raw_prev.unwrap() == content;
-                        self.raw_captures.insert(name.clone(), content.clone());
-
-                        // If raw content is identical, skip normalization entirely.
-                        // Only normalize when raw differs (to filter spinner noise).
-                        let (unchanged, raw_changed_but_normalized_same) = if raw_unchanged {
-                            (true, false)
-                        } else {
-                            let normalized = normalize_capture(content);
-                            let prev = self.prev_captures.get(&name);
-                            let normalized_unchanged = prev.is_some_and(|p| *p == normalized);
-                            self.prev_captures.insert(name.clone(), normalized);
-                            (normalized_unchanged, normalized_unchanged)
-                        };
-
-                        // Codex often signals active work with spinner/progress-only
-                        // updates. If raw capture changed but normalized text did not,
-                        // still count it as activity for Codex sessions.
-                        let changed = !unchanged
-                            || (session.agent_type == AgentType::Codex
-                                && raw_changed_but_normalized_same);
-
-                        if first_capture {
-                            // Brand-new session — assume Running until debounce says otherwise.
-                            session.status = SessionStatus::Running;
-                        } else if !changed {
-                            let count = self.idle_ticks.entry(name.clone()).or_insert(0);
-                            *count = count.saturating_add(1);
-                            self.changed_ticks.insert(name.clone(), 0);
-
-                            if has_active_subagents {
-                                session.status = SessionStatus::Running;
-                            } else if *count >= idle_threshold {
-                                session.status = SessionStatus::Idle;
-                            }
-                            // else: keep current status (hysteresis)
-                        } else {
-                            let count = self.changed_ticks.entry(name.clone()).or_insert(0);
-                            *count = count.saturating_add(1);
-                            self.idle_ticks.insert(name.clone(), 0);
-
-                            if *count >= 5 {
-                                session.status = SessionStatus::Running;
-                            }
-                            // else: keep current status (don't flip to Running on a single blip)
-                        }
-                    }
-
-                    // Track task elapsed time.
-                    // Prefer log-derived timestamps (survives Hydra restarts),
-                    // fall back to in-memory Instant tracking for responsiveness.
-                    let log_elapsed = self
-                        .session_stats
-                        .get(&name)
-                        .and_then(|st| st.task_elapsed());
-
-                    match session.status {
-                        SessionStatus::Running => {
-                            self.task_starts.entry(name.clone()).or_insert(now);
-                            self.task_last_active.insert(name.clone(), now);
-                            // Log elapsed is authoritative when available
-                            session.task_elapsed = log_elapsed.or_else(|| {
-                                let start = self.task_starts[&name];
-                                Some(now.duration_since(start))
-                            });
-                        }
-                        SessionStatus::Idle => {
-                            // Log says agent is still working (e.g. thinking)
-                            if log_elapsed.is_some() {
-                                session.task_elapsed = log_elapsed;
-                            } else if let (Some(&start), Some(&last)) = (
-                                self.task_starts.get(&name),
-                                self.task_last_active.get(&name),
-                            ) {
-                                if now.duration_since(last).as_secs() < 5 {
-                                    session.task_elapsed = Some(last.duration_since(start));
-                                } else {
-                                    self.task_starts.remove(&name);
-                                    self.task_last_active.remove(&name);
-                                }
-                            }
-                        }
-                        SessionStatus::Exited => {
-                            self.task_starts.remove(&name);
-                            self.task_last_active.remove(&name);
-                        }
-                    }
-                }
+                self.timers.update(&mut sessions, &self.session_stats, now);
                 // Remember which session was selected before re-sorting
                 let selected_name = self
                     .sessions
@@ -365,7 +398,7 @@ impl App {
                 });
 
                 // Reuse these cheap pane snapshots for preview refresh.
-                self.latest_pane_captures = captures;
+                self.status.latest_pane_captures = captures;
                 self.sessions = sessions;
 
                 // Restore selection to the same session after sort
@@ -376,28 +409,21 @@ impl App {
                 }
             }
             Err(e) => {
-                self.latest_pane_captures.clear();
+                self.status.latest_pane_captures.clear();
                 self.status_message = Some(format!("Error listing sessions: {e}"));
             }
         }
         // Prune stale entries from per-session HashMaps to prevent unbounded
         // memory growth when sessions are created and deleted over time.
         {
-            let live_keys: std::collections::HashSet<&String> =
+            let live_keys: HashSet<&String> =
                 self.sessions.iter().map(|s| &s.tmux_name).collect();
-            self.prev_captures.retain(|k, _| live_keys.contains(k));
-            self.raw_captures.retain(|k, _| live_keys.contains(k));
-            self.idle_ticks.retain(|k, _| live_keys.contains(k));
-            self.changed_ticks.retain(|k, _| live_keys.contains(k));
-            self.dead_ticks.retain(|k, _| live_keys.contains(k));
-            self.task_starts.retain(|k, _| live_keys.contains(k));
-            self.task_last_active.retain(|k, _| live_keys.contains(k));
+            self.status.prune(&live_keys);
+            self.timers.prune(&live_keys);
             self.last_messages.retain(|k, _| live_keys.contains(k));
             self.session_stats.retain(|k, _| live_keys.contains(k));
             self.log_uuids.retain(|k, _| live_keys.contains(k));
             self.uuid_retry_cooldowns.retain(|k, _| live_keys.contains(k));
-            self.latest_pane_captures
-                .retain(|k, _| live_keys.contains(k));
         }
 
         // Keep selected index in bounds
@@ -438,7 +464,7 @@ impl App {
                 && same_session
                 && !wants_scrollback
                 && !self.preview_has_scrollback
-                && self.idle_ticks.get(&tmux_name).copied().unwrap_or(0) >= 1
+                && self.status.idle_ticks_for(&tmux_name) >= 1
             {
                 return;
             }
@@ -452,7 +478,7 @@ impl App {
                     }
                 }
             } else if !force_live_capture {
-                if let Some(content) = self.latest_pane_captures.get(&tmux_name) {
+                if let Some(content) = self.status.latest_pane_captures.get(&tmux_name) {
                     self.set_preview_content(content.clone(), false);
                 } else {
                     let result = self.manager.capture_pane(&tmux_name).await;
@@ -579,6 +605,8 @@ impl App {
 
     pub fn detach(&mut self) {
         self.mode = Mode::Browse;
+        self.selected = 0;
+        self.preview_scroll_offset = 0;
     }
 
     pub fn start_new_session(&mut self) {
@@ -988,10 +1016,19 @@ fn count_lines_u16(content: &str) -> u16 {
     content.lines().count().min(u16::MAX as usize) as u16
 }
 
-/// Normalize captured pane content to reduce noise from spinners and cursors.
-/// Strips braille spinner characters (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏), common line-drawing
-/// spinners (|/-\), trailing whitespace, and ANSI escape sequences so that
-/// cosmetic animation doesn't trigger Running/Idle status changes.
+/// Normalize captured pane content to reduce noise from spinners, cursors,
+/// and live status indicators. Strips:
+/// - ANSI escape sequences (CSI: ESC [ … letter)
+/// - Braille spinner characters (U+2800–U+28FF)
+/// - Dingbat/star spinner characters used by Claude Code (✢✳✶✻✽ · etc.)
+/// - ASCII digits (neutralizes running timers like "2m 17s" and token counts)
+/// - Direction arrows ↑↓ (alternate in Claude Code status line)
+/// - Trailing whitespace per line
+///
+/// This prevents cosmetic animation (spinners, timers, counters) from
+/// triggering false Running/Idle status changes — especially important when
+/// Claude Code is on a plan approval page or other waiting state where the
+/// UI keeps animating but the agent is idle.
 pub fn normalize_capture(content: &str) -> String {
     let mut result = String::with_capacity(content.len());
     let mut chars = content.chars().peekable();
@@ -1012,6 +1049,19 @@ pub fn normalize_capture(content: &str) -> String {
         }
         // Skip braille spinner characters (U+2800..U+28FF)
         if ('\u{2800}'..='\u{28FF}').contains(&ch) {
+            continue;
+        }
+        // Skip Claude Code dingbat/star spinner characters:
+        // ✢ U+2722, ✳ U+2733, ✶ U+2736, ✻ U+273B, ✽ U+273D, · U+00B7
+        if matches!(ch, '\u{2722}' | '\u{2733}' | '\u{2736}' | '\u{273B}' | '\u{273D}' | '\u{00B7}') {
+            continue;
+        }
+        // Skip ASCII digits (neutralizes running timers and token counters)
+        if ch.is_ascii_digit() {
+            continue;
+        }
+        // Skip direction arrows (alternate in Claude Code status line)
+        if matches!(ch, '↑' | '↓') {
             continue;
         }
         result.push(ch);
@@ -2537,22 +2587,22 @@ mod tests {
         );
 
         // Pre-set a task start to verify it gets cleaned up
-        app.task_starts
+        app.timers.task_starts
             .insert("hydra-testid-dead".to_string(), std::time::Instant::now());
-        app.task_last_active
+        app.timers.task_last_active
             .insert("hydra-testid-dead".to_string(), std::time::Instant::now());
 
         // Dead-tick debounce requires DEAD_TICK_THRESHOLD consecutive dead ticks
-        for _ in 0..App::DEAD_TICK_THRESHOLD {
+        for _ in 0..StatusDetector::DEAD_TICK_THRESHOLD {
             app.refresh_sessions().await;
         }
         assert_eq!(app.sessions[0].status, SessionStatus::Exited);
         assert!(
-            !app.task_starts.contains_key("hydra-testid-dead"),
+            !app.timers.task_starts.contains_key("hydra-testid-dead"),
             "exited session should clear task_starts"
         );
         assert!(
-            !app.task_last_active.contains_key("hydra-testid-dead"),
+            !app.timers.task_last_active.contains_key("hydra-testid-dead"),
             "exited session should clear task_last_active"
         );
     }
@@ -2577,8 +2627,8 @@ mod tests {
         // Simulate long idle: move task_last_active back >5 seconds
         let five_secs_ago = std::time::Instant::now() - std::time::Duration::from_secs(6);
         let key = "hydra-testid-worker".to_string();
-        app.task_last_active.insert(key.clone(), five_secs_ago);
-        app.task_starts.insert(
+        app.timers.task_last_active.insert(key.clone(), five_secs_ago);
+        app.timers.task_starts.insert(
             key.clone(),
             five_secs_ago - std::time::Duration::from_secs(10),
         );
@@ -2587,7 +2637,7 @@ mod tests {
         app.refresh_sessions().await;
         assert_eq!(app.sessions[0].status, SessionStatus::Idle);
         assert!(
-            !app.task_starts.contains_key(&key),
+            !app.timers.task_starts.contains_key(&key),
             "long idle should clear task_starts"
         );
     }
@@ -3266,46 +3316,46 @@ mod tests {
 
         // Pre-populate HashMaps with a stale key that won't appear in live sessions
         let stale = "hydra-testid-deleted".to_string();
-        app.prev_captures.insert(stale.clone(), "old".into());
-        app.idle_ticks.insert(stale.clone(), 3);
-        app.changed_ticks.insert(stale.clone(), 2);
-        app.task_starts.insert(stale.clone(), Instant::now());
-        app.task_last_active.insert(stale.clone(), Instant::now());
+        app.status.prev_captures.insert(stale.clone(), "old".into());
+        app.status.idle_ticks.insert(stale.clone(), 3);
+        app.status.changed_ticks.insert(stale.clone(), 2);
+        app.timers.task_starts.insert(stale.clone(), Instant::now());
+        app.timers.task_last_active.insert(stale.clone(), Instant::now());
         app.last_messages.insert(stale.clone(), "msg".into());
         app.session_stats
             .insert(stale.clone(), SessionStats::default());
         app.log_uuids.insert(stale.clone(), "uuid".into());
         app.uuid_retry_cooldowns.insert(stale.clone(), 3);
-        app.dead_ticks.insert(stale.clone(), 1);
+        app.status.dead_ticks.insert(stale.clone(), 1);
 
         app.refresh_sessions().await;
 
         // Live session key should still exist in prev_captures (inserted during refresh)
         let live = "hydra-testid-alpha".to_string();
         assert!(
-            app.prev_captures.contains_key(&live),
+            app.status.prev_captures.contains_key(&live),
             "live key should remain"
         );
 
         // Stale key should be pruned from all maps
         assert!(
-            !app.prev_captures.contains_key(&stale),
+            !app.status.prev_captures.contains_key(&stale),
             "stale prev_captures should be pruned"
         );
         assert!(
-            !app.idle_ticks.contains_key(&stale),
+            !app.status.idle_ticks.contains_key(&stale),
             "stale idle_ticks should be pruned"
         );
         assert!(
-            !app.changed_ticks.contains_key(&stale),
+            !app.status.changed_ticks.contains_key(&stale),
             "stale changed_ticks should be pruned"
         );
         assert!(
-            !app.task_starts.contains_key(&stale),
+            !app.timers.task_starts.contains_key(&stale),
             "stale task_starts should be pruned"
         );
         assert!(
-            !app.task_last_active.contains_key(&stale),
+            !app.timers.task_last_active.contains_key(&stale),
             "stale task_last_active should be pruned"
         );
         assert!(
@@ -3325,7 +3375,7 @@ mod tests {
             "stale uuid_retry_cooldowns should be pruned"
         );
         assert!(
-            !app.dead_ticks.contains_key(&stale),
+            !app.status.dead_ticks.contains_key(&stale),
             "stale dead_ticks should be pruned"
         );
     }
@@ -3487,11 +3537,11 @@ mod tests {
 
         let key = "hydra-testid-worker";
         assert!(
-            app.task_starts.contains_key(key),
+            app.timers.task_starts.contains_key(key),
             "Running session should start task timer"
         );
         assert!(
-            app.task_last_active.contains_key(key),
+            app.timers.task_last_active.contains_key(key),
             "Running session should set last_active"
         );
     }
@@ -3517,14 +3567,14 @@ mod tests {
         let key = "hydra-testid-worker".to_string();
         // Pre-populate task_starts and task_last_active with recent timestamps
         let now = Instant::now();
-        app.task_starts.insert(key.clone(), now);
-        app.task_last_active.insert(key.clone(), now);
+        app.timers.task_starts.insert(key.clone(), now);
+        app.timers.task_last_active.insert(key.clone(), now);
 
         app.refresh_sessions().await;
 
         // Timer should still be set (within 5s window)
         assert!(
-            app.task_starts.contains_key(&key),
+            app.timers.task_starts.contains_key(&key),
             "recent idle should keep task timer"
         );
         // Session should have a task_elapsed value
@@ -3562,7 +3612,7 @@ mod tests {
     fn normalize_capture_preserves_normal_content() {
         let input = "$ claude\nHello, how can I help?";
         let result = super::normalize_capture(input);
-        assert_eq!(result, input);
+        assert_eq!(result, "$ claude\nHello, how can I help?");
     }
 
     #[test]
@@ -3576,6 +3626,45 @@ mod tests {
         let input = "\x1b[2Kworking \u{2807}   ";
         let result = super::normalize_capture(input);
         assert_eq!(result, "working");
+    }
+
+    #[test]
+    fn normalize_capture_strips_dingbat_spinners() {
+        // Claude Code spinner characters: ✢✳✶✻✽·
+        let input = "✻ Installing CLI tools…";
+        let result = super::normalize_capture(input);
+        assert_eq!(result, " Installing CLI tools…");
+
+        let input2 = "· Working on task";
+        let result2 = super::normalize_capture(input2);
+        assert_eq!(result2, " Working on task");
+    }
+
+    #[test]
+    fn normalize_capture_strips_digits() {
+        let input = "Installing (2m 17s)";
+        let result = super::normalize_capture(input);
+        assert_eq!(result, "Installing (m s)");
+    }
+
+    #[test]
+    fn normalize_capture_strips_direction_arrows() {
+        let input = "status ↑ 4.6k tokens";
+        let result = super::normalize_capture(input);
+        assert_eq!(result, "status  .k tokens");
+    }
+
+    #[test]
+    fn normalize_capture_claude_status_line_stable() {
+        // Two captures of a Claude Code status line 1 second apart
+        // should normalize to identical strings
+        let cap1 = "✻ Installing CLI tools… (2m 17s · ↑ 4.6k tokens · thought for 5s)";
+        let cap2 = "· Installing CLI tools… (2m 18s · ↓ 4.6k tokens · thought for 5s)";
+        assert_eq!(
+            super::normalize_capture(cap1),
+            super::normalize_capture(cap2),
+            "status line with different timer/spinner/arrows should normalize identically"
+        );
     }
 
     // ── log-based idle acceleration tests ──────────────────────────
@@ -3822,7 +3911,7 @@ mod tests {
         app.refresh_preview().await;
         assert_eq!(app.preview_session.as_deref(), Some("hydra-testid-s1"));
         // Simulate idle_ticks >= 1 for the session
-        app.idle_ticks.insert("hydra-testid-s1".to_string(), 1);
+        app.status.idle_ticks.insert("hydra-testid-s1".to_string(), 1);
 
         // Second call — should skip (same session, idle_ticks >= 1)
         app.set_preview_text("modified".to_string());
@@ -4316,7 +4405,7 @@ mod tests {
         );
 
         // Run DEAD_TICK_THRESHOLD consecutive dead ticks → should be Exited
-        for _ in 0..App::DEAD_TICK_THRESHOLD {
+        for _ in 0..StatusDetector::DEAD_TICK_THRESHOLD {
             app.refresh_sessions().await;
         }
         assert_eq!(
@@ -4351,7 +4440,7 @@ mod tests {
         // 1 alive tick — resets dead_ticks counter
         app.refresh_sessions().await;
         assert_eq!(
-            app.dead_ticks
+            app.status.dead_ticks
                 .get("hydra-testid-s1")
                 .copied()
                 .unwrap_or(0),
@@ -4374,7 +4463,7 @@ mod tests {
         let exited = make_session_with_status("s1", AgentType::Claude, SessionStatus::Exited);
         let alive = make_session_with_status("s1", AgentType::Claude, SessionStatus::Idle);
         let manager = MockSessionManager::new().with_list_fn({
-            let threshold = App::DEAD_TICK_THRESHOLD as usize;
+            let threshold = StatusDetector::DEAD_TICK_THRESHOLD as usize;
             move |n| {
                 if n < threshold {
                     vec![exited.clone()]
@@ -4391,17 +4480,17 @@ mod tests {
         );
 
         // Pass debounce threshold to confirm Exited
-        for _ in 0..App::DEAD_TICK_THRESHOLD {
+        for _ in 0..StatusDetector::DEAD_TICK_THRESHOLD {
             app.refresh_sessions().await;
         }
         assert_eq!(app.sessions[0].status, SessionStatus::Exited);
 
         // Pre-populate caches to verify they get cleared on recovery
         let key = "hydra-testid-s1".to_string();
-        app.prev_captures.insert(key.clone(), "old".into());
-        app.raw_captures.insert(key.clone(), "old".into());
-        app.idle_ticks.insert(key.clone(), 10);
-        app.changed_ticks.insert(key.clone(), 5);
+        app.status.prev_captures.insert(key.clone(), "old".into());
+        app.status.raw_captures.insert(key.clone(), "old".into());
+        app.status.idle_ticks.insert(key.clone(), 10);
+        app.status.changed_ticks.insert(key.clone(), 5);
 
         // Session comes back alive — Exited→alive transition should clear caches
         app.refresh_sessions().await;
@@ -4464,7 +4553,7 @@ mod tests {
         app.session_stats.insert(key, stats);
 
         // Run up to normal threshold — should NOT be Exited due to subagent extension
-        for _ in 0..App::DEAD_TICK_THRESHOLD {
+        for _ in 0..StatusDetector::DEAD_TICK_THRESHOLD {
             app.refresh_sessions().await;
         }
         assert_ne!(
@@ -4474,7 +4563,7 @@ mod tests {
         );
 
         // Run up to subagent threshold → should be Exited
-        for _ in App::DEAD_TICK_THRESHOLD..App::DEAD_TICK_SUBAGENT_THRESHOLD {
+        for _ in StatusDetector::DEAD_TICK_THRESHOLD..StatusDetector::DEAD_TICK_SUBAGENT_THRESHOLD {
             app.refresh_sessions().await;
         }
         assert_eq!(
@@ -4482,5 +4571,270 @@ mod tests {
             SessionStatus::Exited,
             "should mark Exited after extended subagent threshold"
         );
+    }
+
+    // ── StatusDetector unit tests ──
+
+    #[test]
+    fn status_detector_first_capture_sets_running() {
+        let mut detector = StatusDetector::new();
+        let mut sessions = vec![make_session_with_status("s1", AgentType::Claude, SessionStatus::Idle)];
+        let mut captures = HashMap::new();
+        captures.insert("hydra-testid-s1".to_string(), "hello world".to_string());
+        let prev_statuses = HashMap::new();
+        let session_stats = HashMap::new();
+
+        detector.update_statuses(&mut sessions, &captures, &prev_statuses, &session_stats);
+        assert_eq!(sessions[0].status, SessionStatus::Running);
+    }
+
+    #[test]
+    fn status_detector_unchanged_content_becomes_idle() {
+        let mut detector = StatusDetector::new();
+        let name = "hydra-testid-s1".to_string();
+        let content = "hello world".to_string();
+        let mut captures = HashMap::new();
+        captures.insert(name.clone(), content.clone());
+        let session_stats = HashMap::new();
+
+        // First capture -> Running
+        let mut sessions = vec![make_session_with_status("s1", AgentType::Claude, SessionStatus::Idle)];
+        let prev_statuses = HashMap::new();
+        detector.update_statuses(&mut sessions, &captures, &prev_statuses, &session_stats);
+        assert_eq!(sessions[0].status, SessionStatus::Running);
+
+        // 30 unchanged ticks -> Idle
+        for i in 0..30 {
+            let mut sessions = vec![make_session_with_status("s1", AgentType::Claude, SessionStatus::Idle)];
+            let mut prev_statuses = HashMap::new();
+            prev_statuses.insert(name.clone(), SessionStatus::Running);
+            detector.update_statuses(&mut sessions, &captures, &prev_statuses, &session_stats);
+            if i < 29 {
+                assert_eq!(sessions[0].status, SessionStatus::Running, "should stay Running at tick {i}");
+            } else {
+                assert_eq!(sessions[0].status, SessionStatus::Idle, "should become Idle at tick 30");
+            }
+        }
+    }
+
+    #[test]
+    fn status_detector_log_idle_accelerates_threshold() {
+        let mut detector = StatusDetector::new();
+        let name = "hydra-testid-s1".to_string();
+        let content = "hello world".to_string();
+        let mut captures = HashMap::new();
+        captures.insert(name.clone(), content.clone());
+
+        // Session stats where task_elapsed() returns None (assistant replied after user = idle)
+        let mut stats_map = HashMap::new();
+        let mut stats = SessionStats::default();
+        let now = chrono::Utc::now();
+        stats.last_user_ts = Some(
+            (now - chrono::Duration::seconds(60))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+        stats.last_assistant_ts = Some(
+            (now - chrono::Duration::seconds(30))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+        stats_map.insert(name.clone(), stats);
+
+        // First capture -> Running
+        let mut sessions = vec![make_session_with_status("s1", AgentType::Claude, SessionStatus::Idle)];
+        let prev_statuses = HashMap::new();
+        detector.update_statuses(&mut sessions, &captures, &prev_statuses, &stats_map);
+        assert_eq!(sessions[0].status, SessionStatus::Running);
+
+        // With log_idle=true, threshold is 8 instead of 30
+        for i in 0..8 {
+            let mut sessions = vec![make_session_with_status("s1", AgentType::Claude, SessionStatus::Idle)];
+            let mut prev_statuses = HashMap::new();
+            prev_statuses.insert(name.clone(), SessionStatus::Running);
+            detector.update_statuses(&mut sessions, &captures, &prev_statuses, &stats_map);
+            if i < 7 {
+                assert_eq!(sessions[0].status, SessionStatus::Running, "should stay Running at tick {i}");
+            } else {
+                assert_eq!(sessions[0].status, SessionStatus::Idle, "should become Idle at tick 8 with log_idle");
+            }
+        }
+    }
+
+    #[test]
+    fn status_detector_active_subagents_keeps_running() {
+        let mut detector = StatusDetector::new();
+        let name = "hydra-testid-s1".to_string();
+        let content = "hello world".to_string();
+        let mut captures = HashMap::new();
+        captures.insert(name.clone(), content.clone());
+
+        let mut stats_map = HashMap::new();
+        let mut stats = SessionStats::default();
+        stats.active_subagents = 1;
+        stats_map.insert(name.clone(), stats);
+
+        // First capture -> Running
+        let mut sessions = vec![make_session_with_status("s1", AgentType::Claude, SessionStatus::Idle)];
+        detector.update_statuses(&mut sessions, &captures, &HashMap::new(), &stats_map);
+        assert_eq!(sessions[0].status, SessionStatus::Running);
+
+        // Even after 30 unchanged ticks, active subagents keep it Running
+        for _ in 0..35 {
+            let mut sessions = vec![make_session_with_status("s1", AgentType::Claude, SessionStatus::Idle)];
+            let mut prev = HashMap::new();
+            prev.insert(name.clone(), SessionStatus::Running);
+            detector.update_statuses(&mut sessions, &captures, &prev, &stats_map);
+            assert_eq!(sessions[0].status, SessionStatus::Running);
+        }
+    }
+
+    #[test]
+    fn status_detector_codex_spinner_counts_as_activity() {
+        let mut detector = StatusDetector::new();
+        let name = "hydra-testid-s1".to_string();
+
+        // First capture
+        let mut captures = HashMap::new();
+        captures.insert(name.clone(), "hello \u{2800}".to_string());
+        let stats = HashMap::new();
+        let mut sessions = vec![make_session_with_status("s1", AgentType::Codex, SessionStatus::Idle)];
+        detector.update_statuses(&mut sessions, &captures, &HashMap::new(), &stats);
+        assert_eq!(sessions[0].status, SessionStatus::Running);
+
+        // Change only the spinner character — raw changes but normalized doesn't
+        captures.insert(name.clone(), "hello \u{2801}".to_string());
+        let mut sessions = vec![make_session_with_status("s1", AgentType::Codex, SessionStatus::Idle)];
+        let mut prev = HashMap::new();
+        prev.insert(name.clone(), SessionStatus::Running);
+        detector.update_statuses(&mut sessions, &captures, &prev, &stats);
+        // For Codex, spinner-only change counts as activity so changed_ticks increments
+        assert_eq!(sessions[0].status, SessionStatus::Running);
+    }
+
+    #[test]
+    fn status_detector_prune_removes_stale_keys() {
+        let mut detector = StatusDetector::new();
+        let live = "live-session".to_string();
+        let stale = "stale-session".to_string();
+
+        detector.prev_captures.insert(live.clone(), "a".into());
+        detector.prev_captures.insert(stale.clone(), "b".into());
+        detector.idle_ticks.insert(stale.clone(), 5);
+        detector.dead_ticks.insert(stale.clone(), 2);
+        detector.latest_pane_captures.insert(live.clone(), "c".into());
+
+        let live_keys: HashSet<&String> = [&live].into_iter().collect();
+        detector.prune(&live_keys);
+
+        assert!(detector.prev_captures.contains_key(&live));
+        assert!(!detector.prev_captures.contains_key(&stale));
+        assert!(!detector.idle_ticks.contains_key(&stale));
+        assert!(!detector.dead_ticks.contains_key(&stale));
+        assert!(detector.latest_pane_captures.contains_key(&live));
+    }
+
+    #[test]
+    fn status_detector_idle_ticks_for_returns_zero_when_missing() {
+        let detector = StatusDetector::new();
+        assert_eq!(detector.idle_ticks_for("nonexistent"), 0);
+    }
+
+    #[test]
+    fn status_detector_idle_ticks_for_returns_value() {
+        let mut detector = StatusDetector::new();
+        detector.idle_ticks.insert("s1".to_string(), 42);
+        assert_eq!(detector.idle_ticks_for("s1"), 42);
+    }
+
+    // ── count_lines_u16 tests ──
+
+    #[test]
+    fn count_lines_u16_empty() {
+        assert_eq!(super::count_lines_u16(""), 0);
+    }
+
+    #[test]
+    fn count_lines_u16_single_line() {
+        assert_eq!(super::count_lines_u16("hello"), 1);
+    }
+
+    #[test]
+    fn count_lines_u16_multiple_lines() {
+        assert_eq!(super::count_lines_u16("a\nb\nc"), 3);
+    }
+
+    #[test]
+    fn count_lines_u16_trailing_newline() {
+        assert_eq!(super::count_lines_u16("a\nb\n"), 2);
+    }
+
+    // ── proptest ──────────────────────────────────────────────────────
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn normalize_capture_never_panics(s in ".*") {
+                let _ = normalize_capture(&s);
+            }
+
+            #[test]
+            fn normalize_capture_idempotent(s in ".*") {
+                let once = normalize_capture(&s);
+                let twice = normalize_capture(&once);
+                prop_assert_eq!(once, twice);
+            }
+
+            #[test]
+            fn normalize_capture_strips_ansi(
+                pre in "[a-zA-Z0-9 ]{0,20}",
+                code in "[0-9;]{1,10}",
+                letter in "[a-zA-Z]",
+                post in "[a-zA-Z0-9 ]{0,20}"
+            ) {
+                let input = format!("{pre}\x1b[{code}{letter}{post}");
+                let result = normalize_capture(&input);
+                prop_assert!(!result.contains('\x1b'));
+            }
+
+            #[test]
+            fn normalize_capture_strips_braille(
+                text in "[a-z ]{0,20}",
+                braille in proptest::char::range('\u{2800}', '\u{28FF}')
+            ) {
+                let input = format!("{text}{braille}{text}");
+                let result = normalize_capture(&input);
+                let has_braille = result.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c));
+                prop_assert!(!has_braille);
+            }
+
+            #[test]
+            fn normalize_capture_no_trailing_whitespace(s in ".{0,200}") {
+                let result = normalize_capture(&s);
+                for line in result.lines() {
+                    prop_assert_eq!(line, line.trim_end(), "line has trailing whitespace: {:?}", line);
+                }
+            }
+
+            #[test]
+            fn parse_diff_numstat_never_panics(s in ".*") {
+                let _ = parse_diff_numstat(&s);
+            }
+
+            #[test]
+            fn parse_diff_numstat_valid_lines(
+                ins in 0u32..10000,
+                del in 0u32..10000,
+                path in "[a-zA-Z0-9/_.-]{1,50}"
+            ) {
+                let input = format!("{ins}\t{del}\t{path}");
+                let files = parse_diff_numstat(&input);
+                prop_assert_eq!(files.len(), 1);
+                prop_assert_eq!(files[0].insertions, ins);
+                prop_assert_eq!(files[0].deletions, del);
+                prop_assert_eq!(&files[0].path, &path);
+            }
+        }
     }
 }

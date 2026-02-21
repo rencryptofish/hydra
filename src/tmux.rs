@@ -1110,4 +1110,152 @@ mod tests {
 
         cleanup_session(&tmux_name).await;
     }
+
+    // ── proptest ──────────────────────────────────────────────────────
+
+    mod proptests {
+        use super::*;
+        use crossterm::event::{KeyCode, KeyModifiers};
+        use proptest::prelude::*;
+
+        fn arb_keycode() -> impl Strategy<Value = KeyCode> {
+            prop_oneof![
+                any::<char>().prop_map(KeyCode::Char),
+                Just(KeyCode::Enter),
+                Just(KeyCode::Backspace),
+                Just(KeyCode::Tab),
+                Just(KeyCode::BackTab),
+                Just(KeyCode::Up),
+                Just(KeyCode::Down),
+                Just(KeyCode::Left),
+                Just(KeyCode::Right),
+                Just(KeyCode::Home),
+                Just(KeyCode::End),
+                Just(KeyCode::PageUp),
+                Just(KeyCode::PageDown),
+                Just(KeyCode::Delete),
+                Just(KeyCode::Insert),
+                (1u8..=12).prop_map(KeyCode::F),
+                Just(KeyCode::Esc),
+                Just(KeyCode::Null),
+            ]
+        }
+
+        fn arb_modifiers() -> impl Strategy<Value = KeyModifiers> {
+            (0u8..8).prop_map(|bits| KeyModifiers::from_bits_truncate(bits))
+        }
+
+        proptest! {
+            #[test]
+            fn keycode_to_tmux_never_panics(
+                code in arb_keycode(),
+                modifiers in arb_modifiers()
+            ) {
+                let _ = keycode_to_tmux(code, modifiers);
+            }
+
+            #[test]
+            fn keycode_char_always_produces_some(
+                c in any::<char>(),
+                modifiers in arb_modifiers()
+            ) {
+                let result = keycode_to_tmux(KeyCode::Char(c), modifiers);
+                prop_assert!(result.is_some());
+            }
+
+            #[test]
+            fn apply_tmux_modifiers_never_panics(
+                base in "[a-zA-Z]{1,10}",
+                modifiers in arb_modifiers()
+            ) {
+                let result = apply_tmux_modifiers(&base, modifiers);
+                prop_assert!(!result.is_empty());
+                prop_assert!(result.contains(&base));
+            }
+
+            #[test]
+            fn ctrl_char_starts_with_c_prefix(c in proptest::char::range('a', 'z')) {
+                let result = keycode_to_tmux(
+                    KeyCode::Char(c),
+                    KeyModifiers::CONTROL
+                ).unwrap();
+                prop_assert!(result.starts_with("C-"), "expected C- prefix, got: {}", result);
+            }
+
+            #[test]
+            fn alt_char_starts_with_m_prefix(c in proptest::char::range('a', 'z')) {
+                let result = keycode_to_tmux(
+                    KeyCode::Char(c),
+                    KeyModifiers::ALT
+                ).unwrap();
+                prop_assert!(result.starts_with("M-"), "expected M- prefix, got: {}", result);
+            }
+
+            #[test]
+            fn f_key_produces_f_prefix(n in 1u8..=12) {
+                let result = keycode_to_tmux(
+                    KeyCode::F(n),
+                    KeyModifiers::NONE
+                ).unwrap();
+                prop_assert!(result.starts_with('F'), "expected F prefix, got: {}", result);
+            }
+        }
+    }
+
+    // ── Additional keycode_to_tmux modifier tests ──
+
+    #[test]
+    fn ctrl_shift_arrow() {
+        let result = keycode_to_tmux(
+            KeyCode::Up,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        // Combined Ctrl+Shift should still map to something
+        assert!(result.is_some(), "Ctrl+Shift+Up should be mappable");
+    }
+
+    #[test]
+    fn alt_letter() {
+        let result = keycode_to_tmux(
+            KeyCode::Char('a'),
+            KeyModifiers::ALT,
+        );
+        assert!(result.is_some(), "Alt+a should be mappable");
+    }
+
+    #[test]
+    fn page_up_and_page_down() {
+        assert!(
+            keycode_to_tmux(KeyCode::PageUp, KeyModifiers::NONE).is_some(),
+            "PageUp should be mappable"
+        );
+        assert!(
+            keycode_to_tmux(KeyCode::PageDown, KeyModifiers::NONE).is_some(),
+            "PageDown should be mappable"
+        );
+    }
+
+    #[test]
+    fn home_and_end_keys() {
+        assert!(
+            keycode_to_tmux(KeyCode::Home, KeyModifiers::NONE).is_some(),
+            "Home should be mappable"
+        );
+        assert!(
+            keycode_to_tmux(KeyCode::End, KeyModifiers::NONE).is_some(),
+            "End should be mappable"
+        );
+    }
+
+    #[test]
+    fn insert_and_delete_keys() {
+        assert!(
+            keycode_to_tmux(KeyCode::Insert, KeyModifiers::NONE).is_some(),
+            "Insert should be mappable"
+        );
+        assert!(
+            keycode_to_tmux(KeyCode::Delete, KeyModifiers::NONE).is_some(),
+            "Delete should be mappable"
+        );
+    }
 }

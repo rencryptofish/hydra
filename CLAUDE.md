@@ -6,10 +6,15 @@ TUI-based AI agent tmux session manager. Lets you run multiple Claude/Codex agen
 
 ```bash
 cargo build
-cargo test                # unit + snapshot + CLI integration tests
+cargo test                # unit + snapshot + CLI + proptest tests
 cargo bench               # criterion benchmarks (rendering, input, data processing)
 cargo insta review        # review snapshot diffs after UI changes
 make install              # build release binary and install to ~/.cargo/bin/
+make check                # CI gate: test + deny + fmt --check + clippy -D warnings
+make deny                 # cargo-deny license/advisory audit
+make coverage             # HTML coverage via cargo llvm-cov
+make fuzz                 # prints cargo fuzz run commands for all targets
+make mutants              # cargo mutants (mutation testing)
 ```
 
 ## Architecture
@@ -18,7 +23,7 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 
 - **`src/lib.rs`** — Thin re-export of all modules so `benches/` (external crates) can access them.
 - **`src/main.rs`** — CLI parsing (clap), TUI event loop, key dispatch. Passes full `KeyEvent` (not just `KeyCode`) to handlers for modifier support. Imports modules via `use hydra::*`.
-- **`src/app.rs`** — `App` state + `Mode` enum (Browse, Attached, NewSessionAgent, ConfirmDelete). Owns `Box<dyn SessionManager>` for testability.
+- **`src/app.rs`** — `App` state + `Mode` enum (Browse, Attached, NewSessionAgent, ConfirmDelete). Owns `Box<dyn SessionManager>` for testability. `StatusDetector` and `TaskTimers` are extracted structs that encapsulate status-change debouncing and elapsed-time tracking respectively.
 - **`src/tmux.rs`** — `SessionManager` async trait (`#[async_trait]`) + `TmuxSessionManager` impl. All tmux subprocess calls use `tokio::process::Command` (non-blocking). Also has `keycode_to_tmux()` for crossterm→tmux key mapping.
 - **`src/session.rs`** — `Session`, `SessionStatus`, `AgentType` types. Pure data, no I/O.
 - **`src/ui.rs`** — All ratatui rendering. Snapshot-tested with `insta`.
@@ -30,14 +35,14 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 
 - **SessionManager trait**: All tmux interaction goes through `#[async_trait] trait SessionManager: Send + Sync` so tests can use mock/noop impls. `App::new_with_manager()` is the test constructor. Async methods that call the manager must clone fields (e.g. `project_id`) before `.await` to avoid borrow conflicts across await points.
 - **Auto-generated session names**: Session names are auto-assigned from the NATO phonetic alphabet (alpha, bravo, charlie, ...). The `generate_name()` function in `session.rs` picks the first unused name, filling gaps. Falls back to `agent-N` if all 26 are taken.
-- **Content-change detection**: Session status (Running/Idle/Exited) is determined by comparing `normalize_capture()`-cleaned pane content between refresh cycles. `normalize_capture()` strips braille spinners (U+2800–U+28FF), ANSI escape sequences, and trailing whitespace to reduce noise from agent animations. **Hysteresis** debounces both directions: Running→Idle requires 30 consecutive unchanged refreshes (~3s at 100ms tick + 2-tick refresh cadence); Idle→Running requires 5 consecutive changed refreshes (~500ms). **Log-accelerated Idle**: when `session_stats.task_elapsed()` returns None (assistant replied, agent is done), the idle threshold drops from 30 to 8 refreshes for faster detection. The log is never used to force Running (it refreshes too slowly and stale data would keep sessions stuck). First capture of a new session immediately sets Running.
+- **Content-change detection**: `StatusDetector` struct in `app.rs` owns all pane-content-comparison state and debounce counters. `normalize_capture()` strips braille spinners (U+2800–U+28FF), Claude Code spinner glyphs (✢✳✶✻✽), ASCII digits, direction arrows (↑↓), ANSI escape sequences, and trailing whitespace. **Hysteresis** debounces both directions: Running→Idle requires 30 consecutive unchanged refreshes; Idle→Running requires 5 consecutive changed refreshes. **Exited debounce**: 3 ticks normally, extended to 15 ticks when `active_subagents > 0` (allows orchestration to settle). **Log-accelerated Idle**: when `session_stats.task_elapsed()` returns None, the idle threshold drops from 30 to 8 refreshes. `StatusDetector::prune()` and `TaskTimers::prune()` use `HashSet<&String>` for O(1) cleanup of stale session data.
 - **Sidebar grouping**: Sessions are grouped by status (Idle → Running → Exited) with dim header rows (e.g. `── ● Idle ──`), then sorted alphabetically within each group. The explicit headers make the grouping intentional rather than chaotic. `SessionStatus::sort_order()` defines the group ordering. The `selected` index maps to `app.sessions` (not visual rows); the UI calculates the visual row by counting header items.
 - **Status indicator lights**: Each session shows a colored `●` dot in the sidebar:
   - **Green** = Idle (ready for input, pane content unchanged for the idle threshold)
   - **Red** = Running (busy, pane content changed recently)
   - **Yellow** = Exited (agent process ended, pane is dead)
 - **Task elapsed timer**: Tracks per-session `Instant` timestamps in App. Running starts the clock; Idle <5s shows frozen duration (same task); Idle >5s clears it (new task).
-- **Embedded attach mode**: `Mode::Attached` forwards keystrokes via `tmux send-keys` instead of `tmux attach`. Preview border switches to thick green (`BorderType::Thick` + bold) for clear visual distinction. Esc returns to Browse.
+- **Embedded attach mode**: `Mode::Attached` forwards keystrokes via `tmux send-keys` instead of `tmux attach`. Preview border switches to thick green (`BorderType::Thick` + bold) for clear visual distinction. Esc returns to Browse and resets selection to index 0 (first idle session).
 - **Last message display**: Sidebar shows the last Claude assistant message per session (dimmed second line, truncated to 50 chars). UUIDs are resolved via PID→process tree lookup and cached in `App.log_uuids`. Failed UUID resolutions are retried with cooldown to avoid repeated expensive subprocess walks. Messages refresh every 50 ticks (~5s). Only reads incremental JSONL bytes for efficiency.
 - **Claude Code JSONL logs**: Located at `~/.claude/projects/<escaped-cwd>/<uuid>.jsonl`. Path escaping replaces `/` with `-` (e.g. `/Users/monkey/hydra` → `-Users-monkey-hydra`). Structure: `{"type": "assistant", "message": {"content": [{"text": "..."}]}}`. The UUID is discovered by parsing `--session-id` from the process command line (`ps -p <pid> -o command=`), falling back to `lsof -p <pane_pid>` for legacy sessions without `--session-id`.
 - **remain-on-exit**: Set on session creation so exited agents stay visible with `Exited` status instead of vanishing.
@@ -55,12 +60,14 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 - **CLI tests**: `tests/cli_tests.rs` with `assert_cmd` — tests help, ls, arg validation, unknown commands
 - **Mock**: `MockSessionManager` in app tests (controllable return values), `NoopSessionManager` in UI tests — both implement full `SessionManager` trait with `#[async_trait]`. Tests calling async App methods (`refresh_sessions`, `refresh_preview`, `confirm_new_session`, `confirm_delete`) use `#[tokio::test]`.
 - **Benchmarks**: `benches/rendering.rs`, `benches/input_handling.rs`, `benches/data_processing.rs` use criterion. Each defines its own `NoopSessionManager` and helper factories. Run `cargo bench` or `cargo bench --bench rendering` for a single suite.
+- **Property-based tests**: `proptest` used across session.rs (name generation, project_id, parse roundtrips), tmux.rs (keycode mapping never panics), app.rs (normalize_capture), and logs.rs (JSONL parsing, incremental stats composability). Verify determinism, roundtrip correctness, and no-panic guarantees.
+- **Fuzz targets**: `fuzz/fuzz_targets/` has targets for `normalize_capture`, `jsonl_parsing`, `extract_message`, `diff_numstat`. Run via `cargo fuzz run <target>`.
 - **Test isolation**: All tests that touch the filesystem use `tempfile::tempdir()` for isolated temp directories. Test helpers (`test_app()`, `test_app_with_sessions()`) set `app.manifest_dir` to per-thread temp dirs. Never write to `~/.hydra/` in tests.
 - When adding a new `SessionManager` method, update mock impls in BOTH `app.rs` and `ui.rs` test modules
 
 ## Conventions
 
-- Tick rate is 100ms (`EventHandler::new(Duration::from_millis(100))`), session/preview refresh runs every 2 ticks (~200ms)
+- Tick rate is 50ms (`EVENT_TICK_RATE`), session/preview refresh runs every tick (~50ms)
 - tmux session names: `hydra-<8char_sha256_hex>-<user_name>`
 - Agent commands: `claude --dangerously-skip-permissions`, `codex -c check_for_update_on_startup=false --yolo`
 - Mouse handling lives in `App::handle_mouse()` (moved from `main.rs` to `app.rs`)
@@ -84,6 +91,11 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 - Preview pane uses ANSI color rendering: `tmux capture-pane -e` emits escape sequences, parsed once via `ansi_to_tui::IntoText` into cached `Text<'static>`. Raw string kept for `normalize_capture()` status detection.
 - **Benchmark baselines (criterion, 2026-02-20)**: Full frame draw ~50–60µs at 80×24 (<1% of 100ms tick); key/mouse dispatch <200ns; `normalize_capture` 6–130µs scaling with input size; JSONL incremental parse ~5× faster than full; preview rendering is the most expensive path (~6ms at 5000 lines). All well within the tick budget.
 - To expose internal functions to criterion benchmarks, `src/lib.rs` re-exports modules and hot-path helpers (`normalize_capture`, `parse_diff_numstat`, `draw_sidebar`/`draw_preview`/`draw_stats`, `extract_assistant_message_text`, `update_session_stats_from_path_and_last_message`, `apply_tmux_modifiers`) are `pub`.
+- Extract complex state machine logic (status debouncing, timer tracking) into dedicated structs (`StatusDetector`, `TaskTimers`) with `pub(crate)` fields — keeps `App` manageable and makes state transitions independently testable.
+- `normalize_capture()` must strip agent-specific spinner glyphs and progress characters (digits, arrows) in addition to braille — otherwise timer updates and wait-screen animations cause false Running→Idle→Running flicker.
+- Exited-session debounce needs to be longer when subagents are active (`DEAD_TICK_SUBAGENT_THRESHOLD = 15`) — orchestrating agents briefly lose their pane during subagent handoffs.
+- `proptest` char ranges (`'a'..='z'`) don't implement `Strategy` — use `proptest::char::range()` instead.
+- Makefile `check` target composes `test + deny + fmt --check + clippy` for CI. `make coverage` uses `cargo llvm-cov html`, `make mutants` uses `cargo mutants`.
 
 ## Common Changes
 

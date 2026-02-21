@@ -369,6 +369,67 @@ mod tests {
 
     // ── SessionStatus::sort_order tests ─────────────────────────────
 
+    // ── proptest ──────────────────────────────────────────────────────
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn generate_name_always_returns_nonempty(
+                existing in proptest::collection::vec("[a-z]{1,10}", 0..30)
+            ) {
+                let name = generate_name(&existing);
+                prop_assert!(!name.is_empty());
+            }
+
+            #[test]
+            fn generate_name_never_collides_with_existing(
+                existing in proptest::collection::vec("[a-z]{1,10}", 0..30)
+            ) {
+                let name = generate_name(&existing);
+                prop_assert!(
+                    !existing.contains(&name),
+                    "generated name '{}' collides with existing names",
+                    name
+                );
+            }
+
+            #[test]
+            fn generate_name_is_deterministic(
+                existing in proptest::collection::vec("[a-z]{1,10}", 0..30)
+            ) {
+                let name1 = generate_name(&existing);
+                let name2 = generate_name(&existing);
+                prop_assert_eq!(name1, name2);
+            }
+
+            #[test]
+            fn project_id_is_8_hex_chars(path in ".*") {
+                let id = project_id(&path);
+                prop_assert_eq!(id.len(), 8);
+                prop_assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+            }
+
+            #[test]
+            fn parse_session_name_roundtrips(
+                path in ".{1,50}",
+                name in "[a-z][a-z0-9-]{0,20}"
+            ) {
+                let pid = project_id(&path);
+                let tmux = tmux_session_name(&pid, &name);
+                let parsed = parse_session_name(&tmux, &pid);
+                prop_assert_eq!(parsed, Some(name));
+            }
+
+            #[test]
+            fn format_duration_never_panics(secs in 0u64..1_000_000) {
+                let _ = format_duration(Duration::from_secs(secs));
+            }
+        }
+    }
+
     #[test]
     fn sort_order_idle_is_lowest() {
         assert_eq!(SessionStatus::Idle.sort_order(), 0);
