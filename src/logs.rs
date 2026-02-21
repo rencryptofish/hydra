@@ -941,7 +941,7 @@ pub async fn resolve_session_uuid(tmux_name: &str) -> Option<String> {
 }
 
 /// Convert a CWD path to the Claude projects directory escape format.
-/// e.g. "/Users/monkey/hydra" → "-Users-monkey-hydra"
+/// e.g. "/home/user/project" → "-home-user-project"
 fn escape_project_path(cwd: &str) -> String {
     cwd.replace('/', "-")
 }
@@ -1546,8 +1546,8 @@ mod tests {
     #[test]
     fn escape_project_path_basic() {
         assert_eq!(
-            escape_project_path("/Users/monkey/hydra"),
-            "-Users-monkey-hydra"
+            escape_project_path("/home/user/project"),
+            "-home-user-project"
         );
     }
 
@@ -1564,8 +1564,8 @@ mod tests {
     #[test]
     fn escape_project_path_nested() {
         assert_eq!(
-            escape_project_path("/Users/cat/code/my-project"),
-            "-Users-cat-code-my-project"
+            escape_project_path("/home/dev/code/my-project"),
+            "-home-dev-code-my-project"
         );
     }
 
