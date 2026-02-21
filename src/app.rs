@@ -243,25 +243,74 @@ impl TaskTimers {
     }
 }
 
+/// Preview pane state: content, scroll position, and caching metadata.
+#[derive(Debug)]
+pub struct PreviewState {
+    pub content: String,
+    /// ANSI-parsed preview content for colored rendering.
+    pub text: Option<Text<'static>>,
+    /// Cached preview line count to avoid O(n) line scans every frame.
+    pub line_count: u16,
+    pub scroll_offset: u16,
+    /// Which session the preview is currently showing (for skip-if-unchanged optimization).
+    session: Option<String>,
+    /// Whether `content` currently contains full scrollback (not just live pane).
+    has_scrollback: bool,
+}
+
+impl PreviewState {
+    fn new() -> Self {
+        Self {
+            content: String::new(),
+            text: None,
+            line_count: 0,
+            scroll_offset: 0,
+            session: None,
+            has_scrollback: false,
+        }
+    }
+
+    fn set_content(&mut self, content: String, has_scrollback: bool) {
+        self.line_count = count_lines_u16(&content);
+        self.text = ansi_to_tui::IntoText::into_text(&content).ok();
+        self.content = content;
+        self.has_scrollback = has_scrollback;
+    }
+
+    pub fn set_text(&mut self, content: String) {
+        self.line_count = count_lines_u16(&content);
+        self.text = ansi_to_tui::IntoText::into_text(&content).ok();
+        self.content = content;
+    }
+
+    pub fn scroll_up(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_add(3);
+    }
+
+    pub fn scroll_down(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(3);
+    }
+
+    /// Reset scroll/cache state when the selected session changes.
+    fn reset_on_selection_change(&mut self) {
+        self.scroll_offset = 0;
+        self.session = None;
+        self.has_scrollback = false;
+    }
+}
+
 pub struct App {
     pub sessions: Vec<Session>,
     pub selected: usize,
-    pub preview: String,
-    /// ANSI-parsed preview content for colored rendering.
-    pub preview_text: Option<Text<'static>>,
-    /// Cached preview line count to avoid O(n) line scans every frame.
-    pub preview_line_count: u16,
+    pub preview: PreviewState,
     pub mode: Mode,
     pub agent_selection: usize,
     pub should_quit: bool,
     pub project_id: String,
-    /// Which session the preview is currently showing (for skip-if-unchanged optimization).
-    preview_session: Option<String>,
     pub cwd: String,
     pub status_message: Option<String>,
     pub sidebar_area: Cell<Rect>,
     pub preview_area: Cell<Rect>,
-    pub preview_scroll_offset: u16,
     pub(crate) status: StatusDetector,
     pub(crate) timers: TaskTimers,
     pub last_messages: HashMap<String, String>,
@@ -275,8 +324,6 @@ pub struct App {
     message_tick: u8,
     pub manifest_dir: PathBuf,
     manager: Box<dyn SessionManager>,
-    /// Whether `preview` currently contains full scrollback (not just live pane).
-    preview_has_scrollback: bool,
     /// Pending literal keys to send to tmux (tmux_name, text).
     /// Set by `handle_mouse` for forwarding clicks; consumed by the event loop.
     pub pending_literal_keys: Option<(String, String)>,
@@ -302,19 +349,15 @@ impl App {
         Self {
             sessions: Vec::new(),
             selected: 0,
-            preview: String::new(),
-            preview_text: None,
-            preview_line_count: 0,
+            preview: PreviewState::new(),
             mode: Mode::Browse,
             agent_selection: 0,
             should_quit: false,
             project_id,
             cwd,
-            preview_session: None,
             status_message: None,
             sidebar_area: Cell::new(Rect::default()),
             preview_area: Cell::new(Rect::default()),
-            preview_scroll_offset: 0,
             status: StatusDetector::new(),
             timers: TaskTimers::new(),
             last_messages: HashMap::new(),
@@ -326,25 +369,11 @@ impl App {
             message_tick: 0,
             manifest_dir: crate::manifest::default_base_dir(),
             manager,
-            preview_has_scrollback: false,
             pending_literal_keys: None,
             mouse_captured: true,
             diff_tree_cache: RefCell::new((Vec::new(), 0, Vec::new())),
             bg_refresh_rx: None,
         }
-    }
-
-    fn set_preview_content(&mut self, content: String, has_scrollback: bool) {
-        self.preview_line_count = count_lines_u16(&content);
-        self.preview_text = ansi_to_tui::IntoText::into_text(&content).ok();
-        self.preview = content;
-        self.preview_has_scrollback = has_scrollback;
-    }
-
-    pub fn set_preview_text(&mut self, content: String) {
-        self.preview_line_count = count_lines_u16(&content);
-        self.preview_text = ansi_to_tui::IntoText::into_text(&content).ok();
-        self.preview = content;
     }
 
     pub async fn refresh_sessions(&mut self) {
@@ -450,12 +479,12 @@ impl App {
             .get(self.selected)
             .map(|s| s.tmux_name.clone());
         if let Some(tmux_name) = tmux_name {
-            let same_session = self.preview_session.as_ref() == Some(&tmux_name);
-            let wants_scrollback = self.preview_scroll_offset > 0;
+            let same_session = self.preview.session.as_ref() == Some(&tmux_name);
+            let wants_scrollback = self.preview.scroll_offset > 0;
 
             // If the user is inspecting history, keep the current scrollback snapshot
             // stable and avoid re-capturing huge buffers every event/tick.
-            if same_session && wants_scrollback && self.preview_has_scrollback {
+            if same_session && wants_scrollback && self.preview.has_scrollback {
                 return;
             }
 
@@ -463,7 +492,7 @@ impl App {
             if !force_live_capture
                 && same_session
                 && !wants_scrollback
-                && !self.preview_has_scrollback
+                && !self.preview.has_scrollback
                 && self.status.idle_ticks_for(&tmux_name) >= 1
             {
                 return;
@@ -472,36 +501,36 @@ impl App {
             if wants_scrollback {
                 let result = self.manager.capture_pane_scrollback(&tmux_name).await;
                 match result {
-                    Ok(content) => self.set_preview_content(content, true),
+                    Ok(content) => self.preview.set_content(content, true),
                     Err(_) => {
-                        self.set_preview_content(String::from("[unable to capture pane]"), true)
+                        self.preview.set_content(String::from("[unable to capture pane]"), true)
                     }
                 }
             } else if !force_live_capture {
                 if let Some(content) = self.status.latest_pane_captures.get(&tmux_name) {
-                    self.set_preview_content(content.clone(), false);
+                    self.preview.set_content(content.clone(), false);
                 } else {
                     let result = self.manager.capture_pane(&tmux_name).await;
                     match result {
-                        Ok(content) => self.set_preview_content(content, false),
+                        Ok(content) => self.preview.set_content(content, false),
                         Err(_) => {
-                            self.set_preview_content(String::from("[unable to capture pane]"), false)
+                            self.preview.set_content(String::from("[unable to capture pane]"), false)
                         }
                     }
                 }
             } else {
                 let result = self.manager.capture_pane(&tmux_name).await;
                 match result {
-                    Ok(content) => self.set_preview_content(content, false),
+                    Ok(content) => self.preview.set_content(content, false),
                     Err(_) => {
-                        self.set_preview_content(String::from("[unable to capture pane]"), false)
+                        self.preview.set_content(String::from("[unable to capture pane]"), false)
                     }
                 }
             }
-            self.preview_session = Some(tmux_name);
+            self.preview.session = Some(tmux_name);
         } else {
-            self.set_preview_content(String::from("No sessions. Press 'n' to create one."), false);
-            self.preview_session = None;
+            self.preview.set_content(String::from("No sessions. Press 'n' to create one."), false);
+            self.preview.session = None;
         }
     }
 
@@ -570,9 +599,7 @@ impl App {
     pub fn select_next(&mut self) {
         if !self.sessions.is_empty() {
             self.selected = (self.selected + 1) % self.sessions.len();
-            self.preview_scroll_offset = 0;
-            self.preview_session = None;
-            self.preview_has_scrollback = false;
+            self.preview.reset_on_selection_change();
         }
     }
 
@@ -583,18 +610,16 @@ impl App {
             } else {
                 self.selected - 1
             };
-            self.preview_scroll_offset = 0;
-            self.preview_session = None;
-            self.preview_has_scrollback = false;
+            self.preview.reset_on_selection_change();
         }
     }
 
     pub fn scroll_preview_up(&mut self) {
-        self.preview_scroll_offset = self.preview_scroll_offset.saturating_add(3);
+        self.preview.scroll_up();
     }
 
     pub fn scroll_preview_down(&mut self) {
-        self.preview_scroll_offset = self.preview_scroll_offset.saturating_sub(3);
+        self.preview.scroll_down();
     }
 
     pub fn attach_selected(&mut self) {
@@ -606,7 +631,7 @@ impl App {
     pub fn detach(&mut self) {
         self.mode = Mode::Browse;
         self.selected = 0;
-        self.preview_scroll_offset = 0;
+        self.preview.scroll_offset = 0;
     }
 
     pub fn start_new_session(&mut self) {
@@ -814,9 +839,7 @@ impl App {
                         if let Some(idx) = target_idx {
                             if self.selected != idx {
                                 self.selected = idx;
-                                self.preview_scroll_offset = 0;
-                                self.preview_session = None;
-                                self.preview_has_scrollback = false;
+                                self.preview.reset_on_selection_change();
                             }
                         }
                     } else if preview.contains(pos) {
@@ -853,7 +876,7 @@ impl App {
                 MouseEventKind::Down(MouseButton::Left) => {
                     if inner(preview).contains(pos) {
                         // Reset scroll to bottom so user sees live output after clicking.
-                        self.preview_scroll_offset = 0;
+                        self.preview.scroll_offset = 0;
                     } else {
                         self.detach();
                     }
@@ -1858,37 +1881,37 @@ mod tests {
     #[test]
     fn scroll_preview_up_increases_offset() {
         let mut app = test_app();
-        assert_eq!(app.preview_scroll_offset, 0);
+        assert_eq!(app.preview.scroll_offset, 0);
         app.scroll_preview_up();
-        assert_eq!(app.preview_scroll_offset, 3);
+        assert_eq!(app.preview.scroll_offset, 3);
         app.scroll_preview_up();
-        assert_eq!(app.preview_scroll_offset, 6);
+        assert_eq!(app.preview.scroll_offset, 6);
     }
 
     #[test]
     fn scroll_preview_down_decreases_offset() {
         let mut app = test_app();
-        app.preview_scroll_offset = 6;
+        app.preview.scroll_offset = 6;
         app.scroll_preview_down();
-        assert_eq!(app.preview_scroll_offset, 3);
+        assert_eq!(app.preview.scroll_offset, 3);
         app.scroll_preview_down();
-        assert_eq!(app.preview_scroll_offset, 0);
+        assert_eq!(app.preview.scroll_offset, 0);
     }
 
     #[test]
     fn scroll_preview_down_saturates_at_zero() {
         let mut app = test_app();
-        assert_eq!(app.preview_scroll_offset, 0);
+        assert_eq!(app.preview.scroll_offset, 0);
         app.scroll_preview_down();
-        assert_eq!(app.preview_scroll_offset, 0, "should not go below 0");
+        assert_eq!(app.preview.scroll_offset, 0, "should not go below 0");
     }
 
     #[test]
     fn scroll_preview_up_saturates_at_max() {
         let mut app = test_app();
-        app.preview_scroll_offset = u16::MAX - 1;
+        app.preview.scroll_offset = u16::MAX - 1;
         app.scroll_preview_up();
-        assert_eq!(app.preview_scroll_offset, u16::MAX);
+        assert_eq!(app.preview.scroll_offset, u16::MAX);
     }
 
     #[test]
@@ -1898,9 +1921,9 @@ mod tests {
             make_session("b", AgentType::Claude),
         ];
         let mut app = test_app_with_sessions(sessions);
-        app.preview_scroll_offset = 10;
+        app.preview.scroll_offset = 10;
         app.select_next();
-        assert_eq!(app.preview_scroll_offset, 0, "scroll should reset on nav");
+        assert_eq!(app.preview.scroll_offset, 0, "scroll should reset on nav");
     }
 
     #[test]
@@ -1911,9 +1934,9 @@ mod tests {
         ];
         let mut app = test_app_with_sessions(sessions);
         app.selected = 1;
-        app.preview_scroll_offset = 10;
+        app.preview.scroll_offset = 10;
         app.select_prev();
-        assert_eq!(app.preview_scroll_offset, 0);
+        assert_eq!(app.preview.scroll_offset, 0);
     }
 
     // ── Mouse handling tests ─────────────────────────────────────────
@@ -2016,7 +2039,7 @@ mod tests {
             row: 5,
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
-        assert_eq!(app.preview_scroll_offset, 3);
+        assert_eq!(app.preview.scroll_offset, 3);
     }
 
     #[test]
@@ -2025,7 +2048,7 @@ mod tests {
         let mut app = test_app_with_sessions(sessions);
         app.sidebar_area.set(Rect::new(0, 0, 24, 20));
         app.preview_area.set(Rect::new(24, 0, 56, 20));
-        app.preview_scroll_offset = 6;
+        app.preview.scroll_offset = 6;
 
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::ScrollDown,
@@ -2033,7 +2056,7 @@ mod tests {
             row: 5,
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
-        assert_eq!(app.preview_scroll_offset, 3);
+        assert_eq!(app.preview.scroll_offset, 3);
     }
 
     #[test]
@@ -2098,7 +2121,7 @@ mod tests {
             row: 5,
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
-        assert_eq!(app.preview_scroll_offset, 3);
+        assert_eq!(app.preview.scroll_offset, 3);
         assert_eq!(app.mode, Mode::Attached, "should stay attached");
     }
 
@@ -2109,7 +2132,7 @@ mod tests {
         app.mode = Mode::Attached;
         app.sidebar_area.set(Rect::new(0, 0, 24, 20));
         app.preview_area.set(Rect::new(24, 0, 56, 20));
-        app.preview_scroll_offset = 6;
+        app.preview.scroll_offset = 6;
 
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::ScrollDown,
@@ -2117,7 +2140,7 @@ mod tests {
             row: 5,
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
-        assert_eq!(app.preview_scroll_offset, 3);
+        assert_eq!(app.preview.scroll_offset, 3);
     }
 
     #[test]
@@ -2166,7 +2189,7 @@ mod tests {
         );
         app.sessions = vec![make_session("s1", AgentType::Claude)];
         app.refresh_preview().await;
-        assert_eq!(app.preview, "[unable to capture pane]");
+        assert_eq!(app.preview.content, "[unable to capture pane]");
     }
 
     #[tokio::test]
@@ -3034,7 +3057,7 @@ mod tests {
         app.sidebar_area.set(Rect::new(0, 0, 24, 20));
         app.preview_area.set(Rect::new(24, 0, 56, 20));
         app.selected = 0;
-        app.preview_scroll_offset = 5; // non-zero offset
+        app.preview.scroll_offset = 5; // non-zero offset
 
         // Click on first session (already selected)
         app.handle_mouse(MouseEvent {
@@ -3045,7 +3068,7 @@ mod tests {
         });
         assert_eq!(app.selected, 0);
         // Scroll offset should NOT reset since session didn't change
-        assert_eq!(app.preview_scroll_offset, 5);
+        assert_eq!(app.preview.scroll_offset, 5);
     }
 
     #[test]
@@ -3064,7 +3087,7 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
         assert_eq!(
-            app.preview_scroll_offset, 0,
+            app.preview.scroll_offset, 0,
             "scroll outside preview should be noop"
         );
         assert_eq!(app.mode, Mode::Attached);
@@ -3252,7 +3275,7 @@ mod tests {
         app.mode = Mode::Attached;
         app.sidebar_area.set(Rect::new(0, 0, 24, 20));
         app.preview_area.set(Rect::new(24, 0, 56, 20));
-        app.preview_scroll_offset = 10;
+        app.preview.scroll_offset = 10;
 
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -3262,7 +3285,7 @@ mod tests {
         });
 
         assert_eq!(
-            app.preview_scroll_offset, 0,
+            app.preview.scroll_offset, 0,
             "click should reset scroll to bottom"
         );
     }
@@ -3493,7 +3516,7 @@ mod tests {
         let mut app = test_app_with_sessions(sessions);
         app.sidebar_area.set(Rect::new(0, 0, 24, 20));
         app.preview_area.set(Rect::new(24, 0, 56, 20));
-        assert_eq!(app.preview_scroll_offset, 0);
+        assert_eq!(app.preview.scroll_offset, 0);
 
         // Scroll up in preview
         app.handle_mouse(MouseEvent {
@@ -3502,9 +3525,9 @@ mod tests {
             row: 10,
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
-        assert!(app.preview_scroll_offset > 0);
+        assert!(app.preview.scroll_offset > 0);
 
-        let offset = app.preview_scroll_offset;
+        let offset = app.preview.scroll_offset;
 
         // Scroll down should decrease offset
         app.handle_mouse(MouseEvent {
@@ -3513,7 +3536,7 @@ mod tests {
             row: 10,
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
-        assert!(app.preview_scroll_offset < offset);
+        assert!(app.preview.scroll_offset < offset);
     }
 
     // ── Task timer: Running starts clock ─────────────────────────
@@ -3755,8 +3778,8 @@ mod tests {
     #[tokio::test]
     async fn refresh_sessions_changed_content_triggers_running_after_five_ticks() {
         let sessions = vec![make_session("s1", AgentType::Claude)];
-        let manager =
-            MockSessionManager::with_sessions(sessions).with_capture_fn(|n| format!("output {n}"));
+        let manager = MockSessionManager::with_sessions(sessions)
+            .with_capture_fn(|n| format!("output {}", (b'a' + (n % 26) as u8) as char));
 
         let mut app = App::new_with_manager(
             "testid".to_string(),
@@ -3802,7 +3825,7 @@ mod tests {
             if n < 32 {
                 "stable".to_string()
             } else {
-                format!("changing {n}")
+                format!("changing {}", (b'a' + (n % 26) as u8) as char)
             }
         });
 
@@ -3909,12 +3932,12 @@ mod tests {
 
         // First call — captures preview
         app.refresh_preview().await;
-        assert_eq!(app.preview_session.as_deref(), Some("hydra-testid-s1"));
+        assert_eq!(app.preview.session.as_deref(), Some("hydra-testid-s1"));
         // Simulate idle_ticks >= 1 for the session
         app.status.idle_ticks.insert("hydra-testid-s1".to_string(), 1);
 
         // Second call — should skip (same session, idle_ticks >= 1)
-        app.set_preview_text("modified".to_string());
+        app.preview.set_text("modified".to_string());
         app.refresh_preview().await;
         // If it skipped, preview remains "modified" (wasn't overwritten)
         assert_eq!(
@@ -3926,7 +3949,7 @@ mod tests {
         app.sessions.push(make_session("s2", AgentType::Claude));
         app.selected = 1;
         app.refresh_preview().await;
-        assert_eq!(app.preview_session.as_deref(), Some("hydra-testid-s2"));
+        assert_eq!(app.preview.session.as_deref(), Some("hydra-testid-s2"));
     }
 
     // ── Preview skip does NOT skip when idle_ticks = 0 ──
@@ -3943,7 +3966,7 @@ mod tests {
 
         app.refresh_preview().await;
         // idle_ticks = 0 (default), same session
-        app.set_preview_text("modified".to_string());
+        app.preview.set_text("modified".to_string());
         app.refresh_preview().await;
         // Should NOT skip, so preview is overwritten
         assert_ne!(
@@ -3975,7 +3998,7 @@ mod tests {
         );
 
         app.refresh_preview().await;
-        assert_eq!(app.preview, "pane-capture");
+        assert_eq!(app.preview.content, "pane-capture");
         assert_eq!(
             pane_calls.load(Ordering::SeqCst),
             1,
@@ -4005,11 +4028,11 @@ mod tests {
 
         app.refresh_sessions().await;
         app.refresh_preview().await;
-        assert_eq!(app.preview, "pane-capture");
+        assert_eq!(app.preview.content, "pane-capture");
 
-        app.preview_scroll_offset = 1;
+        app.preview.scroll_offset = 1;
         app.refresh_preview().await;
-        assert_eq!(app.preview, "mock pane content"); // scrollback returns default
+        assert_eq!(app.preview.content, "mock pane content"); // scrollback returns default
         assert_eq!(
             scrollback_calls.load(Ordering::SeqCst),
             1,
@@ -4017,7 +4040,7 @@ mod tests {
         );
 
         // While still scrolled up in same session, preview should stay frozen.
-        app.set_preview_text("frozen".to_string());
+        app.preview.set_text("frozen".to_string());
         app.refresh_preview().await;
         assert_eq!(
             app.preview, "frozen",
@@ -4030,9 +4053,9 @@ mod tests {
         );
 
         // Returning to bottom should switch back to live pane path.
-        app.preview_scroll_offset = 0;
+        app.preview.scroll_offset = 0;
         app.refresh_preview().await;
-        assert_eq!(app.preview, "pane-capture");
+        assert_eq!(app.preview.content, "pane-capture");
         assert_eq!(
             pane_calls.load(Ordering::SeqCst),
             1,
@@ -4151,7 +4174,7 @@ mod tests {
             "should not forward mouse clicks to agents"
         );
         assert_eq!(
-            app.preview_scroll_offset, 0,
+            app.preview.scroll_offset, 0,
             "should reset scroll to bottom"
         );
     }
@@ -4368,9 +4391,9 @@ mod tests {
             Box::new(mock),
         );
         app.sessions = vec![make_session("s1", AgentType::Claude)];
-        app.preview_scroll_offset = 5; // trigger scrollback path
+        app.preview.scroll_offset = 5; // trigger scrollback path
         app.refresh_preview().await;
-        assert_eq!(app.preview, "[unable to capture pane]");
+        assert_eq!(app.preview.content, "[unable to capture pane]");
     }
 
     // ── Dead-tick debounce tests ─────────────────────────────────────
