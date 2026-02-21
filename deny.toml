@@ -2,28 +2,29 @@
 # Run: cargo deny check
 
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "warn"
-notice = "warn"
+ignore = [
+    # paste is unmaintained but it's a transitive dep of ratatui — nothing we can do
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
-unlicensed = "deny"
 allow = [
     "MIT",
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
+    "MPL-2.0",
+    "Zlib",
     "Unicode-3.0",
     "Unicode-DFS-2016",
 ]
-copyleft = "deny"
+confidence-threshold = 0.8
+exceptions = []
 
-[[licenses.clarify]]
-name = "ring"
-expression = "MIT AND ISC AND OpenSSL"
-license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+[licenses.private]
+ignore = true
+registries = []
 
 [bans]
 multiple-versions = "warn"
