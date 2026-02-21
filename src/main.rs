@@ -1,11 +1,3 @@
-mod app;
-mod event;
-mod logs;
-mod manifest;
-mod session;
-mod tmux;
-mod ui;
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use crossterm::{
@@ -22,9 +14,10 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
-use app::{App, Mode};
-use event::{Event, EventHandler};
-use session::{project_id, AgentType};
+use hydra::app::{App, Mode};
+use hydra::event::{Event, EventHandler};
+use hydra::session::{self, project_id, AgentType};
+use hydra::{manifest, tmux, ui};
 
 const EVENT_TICK_RATE: Duration = Duration::from_millis(100);
 const SESSION_REFRESH_INTERVAL_TICKS: u8 = 2;

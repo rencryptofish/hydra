@@ -177,7 +177,7 @@ fn update_session_stats_from_path(path: &std::path::Path, stats: &mut SessionSta
     let _ = update_session_stats_from_path_and_last_message(path, stats);
 }
 
-fn update_session_stats_from_path_and_last_message(
+pub fn update_session_stats_from_path_and_last_message(
     path: &std::path::Path,
     stats: &mut SessionStats,
 ) -> Option<String> {
@@ -946,7 +946,7 @@ fn escape_project_path(cwd: &str) -> String {
     cwd.replace('/', "-")
 }
 
-fn extract_assistant_message_text(v: &serde_json::Value) -> Option<String> {
+pub fn extract_assistant_message_text(v: &serde_json::Value) -> Option<String> {
     let content = v
         .get("message")
         .and_then(|m| m.get("content"))

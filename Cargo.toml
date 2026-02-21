@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+ansi-to-tui = "7"
 anyhow = "1"
 async-trait = "0.1"
 chrono = "0.4"
@@ -21,7 +22,20 @@ tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 insta = "1"
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+
+[[bench]]
+name = "rendering"
+harness = false
+
+[[bench]]
+name = "input_handling"
+harness = false
+
+[[bench]]
+name = "data_processing"
+harness = false

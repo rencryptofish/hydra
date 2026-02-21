@@ -303,7 +303,7 @@ pub async fn create_session(
 /// Capture the current pane content of a tmux session.
 pub async fn capture_pane(tmux_name: &str) -> Result<String> {
     let output =
-        run_cmd_timeout(Command::new("tmux").args(["capture-pane", "-t", tmux_name, "-p"]))
+        run_cmd_timeout(Command::new("tmux").args(["capture-pane", "-t", tmux_name, "-p", "-e"]))
             .await
             .context("Failed to capture tmux pane")?;
 
@@ -321,7 +321,7 @@ pub async fn capture_pane_scrollback(tmux_name: &str) -> Result<String> {
     let output = match tokio::time::timeout(
         CMD_TIMEOUT_LONG,
         Command::new("tmux")
-            .args(["capture-pane", "-t", tmux_name, "-p", "-S", "-5000"])
+            .args(["capture-pane", "-t", tmux_name, "-p", "-e", "-S", "-5000"])
             .output(),
     )
     .await
@@ -418,7 +418,7 @@ pub fn keycode_to_tmux(
 }
 
 /// Wrap a tmux key name with modifier prefixes (C-, M-, S-).
-fn apply_tmux_modifiers(base: &str, modifiers: crossterm::event::KeyModifiers) -> String {
+pub fn apply_tmux_modifiers(base: &str, modifiers: crossterm::event::KeyModifiers) -> String {
     use crossterm::event::KeyModifiers;
 
     let mut key = base.to_string();

@@ -77,6 +77,8 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 - `raw.githubusercontent.com` returns 404 for private repos — can't use `curl | bash` install pattern. Use `cargo install --git ssh://...` instead.
 - `cargo install --git ssh://...` uses libgit2 by default, which doesn't read the SSH agent. Set `CARGO_NET_GIT_FETCH_WITH_CLI=true` to force cargo to use the system `git` CLI (which does).
 - `hydra update` now uses signed binary releases: downloads binary + `.minisig` from GitHub Releases, verifies Ed25519 signature in memory via `minisign-verify` crate before writing to disk. `UPDATE_PUBLIC_KEY` in `main.rs` is a placeholder — must be replaced with the real key before cutting releases.
+- `ansi-to-tui` v7 is compatible with ratatui 0.29; v8 depends on `ratatui-core` (a separate crate for ratatui 0.30+) and causes type mismatches.
+- Preview pane uses ANSI color rendering: `tmux capture-pane -e` emits escape sequences, parsed once via `ansi_to_tui::IntoText` into cached `Text<'static>`. Raw string kept for `normalize_capture()` status detection.
 
 ## Common Changes
 

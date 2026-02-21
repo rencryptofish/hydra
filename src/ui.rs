@@ -48,7 +48,7 @@ fn status_color(status: &SessionStatus) -> Color {
     }
 }
 
-fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
+pub fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     // Show stats if global stats have any tokens
     let has_stats = app.global_stats.tokens_in + app.global_stats.tokens_out > 0;
 
@@ -336,7 +336,7 @@ fn draw_diff_tree(frame: &mut Frame, lines: &[Line], area: Rect) {
     frame.render_widget(paragraph, inner);
 }
 
-fn draw_stats(frame: &mut Frame, app: &App, area: Rect) {
+pub fn draw_stats(frame: &mut Frame, app: &App, area: Rect) {
     // Use machine-wide global stats for cost and tokens
     let total_cost = app.global_stats.cost_usd();
     let total_tokens = app.global_stats.tokens_in + app.global_stats.tokens_out;
@@ -374,7 +374,7 @@ fn draw_stats(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
+pub fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
     let title = if let Some(session) = app.sessions.get(app.selected) {
         format!(" {} ", session.name)
     } else {
@@ -428,15 +428,21 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
     let capped_offset = app.preview_scroll_offset.min(max_scroll_offset);
     let scroll_y = max_scroll_offset.saturating_sub(capped_offset);
 
-    let preview = Paragraph::new(app.preview.as_str())
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(border_type)
-                .title(border_title)
-                .border_style(border_style),
-        )
-        .scroll((scroll_y, 0));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(border_type)
+        .title(border_title)
+        .border_style(border_style);
+
+    let preview = if let Some(ref text) = app.preview_text {
+        Paragraph::new(text.clone())
+            .block(block)
+            .scroll((scroll_y, 0))
+    } else {
+        Paragraph::new(app.preview.as_str())
+            .block(block)
+            .scroll((scroll_y, 0))
+    };
 
     frame.render_widget(preview, preview_area);
 }

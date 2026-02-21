@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
+use ratatui::text::Text;
 
 use crate::logs::{GlobalStats, SessionStats};
 use crate::session::{AgentType, Session, SessionStatus};
@@ -32,6 +33,8 @@ pub struct App {
     pub sessions: Vec<Session>,
     pub selected: usize,
     pub preview: String,
+    /// ANSI-parsed preview content for colored rendering.
+    pub preview_text: Option<Text<'static>>,
     /// Cached preview line count to avoid O(n) line scans every frame.
     pub preview_line_count: u16,
     pub mode: Mode,
@@ -103,6 +106,7 @@ impl App {
             sessions: Vec::new(),
             selected: 0,
             preview: String::new(),
+            preview_text: None,
             preview_line_count: 0,
             mode: Mode::Browse,
             agent_selection: 0,
@@ -141,13 +145,14 @@ impl App {
 
     fn set_preview_content(&mut self, content: String, has_scrollback: bool) {
         self.preview_line_count = count_lines_u16(&content);
+        self.preview_text = ansi_to_tui::IntoText::into_text(&content).ok();
         self.preview = content;
         self.preview_has_scrollback = has_scrollback;
     }
 
-    #[cfg(test)]
     pub fn set_preview_text(&mut self, content: String) {
         self.preview_line_count = count_lines_u16(&content);
+        self.preview_text = ansi_to_tui::IntoText::into_text(&content).ok();
         self.preview = content;
     }
 
@@ -987,7 +992,7 @@ fn count_lines_u16(content: &str) -> u16 {
 /// Strips braille spinner characters (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏), common line-drawing
 /// spinners (|/-\), trailing whitespace, and ANSI escape sequences so that
 /// cosmetic animation doesn't trigger Running/Idle status changes.
-fn normalize_capture(content: &str) -> String {
+pub fn normalize_capture(content: &str) -> String {
     let mut result = String::with_capacity(content.len());
     let mut chars = content.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -1022,7 +1027,7 @@ fn normalize_capture(content: &str) -> String {
 /// Parse `git diff --numstat` output into per-file stats.
 /// Each line: `<insertions>\t<deletions>\t<path>`
 /// Binary files show `-\t-\t<path>` — we skip those.
-fn parse_diff_numstat(output: &str) -> Vec<DiffFile> {
+pub fn parse_diff_numstat(output: &str) -> Vec<DiffFile> {
     output
         .lines()
         .filter_map(|line| {
