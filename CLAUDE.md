@@ -7,6 +7,7 @@ TUI-based AI agent tmux session manager. Lets you run multiple Claude/Codex agen
 ```bash
 cargo build
 cargo test                # unit + snapshot + CLI integration tests
+cargo bench               # criterion benchmarks (rendering, input, data processing)
 cargo insta review        # review snapshot diffs after UI changes
 make install              # build release binary and install to ~/.cargo/bin/
 ```
@@ -15,7 +16,8 @@ make install              # build release binary and install to ~/.cargo/bin/
 
 Single-binary Rust TUI (ratatui + crossterm + tokio):
 
-- **`src/main.rs`** — CLI parsing (clap), TUI event loop, key dispatch. Passes full `KeyEvent` (not just `KeyCode`) to handlers for modifier support.
+- **`src/lib.rs`** — Thin re-export of all modules so `benches/` (external crates) can access them.
+- **`src/main.rs`** — CLI parsing (clap), TUI event loop, key dispatch. Passes full `KeyEvent` (not just `KeyCode`) to handlers for modifier support. Imports modules via `use hydra::*`.
 - **`src/app.rs`** — `App` state + `Mode` enum (Browse, Attached, NewSessionAgent, ConfirmDelete). Owns `Box<dyn SessionManager>` for testability.
 - **`src/tmux.rs`** — `SessionManager` async trait (`#[async_trait]`) + `TmuxSessionManager` impl. All tmux subprocess calls use `tokio::process::Command` (non-blocking). Also has `keycode_to_tmux()` for crossterm→tmux key mapping.
 - **`src/session.rs`** — `Session`, `SessionStatus`, `AgentType` types. Pure data, no I/O.
@@ -52,6 +54,7 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 - **Snapshot tests**: `src/ui.rs` uses `insta::assert_snapshot!` with `ratatui::backend::TestBackend` (80x24). Run `cargo insta review` after intentional UI changes. Snapshots live in `src/snapshots/`.
 - **CLI tests**: `tests/cli_tests.rs` with `assert_cmd` — tests help, ls, arg validation, unknown commands
 - **Mock**: `MockSessionManager` in app tests (controllable return values), `NoopSessionManager` in UI tests — both implement full `SessionManager` trait with `#[async_trait]`. Tests calling async App methods (`refresh_sessions`, `refresh_preview`, `confirm_new_session`, `confirm_delete`) use `#[tokio::test]`.
+- **Benchmarks**: `benches/rendering.rs`, `benches/input_handling.rs`, `benches/data_processing.rs` use criterion. Each defines its own `NoopSessionManager` and helper factories. Run `cargo bench` or `cargo bench --bench rendering` for a single suite.
 - **Test isolation**: All tests that touch the filesystem use `tempfile::tempdir()` for isolated temp directories. Test helpers (`test_app()`, `test_app_with_sessions()`) set `app.manifest_dir` to per-thread temp dirs. Never write to `~/.hydra/` in tests.
 - When adding a new `SessionManager` method, update mock impls in BOTH `app.rs` and `ui.rs` test modules
 
@@ -79,6 +82,8 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 - `hydra update` now uses signed binary releases: downloads binary + `.minisig` from GitHub Releases, verifies Ed25519 signature in memory via `minisign-verify` crate before writing to disk. `UPDATE_PUBLIC_KEY` in `main.rs` is a placeholder — must be replaced with the real key before cutting releases.
 - `ansi-to-tui` v7 is compatible with ratatui 0.29; v8 depends on `ratatui-core` (a separate crate for ratatui 0.30+) and causes type mismatches.
 - Preview pane uses ANSI color rendering: `tmux capture-pane -e` emits escape sequences, parsed once via `ansi_to_tui::IntoText` into cached `Text<'static>`. Raw string kept for `normalize_capture()` status detection.
+- **Benchmark baselines (criterion, 2026-02-20)**: Full frame draw ~50–60µs at 80×24 (<1% of 100ms tick); key/mouse dispatch <200ns; `normalize_capture` 6–130µs scaling with input size; JSONL incremental parse ~5× faster than full; preview rendering is the most expensive path (~6ms at 5000 lines). All well within the tick budget.
+- To expose internal functions to criterion benchmarks, `src/lib.rs` re-exports modules and hot-path helpers (`normalize_capture`, `parse_diff_numstat`, `draw_sidebar`/`draw_preview`/`draw_stats`, `extract_assistant_message_text`, `update_session_stats_from_path_and_last_message`, `apply_tmux_modifiers`) are `pub`.
 
 ## Common Changes
 
