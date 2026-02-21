@@ -423,9 +423,9 @@ pub fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let inner_height = preview_area.height.saturating_sub(2);
-    let total_lines = app.preview_line_count;
+    let total_lines = app.preview.line_count;
     let max_scroll_offset = total_lines.saturating_sub(inner_height);
-    let capped_offset = app.preview_scroll_offset.min(max_scroll_offset);
+    let capped_offset = app.preview.scroll_offset.min(max_scroll_offset);
     let scroll_y = max_scroll_offset.saturating_sub(capped_offset);
 
     let block = Block::default()
@@ -434,12 +434,12 @@ pub fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
         .title(border_title)
         .border_style(border_style);
 
-    let preview = if let Some(ref text) = app.preview_text {
+    let preview = if let Some(ref text) = app.preview.text {
         Paragraph::new(text.clone())
             .block(block)
             .scroll((scroll_y, 0))
     } else {
-        Paragraph::new(app.preview.as_str())
+        Paragraph::new(app.preview.content.as_str())
             .block(block)
             .scroll((scroll_y, 0))
     };
@@ -634,7 +634,7 @@ mod tests {
             make_session("research", AgentType::Claude),
         ];
         app.selected = 0;
-        app.set_preview_text("some preview content".to_string());
+        app.preview.set_text("some preview content".to_string());
 
         terminal.draw(|f| super::draw(f, &app)).unwrap();
         let output = buffer_to_string(&terminal);
@@ -648,7 +648,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         let mut app = make_app();
-        app.set_preview_text("No sessions. Press 'n' to create one.".to_string());
+        app.preview.set_text("No sessions. Press 'n' to create one.".to_string());
 
         terminal.draw(|f| super::draw(f, &app)).unwrap();
         let output = buffer_to_string(&terminal);
@@ -696,7 +696,7 @@ mod tests {
         app.sessions = vec![make_session("active-session", AgentType::Claude)];
         app.selected = 0;
         app.mode = Mode::Attached;
-        app.set_preview_text("$ claude\nHello, how can I help?".to_string());
+        app.preview.set_text("$ claude\nHello, how can I help?".to_string());
 
         terminal.draw(|f| super::draw(f, &app)).unwrap();
         let output = buffer_to_string(&terminal);
@@ -711,7 +711,7 @@ mod tests {
 
         let mut app = make_app();
         app.status_message = Some("Created session 'worker-1' with Claude".to_string());
-        app.set_preview_text("No sessions. Press 'n' to create one.".to_string());
+        app.preview.set_text("No sessions. Press 'n' to create one.".to_string());
 
         terminal.draw(|f| super::draw(f, &app)).unwrap();
         let output = buffer_to_string(&terminal);
@@ -731,7 +731,7 @@ mod tests {
             make_session_with_status("exited-one", AgentType::Claude, SessionStatus::Exited),
         ];
         app.selected = 1;
-        app.set_preview_text("running session output".to_string());
+        app.preview.set_text("running session output".to_string());
 
         terminal.draw(|f| super::draw(f, &app)).unwrap();
         let output = buffer_to_string(&terminal);
@@ -750,7 +750,7 @@ mod tests {
         session.task_elapsed = Some(std::time::Duration::from_secs(125));
         app.sessions = vec![session];
         app.selected = 0;
-        app.set_preview_text("working...".to_string());
+        app.preview.set_text("working...".to_string());
 
         terminal.draw(|f| super::draw(f, &app)).unwrap();
         let output = buffer_to_string(&terminal);
@@ -769,7 +769,7 @@ mod tests {
             make_session("worker-2", AgentType::Codex),
         ];
         app.selected = 0;
-        app.set_preview_text("preview".to_string());
+        app.preview.set_text("preview".to_string());
         app.last_messages.insert(
             "hydra-testproj-worker-1".to_string(),
             "I'll help you with that task.".to_string(),
@@ -789,7 +789,7 @@ mod tests {
         let mut app = make_app();
         app.sessions = vec![make_session("worker-1", AgentType::Claude)];
         app.selected = 0;
-        app.set_preview_text("preview".to_string());
+        app.preview.set_text("preview".to_string());
         app.last_messages.insert(
             "hydra-testproj-worker-1".to_string(),
             "This is a very long message that should be truncated at fifty characters to fit sidebar".to_string(),
@@ -810,13 +810,13 @@ mod tests {
         app.sessions = vec![make_session("s1", AgentType::Claude)];
         app.selected = 0;
         // Create content taller than the preview area
-        app.set_preview_text(
+        app.preview.set_text(
             (0..50)
                 .map(|i| format!("line {i}"))
                 .collect::<Vec<_>>()
                 .join("\n"),
         );
-        app.preview_scroll_offset = 10;
+        app.preview.scroll_offset = 10;
 
         terminal.draw(|f| super::draw(f, &app)).unwrap();
         let output = buffer_to_string(&terminal);
@@ -1083,7 +1083,7 @@ mod tests {
         let mut app = make_app();
         app.sessions = vec![make_session("worker-1", AgentType::Claude)];
         app.selected = 0;
-        app.set_preview_text("preview content".to_string());
+        app.preview.set_text("preview content".to_string());
 
         let mut stats = crate::logs::SessionStats::default();
         stats.turns = 5;
@@ -1114,7 +1114,7 @@ mod tests {
         let mut app = make_app();
         app.sessions = vec![make_session("worker-1", AgentType::Claude)];
         app.selected = 0;
-        app.set_preview_text("some preview content".to_string());
+        app.preview.set_text("some preview content".to_string());
 
         // Populate global stats (machine-wide, drives stats block visibility)
         app.global_stats.tokens_in = 28200;
@@ -1248,7 +1248,7 @@ mod tests {
 
         let mut app = make_app();
         app.sessions = vec![make_session("s1", AgentType::Claude)];
-        app.set_preview_text("test output".to_string());
+        app.preview.set_text("test output".to_string());
         app.mouse_captured = false; // copy mode enabled
 
         terminal.draw(|f| super::draw(f, &app)).unwrap();

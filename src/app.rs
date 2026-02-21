@@ -299,6 +299,98 @@ impl PreviewState {
     }
 }
 
+/// Background task state for async message/stats/diff refresh.
+pub(crate) struct BackgroundRefreshState {
+    pub(crate) log_uuids: HashMap<String, String>,
+    pub(crate) uuid_retry_cooldowns: HashMap<String, u8>,
+    pub(crate) message_tick: u8,
+    bg_refresh_rx: Option<tokio::sync::oneshot::Receiver<MessageRefreshResult>>,
+}
+
+impl BackgroundRefreshState {
+    fn new() -> Self {
+        Self {
+            log_uuids: HashMap::new(),
+            uuid_retry_cooldowns: HashMap::new(),
+            message_tick: 0,
+            bg_refresh_rx: None,
+        }
+    }
+
+    /// Poll for completed background results and spawn new tasks on cadence.
+    /// Returns `Some(result)` when a background task completes.
+    pub(crate) fn tick(
+        &mut self,
+        tmux_names: &[String],
+        session_stats: &HashMap<String, SessionStats>,
+        global_stats: &GlobalStats,
+        cwd: &str,
+    ) -> Option<MessageRefreshResult> {
+        let mut completed = None;
+
+        // Always poll for completed background results
+        if let Some(mut rx) = self.bg_refresh_rx.take() {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.log_uuids.extend(result.log_uuids.clone());
+                    self.uuid_retry_cooldowns = result.uuid_retry_cooldowns.clone();
+                    completed = Some(result);
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    // Still running, put it back
+                    self.bg_refresh_rx = Some(rx);
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    // Task panicked or was dropped
+                }
+            }
+        }
+
+        self.message_tick = self.message_tick.wrapping_add(1);
+        // Run every 50 ticks (~5 seconds at 100ms interval)
+        if self.message_tick % 50 != 0 {
+            return completed;
+        }
+
+        // Don't start a new background task if one is already running
+        if self.bg_refresh_rx.is_some() {
+            return completed;
+        }
+
+        // Clone data for background task
+        let tmux_names = tmux_names.to_vec();
+        let log_uuids = self.log_uuids.clone();
+        let uuid_retry_cooldowns = self.uuid_retry_cooldowns.clone();
+        let session_stats = session_stats.clone();
+        let global_stats = global_stats.clone();
+        let cwd = cwd.to_string();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.bg_refresh_rx = Some(rx);
+
+        tokio::spawn(async move {
+            let result = compute_message_refresh(
+                tmux_names,
+                log_uuids,
+                uuid_retry_cooldowns,
+                session_stats,
+                global_stats,
+                cwd,
+            )
+            .await;
+            let _ = tx.send(result);
+        });
+
+        completed
+    }
+
+    /// Remove entries for sessions that no longer exist.
+    pub(crate) fn prune(&mut self, live_keys: &HashSet<&String>) {
+        self.log_uuids.retain(|k, _| live_keys.contains(k));
+        self.uuid_retry_cooldowns.retain(|k, _| live_keys.contains(k));
+    }
+}
+
 pub struct App {
     pub sessions: Vec<Session>,
     pub selected: usize,
@@ -318,10 +410,7 @@ pub struct App {
     pub global_stats: GlobalStats,
     /// Per-file git diff stats from `git diff --numstat`
     pub diff_files: Vec<DiffFile>,
-    log_uuids: HashMap<String, String>,
-    /// Per-session cooldown (in refresh cycles) before retrying UUID resolution.
-    uuid_retry_cooldowns: HashMap<String, u8>,
-    message_tick: u8,
+    pub(crate) bg: BackgroundRefreshState,
     pub manifest_dir: PathBuf,
     manager: Box<dyn SessionManager>,
     /// Pending literal keys to send to tmux (tmux_name, text).
@@ -332,8 +421,6 @@ pub struct App {
     /// Cached diff tree lines: (diff_files, width, rendered lines).
     /// Updated lazily in draw_sidebar to avoid recomputing on every frame.
     pub diff_tree_cache: RefCell<(Vec<DiffFile>, usize, Vec<ratatui::text::Line<'static>>)>,
-    /// Background refresh channel for async message/stats/diff updates.
-    bg_refresh_rx: Option<tokio::sync::oneshot::Receiver<MessageRefreshResult>>,
 }
 
 impl App {
@@ -364,15 +451,12 @@ impl App {
             session_stats: HashMap::new(),
             global_stats: GlobalStats::default(),
             diff_files: Vec::new(),
-            log_uuids: HashMap::new(),
-            uuid_retry_cooldowns: HashMap::new(),
-            message_tick: 0,
+            bg: BackgroundRefreshState::new(),
             manifest_dir: crate::manifest::default_base_dir(),
             manager,
             pending_literal_keys: None,
             mouse_captured: true,
             diff_tree_cache: RefCell::new((Vec::new(), 0, Vec::new())),
-            bg_refresh_rx: None,
         }
     }
 
@@ -451,8 +535,7 @@ impl App {
             self.timers.prune(&live_keys);
             self.last_messages.retain(|k, _| live_keys.contains(k));
             self.session_stats.retain(|k, _| live_keys.contains(k));
-            self.log_uuids.retain(|k, _| live_keys.contains(k));
-            self.uuid_retry_cooldowns.retain(|k, _| live_keys.contains(k));
+            self.bg.prune(&live_keys);
         }
 
         // Keep selected index in bounds
@@ -538,62 +621,18 @@ impl App {
     /// Non-blocking: spawns heavy I/O (JSONL parsing, git diff, UUID resolution)
     /// on a background tokio task and polls results via oneshot channel.
     pub fn refresh_messages(&mut self) {
-        // Always poll for completed background results
-        if let Some(mut rx) = self.bg_refresh_rx.take() {
-            match rx.try_recv() {
-                Ok(result) => {
-                    self.log_uuids.extend(result.log_uuids);
-                    self.uuid_retry_cooldowns = result.uuid_retry_cooldowns;
-                    self.last_messages.extend(result.last_messages);
-                    self.session_stats = result.session_stats;
-                    self.global_stats = result.global_stats;
-                    self.diff_files = result.diff_files;
-                }
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                    // Still running, put it back
-                    self.bg_refresh_rx = Some(rx);
-                }
-                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                    // Task panicked or was dropped
-                }
-            }
-        }
-
-        self.message_tick = self.message_tick.wrapping_add(1);
-        // Run every 50 ticks (~5 seconds at 100ms interval)
-        if self.message_tick % 50 != 0 {
-            return;
-        }
-
-        // Don't start a new background task if one is already running
-        if self.bg_refresh_rx.is_some() {
-            return;
-        }
-
-        // Clone data for background task
         let tmux_names: Vec<String> = self.sessions.iter().map(|s| s.tmux_name.clone()).collect();
-        let log_uuids = self.log_uuids.clone();
-        let uuid_retry_cooldowns = self.uuid_retry_cooldowns.clone();
-        let session_stats = self.session_stats.clone();
-        let global_stats = self.global_stats.clone();
-        let cwd = self.cwd.clone();
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.bg_refresh_rx = Some(rx);
-
-        tokio::spawn(async move {
-            let result =
-                compute_message_refresh(
-                    tmux_names,
-                    log_uuids,
-                    uuid_retry_cooldowns,
-                    session_stats,
-                    global_stats,
-                    cwd,
-                )
-                .await;
-            let _ = tx.send(result);
-        });
+        if let Some(result) = self.bg.tick(
+            &tmux_names,
+            &self.session_stats,
+            &self.global_stats,
+            &self.cwd,
+        ) {
+            self.last_messages.extend(result.last_messages);
+            self.session_stats = result.session_stats;
+            self.global_stats = result.global_stats;
+            self.diff_files = result.diff_files;
+        }
     }
 
     pub fn select_next(&mut self) {
@@ -1839,9 +1878,9 @@ mod tests {
         let mut app = test_app();
         app.refresh_preview().await;
         assert!(
-            app.preview.contains("No sessions"),
+            app.preview.content.contains("No sessions"),
             "preview with no sessions should show placeholder, got: {:?}",
-            app.preview
+            app.preview.content
         );
     }
 
@@ -1851,7 +1890,7 @@ mod tests {
         let mut app = test_app_with_sessions(sessions);
         app.refresh_preview().await;
         assert_eq!(
-            app.preview, "mock pane content",
+            app.preview.content, "mock pane content",
             "preview should contain mock pane content"
         );
     }
@@ -2343,7 +2382,7 @@ mod tests {
         // message_tick starts at 0, first call increments to 1
         app.refresh_messages();
         // No panic, no messages (no sessions)
-        assert_eq!(app.message_tick, 1);
+        assert_eq!(app.bg.message_tick, 1);
     }
 
     // ── Mouse with last_messages (2-line items) ──────────────────────
@@ -3121,9 +3160,9 @@ mod tests {
     async fn refresh_messages_runs_on_50th_tick() {
         let mut app = test_app();
         // Start at tick 49 so the next call (tick 50) triggers the inner loop
-        app.message_tick = 49;
+        app.bg.message_tick = 49;
         app.refresh_messages();
-        assert_eq!(app.message_tick, 50);
+        assert_eq!(app.bg.message_tick, 50);
         // No panic and no sessions to process — this just covers the tick check
     }
 
@@ -3149,7 +3188,7 @@ mod tests {
             .insert("test-session".to_string(), 4);
         tx.send(result).ok(); // ignore error (can't unwrap without Debug on the error type)
 
-        app.bg_refresh_rx = Some(rx);
+        app.bg.bg_refresh_rx = Some(rx);
         app.refresh_messages();
 
         assert_eq!(
@@ -3158,11 +3197,11 @@ mod tests {
             "should apply completed background result"
         );
         assert_eq!(
-            app.uuid_retry_cooldowns.get("test-session"),
+            app.bg.uuid_retry_cooldowns.get("test-session"),
             Some(&4),
             "should apply cooldown state from background result"
         );
-        assert!(app.bg_refresh_rx.is_none(), "should consume the channel");
+        assert!(app.bg.bg_refresh_rx.is_none(), "should consume the channel");
     }
 
     #[tokio::test]
@@ -3171,11 +3210,11 @@ mod tests {
 
         // Create a oneshot where we keep the sender (task still running)
         let (tx, rx) = tokio::sync::oneshot::channel::<MessageRefreshResult>();
-        app.bg_refresh_rx = Some(rx);
+        app.bg.bg_refresh_rx = Some(rx);
         app.refresh_messages();
 
         assert!(
-            app.bg_refresh_rx.is_some(),
+            app.bg.bg_refresh_rx.is_some(),
             "should put receiver back when task is still running"
         );
         drop(tx); // cleanup
@@ -3188,11 +3227,11 @@ mod tests {
         // Create a oneshot and immediately drop the sender (simulates task panic)
         let (_tx, rx) = tokio::sync::oneshot::channel::<MessageRefreshResult>();
         drop(_tx);
-        app.bg_refresh_rx = Some(rx);
+        app.bg.bg_refresh_rx = Some(rx);
         app.refresh_messages();
 
         assert!(
-            app.bg_refresh_rx.is_none(),
+            app.bg.bg_refresh_rx.is_none(),
             "should clear channel when task was dropped"
         );
     }
@@ -3202,15 +3241,15 @@ mod tests {
         let mut app = test_app();
         // Simulate a running background task with a pending oneshot
         let (_tx, rx) = tokio::sync::oneshot::channel::<MessageRefreshResult>();
-        app.bg_refresh_rx = Some(rx);
+        app.bg.bg_refresh_rx = Some(rx);
 
         // Set tick to 19 so next call would normally trigger a new bg task
-        app.message_tick = 19;
+        app.bg.message_tick = 19;
         app.refresh_messages();
-        assert_eq!(app.message_tick, 20);
+        assert_eq!(app.bg.message_tick, 20);
         // bg_refresh_rx should still be set (the pending one, not a new one)
         assert!(
-            app.bg_refresh_rx.is_some(),
+            app.bg.bg_refresh_rx.is_some(),
             "should not start new bg task when one is running"
         );
         drop(_tx);
@@ -3219,9 +3258,9 @@ mod tests {
     #[tokio::test]
     async fn refresh_messages_wraps_tick_counter() {
         let mut app = test_app();
-        app.message_tick = 255; // u8::MAX
+        app.bg.message_tick = 255; // u8::MAX
         app.refresh_messages();
-        assert_eq!(app.message_tick, 0, "tick counter should wrap around");
+        assert_eq!(app.bg.message_tick, 0, "tick counter should wrap around");
     }
 
     #[test]
@@ -3347,8 +3386,8 @@ mod tests {
         app.last_messages.insert(stale.clone(), "msg".into());
         app.session_stats
             .insert(stale.clone(), SessionStats::default());
-        app.log_uuids.insert(stale.clone(), "uuid".into());
-        app.uuid_retry_cooldowns.insert(stale.clone(), 3);
+        app.bg.log_uuids.insert(stale.clone(), "uuid".into());
+        app.bg.uuid_retry_cooldowns.insert(stale.clone(), 3);
         app.status.dead_ticks.insert(stale.clone(), 1);
 
         app.refresh_sessions().await;
@@ -3390,11 +3429,11 @@ mod tests {
             "stale session_stats should be pruned"
         );
         assert!(
-            !app.log_uuids.contains_key(&stale),
+            !app.bg.log_uuids.contains_key(&stale),
             "stale log_uuids should be pruned"
         );
         assert!(
-            !app.uuid_retry_cooldowns.contains_key(&stale),
+            !app.bg.uuid_retry_cooldowns.contains_key(&stale),
             "stale uuid_retry_cooldowns should be pruned"
         );
         assert!(
@@ -3941,7 +3980,7 @@ mod tests {
         app.refresh_preview().await;
         // If it skipped, preview remains "modified" (wasn't overwritten)
         assert_eq!(
-            app.preview, "modified",
+            app.preview.content, "modified",
             "should skip capture when idle and same session"
         );
 
@@ -3970,7 +4009,7 @@ mod tests {
         app.refresh_preview().await;
         // Should NOT skip, so preview is overwritten
         assert_ne!(
-            app.preview, "modified",
+            app.preview.content, "modified",
             "should not skip when idle_ticks = 0"
         );
     }
@@ -4043,7 +4082,7 @@ mod tests {
         app.preview.set_text("frozen".to_string());
         app.refresh_preview().await;
         assert_eq!(
-            app.preview, "frozen",
+            app.preview.content, "frozen",
             "scrolled history should not recapture every tick"
         );
         assert_eq!(

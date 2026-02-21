@@ -23,7 +23,7 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 
 - **`src/lib.rs`** — Thin re-export of all modules so `benches/` (external crates) can access them.
 - **`src/main.rs`** — CLI parsing (clap), TUI event loop, key dispatch. Passes full `KeyEvent` (not just `KeyCode`) to handlers for modifier support. Imports modules via `use hydra::*`.
-- **`src/app.rs`** — `App` state + `Mode` enum (Browse, Attached, NewSessionAgent, ConfirmDelete). Owns `Box<dyn SessionManager>` for testability. `StatusDetector` and `TaskTimers` are extracted structs that encapsulate status-change debouncing and elapsed-time tracking respectively.
+- **`src/app.rs`** — `App` state + `Mode` enum (Browse, Attached, NewSessionAgent, ConfirmDelete). Owns `Box<dyn SessionManager>` for testability. Sub-structs defined in-file: `StatusDetector` (pane content change tracking + hysteresis), `TaskTimers` (elapsed-time tracking), `PreviewState` (preview content/scroll/cache), `BackgroundRefreshState` (async message/stats refresh polling).
 - **`src/tmux.rs`** — `SessionManager` async trait (`#[async_trait]`) + `TmuxSessionManager` impl. All tmux subprocess calls use `tokio::process::Command` (non-blocking). Also has `keycode_to_tmux()` for crossterm→tmux key mapping.
 - **`src/session.rs`** — `Session`, `SessionStatus`, `AgentType` types. Pure data, no I/O.
 - **`src/ui.rs`** — All ratatui rendering. Snapshot-tested with `insta`.
@@ -96,6 +96,7 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 - Exited-session debounce needs to be longer when subagents are active (`DEAD_TICK_SUBAGENT_THRESHOLD = 15`) — orchestrating agents briefly lose their pane during subagent handoffs.
 - `proptest` char ranges (`'a'..='z'`) don't implement `Strategy` — use `proptest::char::range()` instead.
 - Makefile `check` target composes `test + deny + fmt --check + clippy` for CI. `make coverage` uses `cargo llvm-cov html`, `make mutants` uses `cargo mutants`.
+- **App sub-structs**: `StatusDetector`, `TaskTimers`, `PreviewState`, `BackgroundRefreshState` are defined in `app.rs` (not separate modules) so tests in `mod tests` can still access `pub(crate)` fields. Extraction pattern: move fields + logic into sub-struct, add delegation methods on App, batch-rename test references with `replace_all`. Keep fields read by `ui.rs` (like `last_messages`, `session_stats`, `diff_files`) directly on App — don't nest them in sub-structs.
 
 ## Common Changes
 
