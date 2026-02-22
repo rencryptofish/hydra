@@ -1,12 +1,12 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use ratatui::backend::TestBackend;
-use ratatui::layout::Rect;
-use ratatui::Terminal;
 use hydra::app::{App, DiffFile};
 use hydra::logs::GlobalStats;
 use hydra::session::{AgentType, Session, SessionStatus};
 use hydra::tmux::SessionManager;
 use hydra::ui;
+use ratatui::backend::TestBackend;
+use ratatui::layout::Rect;
+use ratatui::Terminal;
 
 // ── Noop session manager for benchmarks ─────────────────────────────
 
@@ -55,10 +55,9 @@ fn make_session(name: &str, status: SessionStatus) -> Session {
 }
 
 const NATO: &[&str] = &[
-    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
-    "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa",
-    "quebec", "romeo", "sierra", "tango", "uniform", "victor", "whiskey",
-    "xray", "yankee", "zulu",
+    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet",
+    "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango",
+    "uniform", "victor", "whiskey", "xray", "yankee", "zulu",
 ];
 
 fn make_app_with_n_sessions(n: usize) -> App {
@@ -86,6 +85,7 @@ fn make_app_with_n_sessions(n: usize) -> App {
     app.sessions = sessions;
 
     // Add last messages for each session
+    #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         let name = if i < NATO.len() {
             NATO[i].to_string()
@@ -126,7 +126,8 @@ fn bench_draw_full_frame(c: &mut Criterion) {
     for n in [0, 3, 10, 26] {
         group.bench_function(format!("{n}_sessions"), |b| {
             let mut app = make_app_with_n_sessions(n);
-            app.set_preview_text("Hello from the agent\nLine 2\nLine 3".to_string());
+            app.preview
+                .set_text("Hello from the agent\nLine 2\nLine 3".to_string());
             let backend = TestBackend::new(80, 24);
             let mut terminal = Terminal::new(backend).unwrap();
 
@@ -172,7 +173,7 @@ fn bench_draw_preview(c: &mut Criterion) {
     for (label, lines) in [("10_lines", 10), ("100_lines", 100), ("5000_lines", 5000)] {
         group.bench_function(label, |b| {
             let mut app = make_app_with_n_sessions(1);
-            app.set_preview_text(generate_preview_lines(lines));
+            app.preview.set_text(generate_preview_lines(lines));
             let backend = TestBackend::new(80, 24);
             let mut terminal = Terminal::new(backend).unwrap();
             let area = Rect::new(20, 0, 60, 24);
@@ -211,7 +212,7 @@ fn bench_draw_large_terminal(c: &mut Criterion) {
     for (w, h) in [(120, 40), (200, 60)] {
         group.bench_function(format!("{w}x{h}"), |b| {
             let mut app = make_app_with_n_sessions(10);
-            app.set_preview_text(generate_preview_lines(200));
+            app.preview.set_text(generate_preview_lines(200));
             app.diff_files = make_diff_files(20);
             let backend = TestBackend::new(w, h);
             let mut terminal = Terminal::new(backend).unwrap();

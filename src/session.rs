@@ -128,7 +128,7 @@ pub fn generate_name(existing: &[String]) -> String {
     let mut i = AUTO_NAMES.len() + 1;
     loop {
         let name = format!("agent-{i}");
-        if !existing.iter().any(|n| *n == name) {
+        if !existing.contains(&name) {
             return name;
         }
         i += 1;

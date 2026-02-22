@@ -54,10 +54,7 @@ fn bench_jsonl_parsing(c: &mut Criterion) {
             let file = create_jsonl_file(n);
             b.iter(|| {
                 let mut stats = SessionStats::default();
-                update_session_stats_from_path_and_last_message(
-                    black_box(file.path()),
-                    &mut stats,
-                );
+                update_session_stats_from_path_and_last_message(black_box(file.path()), &mut stats);
             });
         });
 
@@ -72,12 +69,11 @@ fn bench_jsonl_parsing(c: &mut Criterion) {
             let offset_80 = (file_len as f64 * 0.8) as u64;
 
             b.iter(|| {
-                let mut stats = SessionStats::default();
-                stats.read_offset = offset_80;
-                update_session_stats_from_path_and_last_message(
-                    black_box(file.path()),
-                    &mut stats,
-                );
+                let mut stats = hydra::logs::SessionStats {
+                    read_offset: offset_80,
+                    ..Default::default()
+                };
+                update_session_stats_from_path_and_last_message(black_box(file.path()), &mut stats);
             });
         });
     }
@@ -132,7 +128,11 @@ fn bench_format_functions(c: &mut Criterion) {
     let mut group = c.benchmark_group("format_functions");
 
     // format_tokens
-    for (label, val) in [("small_500", 500u64), ("medium_50k", 50_000), ("large_2m", 2_000_000)] {
+    for (label, val) in [
+        ("small_500", 500u64),
+        ("medium_50k", 50_000),
+        ("large_2m", 2_000_000),
+    ] {
         group.bench_function(format!("tokens_{label}"), |b| {
             b.iter(|| format_tokens(black_box(val)));
         });
@@ -158,9 +158,7 @@ fn bench_keycode_mapping(c: &mut Criterion) {
 
     // Simple character key
     group.bench_function("char_key", |b| {
-        b.iter(|| {
-            keycode_to_tmux(black_box(KeyCode::Char('a')), black_box(KeyModifiers::NONE))
-        });
+        b.iter(|| keycode_to_tmux(black_box(KeyCode::Char('a')), black_box(KeyModifiers::NONE)));
     });
 
     // Character with Ctrl modifier
@@ -200,12 +198,7 @@ fn bench_keycode_mapping(c: &mut Criterion) {
 
     // Unmapped key (should return None)
     group.bench_function("unmapped_key", |b| {
-        b.iter(|| {
-            keycode_to_tmux(
-                black_box(KeyCode::CapsLock),
-                black_box(KeyModifiers::NONE),
-            )
-        });
+        b.iter(|| keycode_to_tmux(black_box(KeyCode::CapsLock), black_box(KeyModifiers::NONE)));
     });
 
     group.finish();

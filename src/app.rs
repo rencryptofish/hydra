@@ -132,8 +132,7 @@ impl StatusDetector {
                 };
 
                 let changed = !unchanged
-                    || (session.agent_type == AgentType::Codex
-                        && raw_changed_but_normalized_same);
+                    || (session.agent_type == AgentType::Codex && raw_changed_but_normalized_same);
 
                 if first_capture {
                     session.status = SessionStatus::Running;
@@ -167,7 +166,8 @@ impl StatusDetector {
         self.idle_ticks.retain(|k, _| live_keys.contains(k));
         self.changed_ticks.retain(|k, _| live_keys.contains(k));
         self.dead_ticks.retain(|k, _| live_keys.contains(k));
-        self.latest_pane_captures.retain(|k, _| live_keys.contains(k));
+        self.latest_pane_captures
+            .retain(|k, _| live_keys.contains(k));
     }
 
     /// Get idle tick count for a session (used by preview refresh skip logic).
@@ -200,9 +200,7 @@ impl TaskTimers {
         for session in sessions.iter_mut() {
             let name = session.tmux_name.clone();
 
-            let log_elapsed = session_stats
-                .get(&name)
-                .and_then(|st| st.task_elapsed());
+            let log_elapsed = session_stats.get(&name).and_then(|st| st.task_elapsed());
 
             match session.status {
                 SessionStatus::Running => {
@@ -348,7 +346,7 @@ impl BackgroundRefreshState {
 
         self.message_tick = self.message_tick.wrapping_add(1);
         // Run every 100 ticks (~5 seconds at 50ms tick rate).
-        if self.message_tick % 100 != 0 {
+        if !self.message_tick.is_multiple_of(100) {
             return completed;
         }
 
@@ -387,7 +385,8 @@ impl BackgroundRefreshState {
     /// Remove entries for sessions that no longer exist.
     pub(crate) fn prune(&mut self, live_keys: &HashSet<&String>) {
         self.log_uuids.retain(|k, _| live_keys.contains(k));
-        self.uuid_retry_cooldowns.retain(|k, _| live_keys.contains(k));
+        self.uuid_retry_cooldowns
+            .retain(|k, _| live_keys.contains(k));
     }
 }
 
@@ -545,8 +544,7 @@ impl App {
         // Prune stale entries from per-session HashMaps to prevent unbounded
         // memory growth when sessions are created and deleted over time.
         {
-            let live_keys: HashSet<&String> =
-                self.sessions.iter().map(|s| &s.tmux_name).collect();
+            let live_keys: HashSet<&String> = self.sessions.iter().map(|s| &s.tmux_name).collect();
             self.status.prune(&live_keys);
             self.timers.prune(&live_keys);
             self.last_messages.retain(|k, _| live_keys.contains(k));
@@ -622,9 +620,9 @@ impl App {
                 let result = self.manager.capture_pane_scrollback(&tmux_name).await;
                 match result {
                     Ok(content) => self.preview.set_content(content, true),
-                    Err(_) => {
-                        self.preview.set_content(String::from("[unable to capture pane]"), true)
-                    }
+                    Err(_) => self
+                        .preview
+                        .set_content(String::from("[unable to capture pane]"), true),
                 }
             } else if !force_live_capture {
                 if let Some(content) = self.status.latest_pane_captures.get(&tmux_name) {
@@ -633,23 +631,24 @@ impl App {
                     let result = self.manager.capture_pane(&tmux_name).await;
                     match result {
                         Ok(content) => self.preview.set_content(content, false),
-                        Err(_) => {
-                            self.preview.set_content(String::from("[unable to capture pane]"), false)
-                        }
+                        Err(_) => self
+                            .preview
+                            .set_content(String::from("[unable to capture pane]"), false),
                     }
                 }
             } else {
                 let result = self.manager.capture_pane(&tmux_name).await;
                 match result {
                     Ok(content) => self.preview.set_content(content, false),
-                    Err(_) => {
-                        self.preview.set_content(String::from("[unable to capture pane]"), false)
-                    }
+                    Err(_) => self
+                        .preview
+                        .set_content(String::from("[unable to capture pane]"), false),
                 }
             }
             self.preview.session = Some(tmux_name);
         } else {
-            self.preview.set_content(String::from("No sessions. Press 'n' to create one."), false);
+            self.preview
+                .set_content(String::from("No sessions. Press 'n' to create one."), false);
             self.preview.session = None;
         }
     }
@@ -1077,8 +1076,7 @@ async fn compute_message_refresh(
                     log_uuids.insert(tmux_name.clone(), uuid);
                     uuid_retry_cooldowns.remove(tmux_name);
                 } else {
-                    uuid_retry_cooldowns
-                        .insert(tmux_name.clone(), UUID_RETRY_COOLDOWN_CYCLES);
+                    uuid_retry_cooldowns.insert(tmux_name.clone(), UUID_RETRY_COOLDOWN_CYCLES);
                 }
             }
         }
@@ -1152,7 +1150,10 @@ pub fn normalize_capture(content: &str) -> String {
         }
         // Skip Claude Code dingbat/star spinner characters:
         // ✢ U+2722, ✳ U+2733, ✶ U+2736, ✻ U+273B, ✽ U+273D, · U+00B7
-        if matches!(ch, '\u{2722}' | '\u{2733}' | '\u{2736}' | '\u{273B}' | '\u{273D}' | '\u{00B7}') {
+        if matches!(
+            ch,
+            '\u{2722}' | '\u{2733}' | '\u{2736}' | '\u{273B}' | '\u{273D}' | '\u{00B7}'
+        ) {
             continue;
         }
         // Skip ASCII digits (neutralizes running timers and token counters)
@@ -2686,9 +2687,11 @@ mod tests {
         );
 
         // Pre-set a task start to verify it gets cleaned up
-        app.timers.task_starts
+        app.timers
+            .task_starts
             .insert("hydra-testid-dead".to_string(), std::time::Instant::now());
-        app.timers.task_last_active
+        app.timers
+            .task_last_active
             .insert("hydra-testid-dead".to_string(), std::time::Instant::now());
 
         // Dead-tick debounce requires DEAD_TICK_THRESHOLD consecutive dead ticks
@@ -2701,7 +2704,9 @@ mod tests {
             "exited session should clear task_starts"
         );
         assert!(
-            !app.timers.task_last_active.contains_key("hydra-testid-dead"),
+            !app.timers
+                .task_last_active
+                .contains_key("hydra-testid-dead"),
             "exited session should clear task_last_active"
         );
     }
@@ -2726,7 +2731,9 @@ mod tests {
         // Simulate long idle: move task_last_active back >5 seconds
         let five_secs_ago = std::time::Instant::now() - std::time::Duration::from_secs(6);
         let key = "hydra-testid-worker".to_string();
-        app.timers.task_last_active.insert(key.clone(), five_secs_ago);
+        app.timers
+            .task_last_active
+            .insert(key.clone(), five_secs_ago);
         app.timers.task_starts.insert(
             key.clone(),
             five_secs_ago - std::time::Duration::from_secs(10),
@@ -3419,7 +3426,9 @@ mod tests {
         app.status.idle_ticks.insert(stale.clone(), 3);
         app.status.changed_ticks.insert(stale.clone(), 2);
         app.timers.task_starts.insert(stale.clone(), Instant::now());
-        app.timers.task_last_active.insert(stale.clone(), Instant::now());
+        app.timers
+            .task_last_active
+            .insert(stale.clone(), Instant::now());
         app.last_messages.insert(stale.clone(), "msg".into());
         app.session_stats
             .insert(stale.clone(), SessionStats::default());
@@ -4010,7 +4019,9 @@ mod tests {
         app.refresh_preview().await;
         assert_eq!(app.preview.session.as_deref(), Some("hydra-testid-s1"));
         // Simulate idle_ticks >= 1 for the session
-        app.status.idle_ticks.insert("hydra-testid-s1".to_string(), 1);
+        app.status
+            .idle_ticks
+            .insert("hydra-testid-s1".to_string(), 1);
 
         // Second call — should skip (same session, idle_ticks >= 1)
         app.preview.set_text("modified".to_string());
@@ -4539,7 +4550,8 @@ mod tests {
         // 1 alive tick — resets dead_ticks counter
         app.refresh_sessions().await;
         assert_eq!(
-            app.status.dead_ticks
+            app.status
+                .dead_ticks
                 .get("hydra-testid-s1")
                 .copied()
                 .unwrap_or(0),
@@ -4618,8 +4630,10 @@ mod tests {
 
         // Inject active subagents into session stats
         let key = "hydra-testid-s1".to_string();
-        let mut stats = SessionStats::default();
-        stats.active_subagents = 2;
+        let stats = crate::logs::SessionStats {
+            active_subagents: 2,
+            ..Default::default()
+        };
         app.session_stats.insert(key.clone(), stats);
 
         // Run enough ticks to normally trigger Idle (1 first-capture + 30 unchanged)
@@ -4647,8 +4661,10 @@ mod tests {
 
         // Inject active subagents
         let key = "hydra-testid-s1".to_string();
-        let mut stats = SessionStats::default();
-        stats.active_subagents = 1;
+        let stats = crate::logs::SessionStats {
+            active_subagents: 1,
+            ..Default::default()
+        };
         app.session_stats.insert(key, stats);
 
         // Run up to normal threshold — should NOT be Exited due to subagent extension
@@ -4677,7 +4693,11 @@ mod tests {
     #[test]
     fn status_detector_first_capture_sets_running() {
         let mut detector = StatusDetector::new();
-        let mut sessions = vec![make_session_with_status("s1", AgentType::Claude, SessionStatus::Idle)];
+        let mut sessions = vec![make_session_with_status(
+            "s1",
+            AgentType::Claude,
+            SessionStatus::Idle,
+        )];
         let mut captures = HashMap::new();
         captures.insert("hydra-testid-s1".to_string(), "hello world".to_string());
         let prev_statuses = HashMap::new();
@@ -4697,21 +4717,37 @@ mod tests {
         let session_stats = HashMap::new();
 
         // First capture -> Running
-        let mut sessions = vec![make_session_with_status("s1", AgentType::Claude, SessionStatus::Idle)];
+        let mut sessions = vec![make_session_with_status(
+            "s1",
+            AgentType::Claude,
+            SessionStatus::Idle,
+        )];
         let prev_statuses = HashMap::new();
         detector.update_statuses(&mut sessions, &captures, &prev_statuses, &session_stats);
         assert_eq!(sessions[0].status, SessionStatus::Running);
 
         // 30 unchanged ticks -> Idle
         for i in 0..30 {
-            let mut sessions = vec![make_session_with_status("s1", AgentType::Claude, SessionStatus::Idle)];
+            let mut sessions = vec![make_session_with_status(
+                "s1",
+                AgentType::Claude,
+                SessionStatus::Idle,
+            )];
             let mut prev_statuses = HashMap::new();
             prev_statuses.insert(name.clone(), SessionStatus::Running);
             detector.update_statuses(&mut sessions, &captures, &prev_statuses, &session_stats);
             if i < 29 {
-                assert_eq!(sessions[0].status, SessionStatus::Running, "should stay Running at tick {i}");
+                assert_eq!(
+                    sessions[0].status,
+                    SessionStatus::Running,
+                    "should stay Running at tick {i}"
+                );
             } else {
-                assert_eq!(sessions[0].status, SessionStatus::Idle, "should become Idle at tick 30");
+                assert_eq!(
+                    sessions[0].status,
+                    SessionStatus::Idle,
+                    "should become Idle at tick 30"
+                );
             }
         }
     }
@@ -4739,21 +4775,37 @@ mod tests {
         stats_map.insert(name.clone(), stats);
 
         // First capture -> Running
-        let mut sessions = vec![make_session_with_status("s1", AgentType::Claude, SessionStatus::Idle)];
+        let mut sessions = vec![make_session_with_status(
+            "s1",
+            AgentType::Claude,
+            SessionStatus::Idle,
+        )];
         let prev_statuses = HashMap::new();
         detector.update_statuses(&mut sessions, &captures, &prev_statuses, &stats_map);
         assert_eq!(sessions[0].status, SessionStatus::Running);
 
         // With log_idle=true, threshold is 8 instead of 30
         for i in 0..8 {
-            let mut sessions = vec![make_session_with_status("s1", AgentType::Claude, SessionStatus::Idle)];
+            let mut sessions = vec![make_session_with_status(
+                "s1",
+                AgentType::Claude,
+                SessionStatus::Idle,
+            )];
             let mut prev_statuses = HashMap::new();
             prev_statuses.insert(name.clone(), SessionStatus::Running);
             detector.update_statuses(&mut sessions, &captures, &prev_statuses, &stats_map);
             if i < 7 {
-                assert_eq!(sessions[0].status, SessionStatus::Running, "should stay Running at tick {i}");
+                assert_eq!(
+                    sessions[0].status,
+                    SessionStatus::Running,
+                    "should stay Running at tick {i}"
+                );
             } else {
-                assert_eq!(sessions[0].status, SessionStatus::Idle, "should become Idle at tick 8 with log_idle");
+                assert_eq!(
+                    sessions[0].status,
+                    SessionStatus::Idle,
+                    "should become Idle at tick 8 with log_idle"
+                );
             }
         }
     }
@@ -4767,18 +4819,28 @@ mod tests {
         captures.insert(name.clone(), content.clone());
 
         let mut stats_map = HashMap::new();
-        let mut stats = SessionStats::default();
-        stats.active_subagents = 1;
+        let stats = crate::logs::SessionStats {
+            active_subagents: 1,
+            ..Default::default()
+        };
         stats_map.insert(name.clone(), stats);
 
         // First capture -> Running
-        let mut sessions = vec![make_session_with_status("s1", AgentType::Claude, SessionStatus::Idle)];
+        let mut sessions = vec![make_session_with_status(
+            "s1",
+            AgentType::Claude,
+            SessionStatus::Idle,
+        )];
         detector.update_statuses(&mut sessions, &captures, &HashMap::new(), &stats_map);
         assert_eq!(sessions[0].status, SessionStatus::Running);
 
         // Even after 30 unchanged ticks, active subagents keep it Running
         for _ in 0..35 {
-            let mut sessions = vec![make_session_with_status("s1", AgentType::Claude, SessionStatus::Idle)];
+            let mut sessions = vec![make_session_with_status(
+                "s1",
+                AgentType::Claude,
+                SessionStatus::Idle,
+            )];
             let mut prev = HashMap::new();
             prev.insert(name.clone(), SessionStatus::Running);
             detector.update_statuses(&mut sessions, &captures, &prev, &stats_map);
@@ -4795,13 +4857,21 @@ mod tests {
         let mut captures = HashMap::new();
         captures.insert(name.clone(), "hello \u{2800}".to_string());
         let stats = HashMap::new();
-        let mut sessions = vec![make_session_with_status("s1", AgentType::Codex, SessionStatus::Idle)];
+        let mut sessions = vec![make_session_with_status(
+            "s1",
+            AgentType::Codex,
+            SessionStatus::Idle,
+        )];
         detector.update_statuses(&mut sessions, &captures, &HashMap::new(), &stats);
         assert_eq!(sessions[0].status, SessionStatus::Running);
 
         // Change only the spinner character — raw changes but normalized doesn't
         captures.insert(name.clone(), "hello \u{2801}".to_string());
-        let mut sessions = vec![make_session_with_status("s1", AgentType::Codex, SessionStatus::Idle)];
+        let mut sessions = vec![make_session_with_status(
+            "s1",
+            AgentType::Codex,
+            SessionStatus::Idle,
+        )];
         let mut prev = HashMap::new();
         prev.insert(name.clone(), SessionStatus::Running);
         detector.update_statuses(&mut sessions, &captures, &prev, &stats);
@@ -4819,7 +4889,9 @@ mod tests {
         detector.prev_captures.insert(stale.clone(), "b".into());
         detector.idle_ticks.insert(stale.clone(), 5);
         detector.dead_ticks.insert(stale.clone(), 2);
-        detector.latest_pane_captures.insert(live.clone(), "c".into());
+        detector
+            .latest_pane_captures
+            .insert(live.clone(), "c".into());
 
         let live_keys: HashSet<&String> = [&live].into_iter().collect();
         detector.prune(&live_keys);

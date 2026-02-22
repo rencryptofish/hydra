@@ -151,7 +151,7 @@ mod tests {
     async fn stream_error_ends_loop() {
         let stream = fake_stream(vec![
             Ok(key_event(KeyCode::Char('a'))),
-            Err(std::io::Error::new(std::io::ErrorKind::Other, "fail")),
+            Err(std::io::Error::other("fail")),
         ]);
         let mut handler = EventHandler::from_stream(stream, Duration::from_secs(60));
 

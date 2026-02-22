@@ -52,10 +52,9 @@ fn make_session(name: &str, status: SessionStatus) -> Session {
 }
 
 const NATO: &[&str] = &[
-    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
-    "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa",
-    "quebec", "romeo", "sierra", "tango", "uniform", "victor", "whiskey",
-    "xray", "yankee", "zulu",
+    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet",
+    "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango",
+    "uniform", "victor", "whiskey", "xray", "yankee", "zulu",
 ];
 
 fn make_app_with_n_sessions(n: usize) -> App {
@@ -187,7 +186,7 @@ fn bench_handle_mouse(c: &mut Criterion) {
                 let mut app = make_app_with_n_sessions(3);
                 app.sidebar_area.set(Rect::new(0, 0, 20, 24));
                 app.preview_area.set(Rect::new(20, 0, 60, 24));
-                app.set_preview_text("line\n".repeat(200));
+                app.preview.set_text("line\n".repeat(200));
                 app
             },
             |mut app| {
@@ -212,7 +211,7 @@ fn bench_handle_mouse(c: &mut Criterion) {
                 app.mode = hydra::app::Mode::Attached;
                 app.sidebar_area.set(Rect::new(0, 0, 20, 24));
                 app.preview_area.set(Rect::new(20, 0, 60, 24));
-                app.preview_scroll_offset = 10;
+                app.preview.scroll_offset = 10;
                 app
             },
             |mut app| {

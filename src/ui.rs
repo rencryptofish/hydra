@@ -191,7 +191,7 @@ pub fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
 
     // Draw diff tree
     if !tree_lines.is_empty() {
-        draw_diff_tree(frame, &tree_lines, tree_area);
+        draw_diff_tree(frame, tree_lines, tree_area);
     }
 }
 
@@ -648,7 +648,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         let mut app = make_app();
-        app.preview.set_text("No sessions. Press 'n' to create one.".to_string());
+        app.preview
+            .set_text("No sessions. Press 'n' to create one.".to_string());
 
         terminal.draw(|f| super::draw(f, &app)).unwrap();
         let output = buffer_to_string(&terminal);
@@ -696,7 +697,8 @@ mod tests {
         app.sessions = vec![make_session("active-session", AgentType::Claude)];
         app.selected = 0;
         app.mode = Mode::Attached;
-        app.preview.set_text("$ claude\nHello, how can I help?".to_string());
+        app.preview
+            .set_text("$ claude\nHello, how can I help?".to_string());
 
         terminal.draw(|f| super::draw(f, &app)).unwrap();
         let output = buffer_to_string(&terminal);
@@ -711,7 +713,8 @@ mod tests {
 
         let mut app = make_app();
         app.status_message = Some("Created session 'worker-1' with Claude".to_string());
-        app.preview.set_text("No sessions. Press 'n' to create one.".to_string());
+        app.preview
+            .set_text("No sessions. Press 'n' to create one.".to_string());
 
         terminal.draw(|f| super::draw(f, &app)).unwrap();
         let output = buffer_to_string(&terminal);
@@ -1085,11 +1088,13 @@ mod tests {
         app.selected = 0;
         app.preview.set_text("preview content".to_string());
 
-        let mut stats = crate::logs::SessionStats::default();
-        stats.turns = 5;
-        stats.tokens_in = 5000;
-        stats.tokens_out = 1000;
-        stats.edits = 2;
+        let stats = crate::logs::SessionStats {
+            turns: 5,
+            tokens_in: 5000,
+            tokens_out: 1000,
+            edits: 2,
+            ..Default::default()
+        };
         app.session_stats
             .insert("hydra-testproj-worker-1".to_string(), stats);
 
@@ -1123,17 +1128,21 @@ mod tests {
         app.global_stats.tokens_cache_write = 100;
 
         // Per-session stats (edits are still hydra-specific)
-        let mut stats1 = crate::logs::SessionStats::default();
-        stats1.turns = 12;
-        stats1.edits = 5;
-        stats1.bash_cmds = 3;
+        let stats1 = crate::logs::SessionStats {
+            turns: 12,
+            edits: 5,
+            bash_cmds: 3,
+            ..Default::default()
+        };
         app.session_stats
             .insert("hydra-testproj-worker-1".to_string(), stats1);
 
-        let mut stats2 = crate::logs::SessionStats::default();
-        stats2.turns = 8;
-        stats2.edits = 3;
-        stats2.bash_cmds = 2;
+        let stats2 = crate::logs::SessionStats {
+            turns: 8,
+            edits: 3,
+            bash_cmds: 2,
+            ..Default::default()
+        };
         app.session_stats
             .insert("hydra-testproj-worker-2".to_string(), stats2);
 

@@ -65,6 +65,12 @@ pub struct TmuxSessionManager {
     agent_cache: Mutex<HashMap<String, AgentType>>,
 }
 
+impl Default for TmuxSessionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TmuxSessionManager {
     pub fn new() -> Self {
         Self {
@@ -104,7 +110,10 @@ impl SessionManager for TmuxSessionManager {
             .collect();
 
         // Keep cache aligned with live tmux sessions to avoid unbounded growth.
-        prune_agent_cache(&mut self.agent_cache.lock().unwrap(), &live_sessions);
+        prune_agent_cache(
+            &mut self.agent_cache.lock().expect("agent_cache lock poisoned"),
+            &live_sessions,
+        );
 
         // Pass 1: Parse session names, split into cached vs uncached agent types
         let mut parsed: Vec<(String, String)> = Vec::new();
@@ -186,7 +195,7 @@ impl SessionManager for TmuxSessionManager {
         let tmux_name = create_session(project_id, name, agent, cwd, command_override).await?;
         self.agent_cache
             .lock()
-            .unwrap()
+            .expect("agent_cache lock poisoned")
             .insert(tmux_name.clone(), agent.clone());
         Ok(tmux_name)
     }
@@ -202,7 +211,10 @@ impl SessionManager for TmuxSessionManager {
 
     async fn kill_session(&self, tmux_name: &str) -> Result<()> {
         kill_session(tmux_name).await?;
-        self.agent_cache.lock().unwrap().remove(tmux_name);
+        self.agent_cache
+            .lock()
+            .expect("agent_cache lock poisoned")
+            .remove(tmux_name);
         Ok(())
     }
 
@@ -846,19 +858,18 @@ mod tests {
 
     #[tokio::test]
     async fn run_cmd_timeout_success() {
-        let output = run_cmd_timeout(&mut Command::new("echo").arg("hello")).await;
+        let output = run_cmd_timeout(Command::new("echo").arg("hello")).await;
         let output = output.unwrap();
         assert!(output.status.success());
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
-            "hello"
-        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
     }
 
     #[tokio::test]
     async fn run_cmd_timeout_bad_command() {
-        let result =
-            run_cmd_timeout(&mut Command::new("__nonexistent_command_that_does_not_exist__")).await;
+        let result = run_cmd_timeout(&mut Command::new(
+            "__nonexistent_command_that_does_not_exist__",
+        ))
+        .await;
         assert!(result.is_err());
     }
 
@@ -876,8 +887,10 @@ mod tests {
 
     #[tokio::test]
     async fn run_status_timeout_bad_command() {
-        let result =
-            run_status_timeout(&mut Command::new("__nonexistent_command_that_does_not_exist__")).await;
+        let result = run_status_timeout(&mut Command::new(
+            "__nonexistent_command_that_does_not_exist__",
+        ))
+        .await;
         assert!(result.is_err());
     }
 
@@ -947,13 +960,17 @@ mod tests {
 
     #[tokio::test]
     async fn integration_capture_pane_nonexistent() {
-        let result = capture_pane("hydra-test-nonexistent-session-xyz").await.unwrap();
+        let result = capture_pane("hydra-test-nonexistent-session-xyz")
+            .await
+            .unwrap();
         assert_eq!(result, "[session not available]");
     }
 
     #[tokio::test]
     async fn integration_capture_scrollback_nonexistent() {
-        let result = capture_pane_scrollback("hydra-test-nonexistent-session-xyz").await.unwrap();
+        let result = capture_pane_scrollback("hydra-test-nonexistent-session-xyz")
+            .await
+            .unwrap();
         assert_eq!(result, "[session not available]");
     }
 
@@ -962,7 +979,14 @@ mod tests {
         let name = test_session_name();
         // Create session with bash
         let status = run_status_timeout(Command::new("tmux").args([
-            "new-session", "-d", "-s", &name, "-x", "80", "-y", "24",
+            "new-session",
+            "-d",
+            "-s",
+            &name,
+            "-x",
+            "80",
+            "-y",
+            "24",
         ]))
         .await
         .unwrap();
@@ -985,8 +1009,16 @@ mod tests {
     async fn integration_is_pane_dead_live_session() {
         let name = test_session_name();
         let status = run_status_timeout(Command::new("tmux").args([
-            "new-session", "-d", "-s", &name, "-x", "80", "-y", "24",
-            "sleep", "30",
+            "new-session",
+            "-d",
+            "-s",
+            &name,
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "sleep",
+            "30",
         ]))
         .await
         .unwrap();
@@ -1009,7 +1041,14 @@ mod tests {
         let name = test_session_name();
         // Create session with remain-on-exit, running a command that exits immediately
         let status = run_status_timeout(Command::new("tmux").args([
-            "new-session", "-d", "-s", &name, "-x", "80", "-y", "24",
+            "new-session",
+            "-d",
+            "-s",
+            &name,
+            "-x",
+            "80",
+            "-y",
+            "24",
             "true",
         ]))
         .await
@@ -1018,7 +1057,11 @@ mod tests {
 
         // Set remain-on-exit so the pane stays
         let _ = run_status_timeout(Command::new("tmux").args([
-            "set-option", "-t", &name, "remain-on-exit", "on",
+            "set-option",
+            "-t",
+            &name,
+            "remain-on-exit",
+            "on",
         ]))
         .await;
 
@@ -1041,8 +1084,16 @@ mod tests {
     async fn integration_get_agent_type_with_env() {
         let name = test_session_name();
         let status = run_status_timeout(Command::new("tmux").args([
-            "new-session", "-d", "-s", &name, "-x", "80", "-y", "24",
-            "sleep", "30",
+            "new-session",
+            "-d",
+            "-s",
+            &name,
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "sleep",
+            "30",
         ]))
         .await
         .unwrap();
@@ -1050,7 +1101,11 @@ mod tests {
 
         // Set the env var
         let _ = run_status_timeout(Command::new("tmux").args([
-            "set-environment", "-t", &name, "HYDRA_AGENT_TYPE", "codex",
+            "set-environment",
+            "-t",
+            &name,
+            "HYDRA_AGENT_TYPE",
+            "codex",
         ]))
         .await;
 
@@ -1063,10 +1118,15 @@ mod tests {
     #[tokio::test]
     async fn integration_create_session_free_fn() {
         let sess_name = "itest-create";
-        let tmux_name =
-            create_session("ffffffff", sess_name, &AgentType::Claude, "/tmp", Some("sleep 30"))
-                .await
-                .unwrap();
+        let tmux_name = create_session(
+            "ffffffff",
+            sess_name,
+            &AgentType::Claude,
+            "/tmp",
+            Some("sleep 30"),
+        )
+        .await
+        .unwrap();
 
         // Verify session exists
         let content = capture_pane(&tmux_name).await.unwrap();
@@ -1074,7 +1134,10 @@ mod tests {
 
         // Verify remain-on-exit was set
         let output = run_cmd_timeout(Command::new("tmux").args([
-            "show-option", "-t", &tmux_name, "remain-on-exit",
+            "show-option",
+            "-t",
+            &tmux_name,
+            "remain-on-exit",
         ]))
         .await
         .unwrap();
@@ -1116,7 +1179,13 @@ mod tests {
     async fn integration_tmux_manager_create_and_kill() {
         let mgr = TmuxSessionManager::new();
         let tmux_name = mgr
-            .create_session("eeeeeeee", "mgr-test", &AgentType::Claude, "/tmp", Some("sleep 30"))
+            .create_session(
+                "eeeeeeee",
+                "mgr-test",
+                &AgentType::Claude,
+                "/tmp",
+                Some("sleep 30"),
+            )
             .await
             .unwrap();
 
@@ -1130,7 +1199,7 @@ mod tests {
         let _content = mgr.capture_pane(&tmux_name).await.unwrap();
 
         // capture_panes (batch) via manager
-        let results = mgr.capture_panes(&[tmux_name.clone()]).await;
+        let results = mgr.capture_panes(std::slice::from_ref(&tmux_name)).await;
         assert_eq!(results.len(), 1);
         assert!(results[0].is_ok());
 
@@ -1158,7 +1227,13 @@ mod tests {
         let mgr = TmuxSessionManager::new();
         let project_id = "abab1234";
         let tmux_name = mgr
-            .create_session(project_id, "listtest", &AgentType::Codex, "/tmp", Some("sleep 30"))
+            .create_session(
+                project_id,
+                "listtest",
+                &AgentType::Codex,
+                "/tmp",
+                Some("sleep 30"),
+            )
             .await
             .unwrap();
 
@@ -1204,7 +1279,7 @@ mod tests {
         }
 
         fn arb_modifiers() -> impl Strategy<Value = KeyModifiers> {
-            (0u8..8).prop_map(|bits| KeyModifiers::from_bits_truncate(bits))
+            (0u8..8).prop_map(KeyModifiers::from_bits_truncate)
         }
 
         proptest! {
@@ -1268,20 +1343,14 @@ mod tests {
 
     #[test]
     fn ctrl_shift_arrow() {
-        let result = keycode_to_tmux(
-            KeyCode::Up,
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        );
+        let result = keycode_to_tmux(KeyCode::Up, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
         // Combined Ctrl+Shift should still map to something
         assert!(result.is_some(), "Ctrl+Shift+Up should be mappable");
     }
 
     #[test]
     fn alt_letter() {
-        let result = keycode_to_tmux(
-            KeyCode::Char('a'),
-            KeyModifiers::ALT,
-        );
+        let result = keycode_to_tmux(KeyCode::Char('a'), KeyModifiers::ALT);
         assert!(result.is_some(), "Alt+a should be mappable");
     }
 
