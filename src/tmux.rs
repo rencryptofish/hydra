@@ -106,8 +106,11 @@ impl SessionManager for TmuxSessionManager {
         // Keep cache aligned with live tmux sessions to avoid unbounded growth.
         prune_agent_cache(&mut self.agent_cache.lock().unwrap(), &live_sessions);
 
-        // Pass 1: Parse session names and resolve agent types (cached, no subprocess)
-        let mut parsed: Vec<(String, String, AgentType)> = Vec::new();
+        // Pass 1: Parse session names, split into cached vs uncached agent types
+        let mut parsed: Vec<(String, String)> = Vec::new();
+        let mut cached_agents: Vec<Option<AgentType>> = Vec::new();
+        let mut uncached_indices: Vec<usize> = Vec::new();
+
         for line in stdout.lines() {
             let tmux_name = line.trim();
             if !tmux_name.starts_with(&prefix) {
@@ -118,34 +121,40 @@ impl SessionManager for TmuxSessionManager {
                 None => continue,
             };
 
-            let agent_type = {
-                let cached = self.agent_cache.lock().unwrap().get(tmux_name).cloned();
-                match cached {
-                    Some(a) => a,
-                    None => {
-                        let agent = get_agent_type(tmux_name).await.unwrap_or(AgentType::Claude);
-                        self.agent_cache
-                            .lock()
-                            .unwrap()
-                            .insert(tmux_name.to_string(), agent.clone());
-                        agent
-                    }
-                }
-            };
-
-            parsed.push((name, tmux_name.to_string(), agent_type));
+            let cached = self.agent_cache.lock().unwrap().get(tmux_name).cloned();
+            if cached.is_none() {
+                uncached_indices.push(parsed.len());
+            }
+            cached_agents.push(cached);
+            parsed.push((name, tmux_name.to_string()));
         }
 
-        // Pass 2: Run all is_pane_dead checks in parallel
-        let dead_futures = parsed
-            .iter()
-            .map(|(_, tmux_name, _)| is_pane_dead(tmux_name));
-        let dead_results = futures::future::join_all(dead_futures).await;
+        // Resolve uncached agent types in parallel (instead of serial)
+        if !uncached_indices.is_empty() {
+            let agent_futures: Vec<_> = uncached_indices
+                .iter()
+                .map(|&i| get_agent_type(&parsed[i].1))
+                .collect();
+            let agent_results = futures::future::join_all(agent_futures).await;
+            let mut cache = self.agent_cache.lock().unwrap();
+            for (&idx, result) in uncached_indices.iter().zip(agent_results) {
+                let agent = result.unwrap_or(AgentType::Claude);
+                cache.insert(parsed[idx].1.clone(), agent.clone());
+                cached_agents[idx] = Some(agent);
+            }
+        }
+
+        // Pass 2: Batch is_pane_dead via single `tmux list-panes -a` call
+        let dead_set = batch_dead_panes().await;
 
         let sessions = parsed
             .into_iter()
-            .zip(dead_results)
-            .map(|((name, tmux_name, agent_type), dead)| {
+            .zip(cached_agents)
+            .map(|((name, tmux_name), agent)| {
+                let dead = dead_set
+                    .as_ref()
+                    .map(|s| s.contains(&tmux_name))
+                    .unwrap_or(false);
                 let status = if dead {
                     SessionStatus::Exited
                 } else {
@@ -155,7 +164,7 @@ impl SessionManager for TmuxSessionManager {
                 Session {
                     name,
                     tmux_name,
-                    agent_type,
+                    agent_type: agent.unwrap_or(AgentType::Claude),
                     status,
                     task_elapsed: None,
                     _alive: true,
@@ -213,6 +222,9 @@ impl SessionManager for TmuxSessionManager {
 /// Check if the pane in a tmux session has exited (requires remain-on-exit).
 /// Returns `true` when the session can't be queried (gone/dead) — a session
 /// we can't reach is effectively dead rather than silently "Idle".
+/// Note: Production code uses `batch_dead_panes()` instead; this is retained
+/// for integration tests that check individual sessions.
+#[cfg(test)]
 async fn is_pane_dead(tmux_name: &str) -> bool {
     let output = run_cmd_timeout(Command::new("tmux").args([
         "list-panes",
@@ -230,6 +242,37 @@ async fn is_pane_dead(tmux_name: &str) -> bool {
         }
         _ => true, // Can't reach session → treat as dead
     }
+}
+
+/// Batch-check all tmux sessions for dead panes in a single subprocess call.
+/// Returns a set of session names whose panes are dead, or None on error.
+async fn batch_dead_panes() -> Option<HashSet<String>> {
+    let output = run_cmd_timeout(Command::new("tmux").args([
+        "list-panes",
+        "-a",
+        "-F",
+        "#{session_name} #{pane_dead}",
+    ]))
+    .await
+    .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let dead: HashSet<String> = stdout
+        .lines()
+        .filter_map(|line| {
+            let (session, flag) = line.rsplit_once(' ')?;
+            if flag != "0" {
+                Some(session.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    Some(dead)
 }
 
 /// Read the HYDRA_AGENT_TYPE env var from the tmux session.
@@ -261,6 +304,13 @@ pub async fn create_session(
     let tmux_name = crate::session::tmux_session_name(project_id, name);
     let cmd = command_override.unwrap_or(agent.command());
 
+    // Wrap command to unset Claude Code env vars so agents don't detect
+    // a nested session when Hydra is launched from within Claude Code.
+    let wrapped_cmd = format!(
+        "unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT; exec {}",
+        cmd
+    );
+
     let status = run_status_timeout(Command::new("tmux").args([
         "new-session",
         "-d",
@@ -268,7 +318,7 @@ pub async fn create_session(
         &tmux_name,
         "-c",
         cwd,
-        cmd,
+        &wrapped_cmd,
     ]))
     .await
     .context("Failed to create tmux session")?;
@@ -286,6 +336,18 @@ pub async fn create_session(
         "on",
     ]))
     .await;
+
+    // Remove Claude Code env vars so spawned agents don't think they're nested
+    for var in ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"] {
+        let _ = run_status_timeout(Command::new("tmux").args([
+            "set-environment",
+            "-t",
+            &tmux_name,
+            "-r",
+            var,
+        ]))
+        .await;
+    }
 
     // Store agent type as env var on the session
     let _ = run_status_timeout(Command::new("tmux").args([
@@ -1257,5 +1319,119 @@ mod tests {
             keycode_to_tmux(KeyCode::Delete, KeyModifiers::NONE).is_some(),
             "Delete should be mappable"
         );
+    }
+
+    // ── batch_dead_panes integration tests ──────────────────────────
+
+    #[tokio::test]
+    async fn integration_batch_dead_panes_returns_some() {
+        // batch_dead_panes should work when a tmux server is running.
+        // If no server is running, it returns None (not an error).
+        let result = batch_dead_panes().await;
+        // We can't guarantee a tmux server is running, so just verify no panic.
+        // If a server is running, we should get Some(set).
+        if let Some(dead) = &result {
+            // The set may be empty or contain sessions — either is valid.
+            assert!(dead.len() < 10000, "sanity check: not absurdly large");
+        }
+    }
+
+    #[tokio::test]
+    async fn integration_batch_dead_panes_detects_exited_session() {
+        let name = test_session_name();
+        // Create session with a command that sleeps briefly (giving us time to set
+        // remain-on-exit), then exits.
+        let status = run_status_timeout(Command::new("tmux").args([
+            "new-session",
+            "-d",
+            "-s",
+            &name,
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "sh",
+            "-c",
+            "sleep 0.3 && exit 0",
+        ]))
+        .await
+        .unwrap();
+        assert!(status.success());
+
+        // Set remain-on-exit while the sleep is still running.
+        let _ = run_status_timeout(Command::new("tmux").args([
+            "set-option", "-t", &name, "remain-on-exit", "on",
+        ]))
+        .await;
+
+        // Wait for the command to finish exiting.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        let dead_set = batch_dead_panes().await.expect("tmux server should be running");
+        assert!(
+            dead_set.contains(&name),
+            "exited session should appear in batch dead set: {dead_set:?}"
+        );
+
+        cleanup_session(&name).await;
+    }
+
+    #[tokio::test]
+    async fn integration_batch_dead_panes_live_session_not_dead() {
+        let name = test_session_name();
+        let status = run_status_timeout(Command::new("tmux").args([
+            "new-session", "-d", "-s", &name, "-x", "80", "-y", "24", "sleep", "30",
+        ]))
+        .await
+        .unwrap();
+        assert!(status.success());
+
+        let dead_set = batch_dead_panes().await.expect("tmux server should be running");
+        assert!(
+            !dead_set.contains(&name),
+            "live session should NOT appear in dead set"
+        );
+
+        cleanup_session(&name).await;
+    }
+
+    #[tokio::test]
+    async fn integration_parallel_agent_resolution() {
+        // Verify that the TmuxSessionManager correctly resolves agent types
+        // for multiple sessions with parallel lookups.
+        let mgr = TmuxSessionManager::new();
+        let project_id = "partest1";
+
+        // Create two sessions with different agent types.
+        let name1 = mgr
+            .create_session(project_id, "par-a", &AgentType::Claude, "/tmp", Some("sleep 30"))
+            .await
+            .unwrap();
+        let name2 = mgr
+            .create_session(project_id, "par-b", &AgentType::Codex, "/tmp", Some("sleep 30"))
+            .await
+            .unwrap();
+
+        // Clear the cache to force parallel resolution.
+        mgr.agent_cache.lock().unwrap().clear();
+
+        let sessions = mgr.list_sessions(project_id).await.unwrap();
+        let s1 = sessions.iter().find(|s| s.tmux_name == name1);
+        let s2 = sessions.iter().find(|s| s.tmux_name == name2);
+
+        assert!(s1.is_some(), "session 1 should be listed");
+        assert!(s2.is_some(), "session 2 should be listed");
+        assert_eq!(s1.unwrap().agent_type, AgentType::Claude);
+        assert_eq!(s2.unwrap().agent_type, AgentType::Codex);
+
+        // Verify cache was populated.
+        {
+            let cache = mgr.agent_cache.lock().unwrap();
+            assert_eq!(cache.get(&name1), Some(&AgentType::Claude));
+            assert_eq!(cache.get(&name2), Some(&AgentType::Codex));
+        }
+
+        cleanup_session(&name1).await;
+        cleanup_session(&name2).await;
     }
 }

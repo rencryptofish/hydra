@@ -520,14 +520,16 @@ fn update_global_stats_inner(
     }
 
     // Process Claude files incrementally.
-    let claude_files = stats.known_claude_files.clone();
-    for path in claude_files {
+    // Index-based iteration avoids cloning the entire Vec<PathBuf> — we can't
+    // iterate by reference because process_*_global_file takes &mut stats.
+    for i in 0..stats.known_claude_files.len() {
+        let path = stats.known_claude_files[i].clone();
         process_claude_global_file(&path, stats, today);
     }
 
     // Process Codex files incrementally.
-    let codex_files = stats.known_codex_files.clone();
-    for path in codex_files {
+    for i in 0..stats.known_codex_files.len() {
+        let path = stats.known_codex_files[i].clone();
         process_codex_global_file(&path, stats, today);
     }
 }

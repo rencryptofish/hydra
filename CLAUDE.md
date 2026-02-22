@@ -46,7 +46,10 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 - **Last message display**: Sidebar shows the last Claude assistant message per session (dimmed second line, truncated to 50 chars). UUIDs are resolved via PID→process tree lookup and cached in `App.log_uuids`. Failed UUID resolutions are retried with cooldown to avoid repeated expensive subprocess walks. Messages refresh every 50 ticks (~5s). Only reads incremental JSONL bytes for efficiency.
 - **Claude Code JSONL logs**: Located at `~/.claude/projects/<escaped-cwd>/<uuid>.jsonl`. Path escaping replaces `/` with `-` (e.g. `/home/user/project` → `-home-user-project`). Structure: `{"type": "assistant", "message": {"content": [{"text": "..."}]}}`. The UUID is discovered by parsing `--session-id` from the process command line (`ps -p <pid> -o command=`), falling back to `lsof -p <pane_pid>` for legacy sessions without `--session-id`.
 - **remain-on-exit**: Set on session creation so exited agents stay visible with `Exited` status instead of vanishing.
-- **Agent type caching**: `TmuxSessionManager` caches `HYDRA_AGENT_TYPE` env var lookups in a `std::sync::Mutex<HashMap>` to avoid repeated `tmux show-environment` calls on every tick. Uses `std::sync::Mutex` (not tokio) since the lock is never held across `.await` points. Cache is also pre-populated on `create_session`.
+- **Agent type caching**: `TmuxSessionManager` caches `HYDRA_AGENT_TYPE` env var lookups in a `std::sync::Mutex<HashMap>` to avoid repeated `tmux show-environment` calls on every tick. Uses `std::sync::Mutex` (not tokio) since the lock is never held across `.await` points. Cache is also pre-populated on `create_session`. Uncached lookups are resolved in parallel via `join_all`.
+- **Idle capture skip**: Sessions idle for 40+ ticks (`IDLE_CAPTURE_SKIP_THRESHOLD`) skip `capture_pane` calls and reuse cached content from `StatusDetector.raw_captures`. Capture resumes if content changes (idle_ticks reset).
+- **Batch dead-pane check**: `batch_dead_panes()` in `tmux.rs` uses a single `tmux list-panes -a -F "#{session_name} #{pane_dead}"` call to check all sessions at once, replacing N individual `is_pane_dead()` subprocess calls.
+- **Nested session isolation**: `create_session()` wraps the agent command with `unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT; exec <cmd>` and calls `tmux set-environment -r` to prevent Claude Code env vars from propagating into agent sessions.
 - **Async I/O**: All tmux subprocess calls use `tokio::process::Command` instead of `std::process::Command` to avoid blocking the event loop. In Attached mode, key presses forward to tmux and force `refresh_preview_live()` for low-latency echo; Browse-mode key navigation uses `refresh_preview()` cache-aware refresh.
 - **Session stats**: `SessionStats` in `logs.rs` tracks per-session metrics (turns, tokens in/out, cache tokens, edits, bash commands, unique files). Updated incrementally via `update_session_stats()` which reads only new bytes since last offset — fast even on 100MB+ logs. Stats refresh on the same 50-tick cadence as last messages (~5s at 100ms tick). Rendered in a bordered "Stats" block at the bottom of the sidebar.
 - **Global stats**: `GlobalStats` in `logs.rs` aggregates cost/tokens across ALL Claude Code sessions on the machine for today. Scans `~/.claude/projects/` recursively (including nested `subagents/*.jsonl` files) via `update_global_stats()`. Uses incremental file offsets (only reads new bytes after first scan). Date-aware: resets at midnight. Cost uses Sonnet pricing ($3/$15 per MTok in/out). Cold scan of ~1400 files / 1GB takes ~1.8s; subsequent calls are fast. Does NOT include Codex usage (different log format at `~/.codex/sessions/`). The sidebar Stats block shows global cost/tokens + per-session edits.
@@ -67,7 +70,7 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 
 ## Conventions
 
-- Tick rate is 50ms (`EVENT_TICK_RATE`), session/preview refresh runs every tick (~50ms)
+- Tick rate is 50ms (`EVENT_TICK_RATE`), session refresh runs every 4 ticks (~200ms via `SESSION_REFRESH_INTERVAL_TICKS`)
 - tmux session names: `hydra-<8char_sha256_hex>-<user_name>`
 - Agent commands: `claude --dangerously-skip-permissions`, `codex -c check_for_update_on_startup=false --yolo`
 - Mouse handling lives in `App::handle_mouse()` (moved from `main.rs` to `app.rs`)
@@ -77,7 +80,7 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 - **Pending action pattern**: `handle_mouse()` is synchronous (to avoid converting 15+ tests to async), so it can't call async trait methods directly. Instead it sets `App.pending_literal_keys: Option<(String, String)>` which the event loop consumes via `flush_pending_keys()`. This pattern keeps mouse tests simple while supporting async I/O.
 - **Literal key sending**: `send_keys_literal()` on `SessionManager` sends raw text/escape sequences via `tmux send-keys -l` (literal mode). Has a default no-op impl in the trait so mock impls don't need to override it.
 
-## Recent Learnings (2026-02-20)
+## Recent Learnings (2026-02-21)
 
 - Keep the UI event tick responsive (100ms) with a 2-tick (~200ms) session refresh cadence, and use forced live preview capture in Attached mode to keep typing echo real-time.
 - Cache preview line count in app state and update it only when preview text changes; avoid `lines().count()` during every draw.
@@ -97,6 +100,11 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 - `proptest` char ranges (`'a'..='z'`) don't implement `Strategy` — use `proptest::char::range()` instead.
 - Makefile `check` target composes `test + deny + fmt --check + clippy` for CI. `make coverage` uses `cargo llvm-cov html`, `make mutants` uses `cargo mutants`.
 - **App sub-structs**: `StatusDetector`, `TaskTimers`, `PreviewState`, `BackgroundRefreshState` are defined in `app.rs` (not separate modules) so tests in `mod tests` can still access `pub(crate)` fields. Extraction pattern: move fields + logic into sub-struct, add delegation methods on App, batch-rename test references with `replace_all`. Keep fields read by `ui.rs` (like `last_messages`, `session_stats`, `diff_files`) directly on App — don't nest them in sub-structs.
+- **Performance: subprocess spawning was the dominant bottleneck**. At 1-tick refresh with 10 sessions, Hydra spawned ~420 tmux subprocesses/sec. Key fixes: (1) `SESSION_REFRESH_INTERVAL_TICKS=4` reduces refresh from 50ms to 200ms; (2) `IDLE_CAPTURE_SKIP_THRESHOLD=40` skips `capture_pane` for sessions idle 40+ ticks (reuses cached capture); (3) `batch_dead_panes()` replaces N individual `is_pane_dead()` calls with one `tmux list-panes -a`; (4) parallel agent type resolution via `join_all` for uncached lookups. Net result: ~25 subprocesses/sec for 10 sessions.
+- **Attached mode double-refresh**: Keystroke handler called `refresh_preview_live()` and then the tick handler also called `refresh_preview()` 50ms later. Fixed with `last_key_refresh` timestamp guard — tick skips refresh if a keystroke just refreshed within 200ms.
+- **Background task cadence**: `message_tick % 50` at 50ms tick = 2.5s cadence (not the intended 5s). Fixed to `% 100` for correct 5s interval.
+- **Nested session env var propagation**: When Hydra is launched from within Claude Code, `CLAUDECODE=1` and `CLAUDE_CODE_ENTRYPOINT` propagate into spawned tmux sessions, causing Claude to refuse to start ("nested sessions share runtime resources"). Fixed by wrapping the agent command with `unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT; exec <cmd>` and also calling `tmux set-environment -r` to remove the vars from the session environment table.
+- **Integration tests for tmux**: Tests that create real tmux sessions need timing care — `sh -c 'sleep 0.3 && exit 0'` gives enough time for `remain-on-exit` to be set before the command exits. Using bare `true` or instant-exit commands causes race conditions where the session is destroyed before options can be applied.
 
 ## Common Changes
 

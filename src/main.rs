@@ -20,7 +20,7 @@ use hydra::session::{self, project_id, AgentType};
 use hydra::{manifest, tmux, ui};
 
 const EVENT_TICK_RATE: Duration = Duration::from_millis(50);
-const SESSION_REFRESH_INTERVAL_TICKS: u8 = 1;
+const SESSION_REFRESH_INTERVAL_TICKS: u8 = 4;
 
 // Minisign Ed25519 public key for verifying release binaries.
 // This is the second line (base64 key data) from the .pub file.
@@ -356,6 +356,9 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
     let mut events = EventHandler::new(EVENT_TICK_RATE);
     let mut prev_mouse_captured = true;
     let mut session_refresh_tick = 0u8;
+    // Track when a keystroke last triggered a preview capture, so the tick
+    // handler can skip redundant refresh_preview in Attached mode.
+    let mut last_key_refresh = std::time::Instant::now() - Duration::from_secs(1);
 
     // Draw initial frame before entering event loop
     terminal.draw(|frame| ui::draw(frame, &app))?;
@@ -376,8 +379,9 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
                         // Force a live pane capture on typed input so attached-mode
                         // echo feels immediate rather than waiting for the tick.
                         app.refresh_preview_live().await;
+                        last_key_refresh = std::time::Instant::now();
                     } else if !was_attached {
-                        app.refresh_preview().await;
+                        app.refresh_preview_from_cache();
                     }
                 }
             }
@@ -393,7 +397,13 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
                 session_refresh_tick = session_refresh_tick.wrapping_add(1);
                 if session_refresh_tick % SESSION_REFRESH_INTERVAL_TICKS == 0 {
                     app.refresh_sessions().await;
-                    app.refresh_preview().await;
+                    // In Attached mode, skip preview refresh if a keystroke just
+                    // triggered one — avoids redundant tmux capture subprocess.
+                    let key_just_refreshed = app.mode == Mode::Attached
+                        && last_key_refresh.elapsed() < Duration::from_millis(200);
+                    if !key_just_refreshed {
+                        app.refresh_preview().await;
+                    }
                 }
                 app.refresh_messages();
             }

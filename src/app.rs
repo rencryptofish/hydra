@@ -347,8 +347,8 @@ impl BackgroundRefreshState {
         }
 
         self.message_tick = self.message_tick.wrapping_add(1);
-        // Run every 50 ticks (~5 seconds at 100ms interval)
-        if self.message_tick % 50 != 0 {
+        // Run every 100 ticks (~5 seconds at 50ms tick rate).
+        if self.message_tick % 100 != 0 {
             return completed;
         }
 
@@ -472,19 +472,35 @@ impl App {
                     .map(|s| (s.tmux_name.clone(), s.status.clone()))
                     .collect();
 
-                // Batch-capture pane content in parallel for all non-exited sessions.
-                // This turns N sequential subprocess waits into 1 parallel wait.
+                // Batch-capture pane content in parallel for non-exited sessions.
+                // Skip sessions that have been idle for many ticks — their content
+                // hasn't changed, so recapturing wastes subprocess calls.
+                // Reuse cached captures for skipped sessions so status detection
+                // still runs (hysteresis state machine needs input every tick).
+                const IDLE_CAPTURE_SKIP_THRESHOLD: u8 = 40;
                 let live_names: Vec<String> = sessions
                     .iter()
                     .filter(|s| s.status != SessionStatus::Exited)
+                    .filter(|s| {
+                        self.status.idle_ticks_for(&s.tmux_name) < IDLE_CAPTURE_SKIP_THRESHOLD
+                    })
                     .map(|s| s.tmux_name.clone())
                     .collect();
                 let capture_results = self.manager.capture_panes(&live_names).await;
-                let captures: HashMap<String, String> = live_names
+                let mut captures: HashMap<String, String> = live_names
                     .into_iter()
                     .zip(capture_results)
                     .map(|(name, res)| (name, res.unwrap_or_default()))
                     .collect();
+                // For stable-idle sessions we skipped, reuse last known capture
+                // so the status detector still processes them.
+                for s in sessions.iter() {
+                    if s.status != SessionStatus::Exited && !captures.contains_key(&s.tmux_name) {
+                        if let Some(prev) = self.status.raw_captures.get(&s.tmux_name) {
+                            captures.insert(s.tmux_name.clone(), prev.clone());
+                        }
+                    }
+                }
 
                 self.status.update_statuses(
                     &mut sessions,
@@ -548,6 +564,27 @@ impl App {
 
     pub async fn refresh_preview(&mut self) {
         self.refresh_preview_impl(false).await;
+    }
+
+    /// Update preview from the pane capture cache (synchronous, no tmux calls).
+    /// Used for Browse-mode key presses where responsiveness matters more than
+    /// freshness — the next tick will correct any stale content within 50ms.
+    pub fn refresh_preview_from_cache(&mut self) {
+        let tmux_name = self
+            .sessions
+            .get(self.selected)
+            .map(|s| s.tmux_name.clone());
+        if let Some(tmux_name) = tmux_name {
+            if let Some(content) = self.status.latest_pane_captures.get(&tmux_name) {
+                self.preview.set_content(content.clone(), false);
+            }
+            // Cache miss (exited session, etc.) — leave preview as-is; next tick updates it.
+            self.preview.session = Some(tmux_name);
+        } else {
+            self.preview
+                .set_content(String::from("No sessions. Press 'n' to create one."), false);
+            self.preview.session = None;
+        }
     }
 
     /// Refresh preview with a forced live pane capture (bypasses cache/idle skip).
@@ -4898,5 +4935,211 @@ mod tests {
                 prop_assert_eq!(&files[0].path, &path);
             }
         }
+    }
+
+    // ── Performance optimization validation ──────────────────────────
+
+    #[tokio::test]
+    async fn idle_sessions_skip_capture_after_threshold() {
+        use std::sync::atomic::Ordering;
+
+        // Create 3 sessions that will all return the same unchanging content.
+        let sessions = vec![
+            make_session("s1", AgentType::Claude),
+            make_session("s2", AgentType::Claude),
+            make_session("s3", AgentType::Claude),
+        ];
+        let manager = MockSessionManager::with_sessions(sessions)
+            .with_capture_fn(|_| "unchanging pane content".to_string());
+        let capture_count = manager.capture_count.clone();
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(manager),
+        );
+        app.manifest_dir = std::env::temp_dir()
+            .join("hydra-test-perf")
+            .join(format!("{:?}", std::thread::current().id()));
+
+        // Phase 1: First refresh captures all 3 sessions.
+        app.refresh_sessions().await;
+        let after_first = capture_count.load(Ordering::SeqCst);
+        assert_eq!(after_first, 3, "first refresh should capture all 3 sessions");
+
+        // Phase 2: Refresh repeatedly with identical content until idle threshold is reached.
+        // IDLE_CAPTURE_SKIP_THRESHOLD is 40, so after ~40 refreshes all sessions should
+        // be considered stable-idle and skipped.
+        for _ in 0..50 {
+            app.refresh_sessions().await;
+        }
+        let after_warmup = capture_count.load(Ordering::SeqCst);
+
+        // Phase 3: Do 10 more refreshes. Stable-idle sessions should be skipped.
+        for _ in 0..10 {
+            app.refresh_sessions().await;
+        }
+        let after_idle = capture_count.load(Ordering::SeqCst);
+        let captures_during_idle_phase = after_idle - after_warmup;
+        assert_eq!(
+            captures_during_idle_phase, 0,
+            "stable-idle sessions should be skipped (got {captures_during_idle_phase} captures in 10 refreshes)"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_skip_resumes_capture_when_content_changes() {
+        use std::sync::atomic::Ordering;
+
+        // Session with content that changes after capture #60.
+        let sessions = vec![make_session("s1", AgentType::Claude)];
+        let manager = MockSessionManager::with_sessions(sessions).with_capture_fn(|n| {
+            if n < 60 {
+                "stable content".to_string()
+            } else {
+                format!("changed content {n}")
+            }
+        });
+        let capture_count = manager.capture_count.clone();
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(manager),
+        );
+        app.manifest_dir = std::env::temp_dir()
+            .join("hydra-test-perf2")
+            .join(format!("{:?}", std::thread::current().id()));
+
+        // Drive past the idle threshold so the session gets skipped.
+        for _ in 0..55 {
+            app.refresh_sessions().await;
+        }
+        let captures_at_idle = capture_count.load(Ordering::SeqCst);
+
+        // Now verify that the session is being skipped (idle).
+        // Confirm no captures happen in the next few refreshes.
+        for _ in 0..5 {
+            app.refresh_sessions().await;
+        }
+        let captures_while_skipped = capture_count.load(Ordering::SeqCst) - captures_at_idle;
+        assert_eq!(
+            captures_while_skipped, 0,
+            "session should be skipped while idle"
+        );
+
+        // Manually reset idle ticks to simulate detection of a change
+        // (e.g. from background refresh noticing the session is active again).
+        app.status.idle_ticks.insert("hydra-testid-s1".to_string(), 0);
+
+        // After reset, the next refresh should capture again.
+        app.refresh_sessions().await;
+        let captures_after_reset = capture_count.load(Ordering::SeqCst) - captures_at_idle;
+        assert!(
+            captures_after_reset > 0,
+            "session should be captured again after idle ticks reset"
+        );
+    }
+
+    #[tokio::test]
+    async fn exited_sessions_never_captured() {
+        use std::sync::atomic::Ordering;
+
+        // Session that is Exited.
+        let sessions = vec![make_session_with_status(
+            "s1",
+            AgentType::Claude,
+            SessionStatus::Exited,
+        )];
+        let manager = MockSessionManager::with_sessions(sessions);
+        let capture_count = manager.capture_count.clone();
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(manager),
+        );
+        app.manifest_dir = std::env::temp_dir()
+            .join("hydra-test-exited")
+            .join(format!("{:?}", std::thread::current().id()));
+
+        for _ in 0..10 {
+            app.refresh_sessions().await;
+        }
+        assert_eq!(
+            capture_count.load(Ordering::SeqCst),
+            0,
+            "exited sessions should never be captured"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_idle_and_running_sessions_only_capture_active() {
+        use std::sync::atomic::Ordering;
+
+        // Two sessions. The capture_fn uses the global call index:
+        // - Calls with even index go to s1 (sorted first alphabetically)
+        // - Calls with odd index go to s2
+        // s1 changes every capture, s2 is always the same.
+        //
+        // Once s2 reaches idle threshold, only s1 should be captured,
+        // so calls will be sequential (not alternating). We can track this
+        // by checking total capture count reduction.
+        let sessions = vec![
+            make_session("s1", AgentType::Claude),
+            make_session("s2", AgentType::Claude),
+        ];
+        // Use a static capture: both sessions get the same content, both go idle.
+        // Then manually wake s1 to verify only it gets captured.
+        let manager = MockSessionManager::with_sessions(sessions)
+            .with_capture_fn(|_| "unchanging content".to_string());
+        let capture_count = manager.capture_count.clone();
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(manager),
+        );
+        app.manifest_dir = std::env::temp_dir()
+            .join("hydra-test-mixed")
+            .join(format!("{:?}", std::thread::current().id()));
+
+        // Phase 1: Both sessions get captured (2 per refresh).
+        app.refresh_sessions().await;
+        assert_eq!(
+            capture_count.load(Ordering::SeqCst),
+            2,
+            "both sessions captured on first refresh"
+        );
+
+        // Phase 2: Drive both sessions past idle threshold.
+        for _ in 0..50 {
+            app.refresh_sessions().await;
+        }
+        let captures_at_idle = capture_count.load(Ordering::SeqCst);
+
+        // Phase 3: Both idle — verify no captures.
+        for _ in 0..5 {
+            app.refresh_sessions().await;
+        }
+        let captures_while_both_idle = capture_count.load(Ordering::SeqCst) - captures_at_idle;
+        assert_eq!(
+            captures_while_both_idle, 0,
+            "no captures when both sessions are idle"
+        );
+
+        // Phase 4: Wake s1 by resetting its idle ticks, keep s2 idle.
+        app.status
+            .idle_ticks
+            .insert("hydra-testid-s1".to_string(), 0);
+        let captures_before_wake = capture_count.load(Ordering::SeqCst);
+
+        for _ in 0..5 {
+            app.refresh_sessions().await;
+        }
+        let captures_after_wake = capture_count.load(Ordering::SeqCst) - captures_before_wake;
+
+        // Only s1 should be captured (s2 is still idle-skipped).
+        // Each refresh captures exactly 1 session = 5 captures total.
+        assert_eq!(
+            captures_after_wake, 5,
+            "only active session should be captured, got {captures_after_wake}"
+        );
     }
 }

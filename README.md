@@ -9,7 +9,7 @@
 Run multiple Claude and Codex agents in parallel, each in its own tmux session, managed from a single TUI.
 
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-456_passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-550_passing-brightgreen.svg)](#testing)
 [![Coverage](https://img.shields.io/badge/coverage-65%25-yellow.svg)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -32,6 +32,7 @@ Run multiple Claude and Codex agents in parallel, each in its own tmux session, 
 - **Multi-agent support** — Claude (`claude --dangerously-skip-permissions`) and Codex (`codex --yolo`)
 - **Mouse support** — click to select sessions, scroll the preview pane
 - **Full scrollback** — scroll up through complete session history in the preview
+- **Low resource usage** — idle sessions skip pane captures, batch tmux queries, parallel agent resolution
 
 ## Requirements
 
@@ -95,10 +96,11 @@ Key design decisions:
 - **Content-change detection** — session status is determined by diffing `capture-pane` output between ticks, not `session_activity`
 - **Session revival** — manifest file persists session metadata; on startup, dead sessions are recreated with agent-specific resume commands
 - **Async I/O** — all tmux subprocess calls and manifest file I/O use `tokio` to avoid blocking the event loop
+- **Nested session isolation** — safely runs from within Claude Code by unsetting `CLAUDECODE` env vars in spawned sessions
 
 ## Testing
 
-456 tests across unit, snapshot, and CLI integration:
+550 tests across unit, snapshot, CLI integration, and property-based:
 
 ```bash
 cargo test                # run all tests
