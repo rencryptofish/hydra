@@ -54,10 +54,12 @@ const MAX_SESSION_TRACKED_FILES: usize = 4096;
 impl SessionStats {
     #[cfg(test)]
     pub fn cost_usd(&self) -> f64 {
-        let input = self.tokens_in as f64 * 3.0 / 1_000_000.0;
-        let output = self.tokens_out as f64 * 15.0 / 1_000_000.0;
-        let cache_read = self.tokens_cache_read as f64 * 0.30 / 1_000_000.0;
-        let cache_write = self.tokens_cache_write as f64 * 3.75 / 1_000_000.0;
+        let input = self.tokens_in as f64 * CLAUDE_INPUT_USD_PER_MTOK / 1_000_000.0;
+        let output = self.tokens_out as f64 * CLAUDE_OUTPUT_USD_PER_MTOK / 1_000_000.0;
+        let cache_read =
+            self.tokens_cache_read as f64 * CLAUDE_CACHE_READ_USD_PER_MTOK / 1_000_000.0;
+        let cache_write =
+            self.tokens_cache_write as f64 * CLAUDE_CACHE_WRITE_USD_PER_MTOK / 1_000_000.0;
         input + output + cache_read + cache_write
     }
 
@@ -144,7 +146,7 @@ pub fn format_cost(usd: f64) -> String {
 
 /// Incrementally update stats from a Claude JSONL log file.
 /// Only reads bytes after `stats.read_offset`, making repeated calls cheap.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn update_session_stats(cwd: &str, uuid: &str, stats: &mut SessionStats) {
     let _ = update_session_stats_and_last_message(cwd, uuid, stats);
 }
@@ -172,7 +174,7 @@ pub fn update_session_stats_and_last_message(
 
 /// Core stats parser — reads from a specific file path.
 /// Separated from `update_session_stats` for testability (avoids HOME env var).
-#[allow(dead_code)]
+#[cfg(test)]
 fn update_session_stats_from_path(path: &std::path::Path, stats: &mut SessionStats) {
     let _ = update_session_stats_from_path_and_last_message(path, stats);
 }
@@ -196,10 +198,8 @@ pub fn update_session_stats_from_path_and_last_message(
     }
 
     // Seek to where we left off
-    if stats.read_offset > 0 {
-        if file.seek(SeekFrom::Start(stats.read_offset)).is_err() {
-            return None;
-        }
+    if stats.read_offset > 0 && file.seek(SeekFrom::Start(stats.read_offset)).is_err() {
+        return None;
     }
 
     let mut buf = Vec::new();
@@ -328,7 +328,15 @@ pub fn update_session_stats_from_path_and_last_message(
 
 const FILE_DISCOVERY_INTERVAL_SECS: i64 = 30;
 
+// Claude Sonnet token pricing (USD per million tokens).
+// Update these when Anthropic changes pricing.
+const CLAUDE_INPUT_USD_PER_MTOK: f64 = 3.0;
+const CLAUDE_OUTPUT_USD_PER_MTOK: f64 = 15.0;
+const CLAUDE_CACHE_READ_USD_PER_MTOK: f64 = 0.30;
+const CLAUDE_CACHE_WRITE_USD_PER_MTOK: f64 = 3.75;
+
 // Uses OpenAI's published GPT-5 Codex token pricing as an estimate.
+// Update these when OpenAI changes pricing.
 const CODEX_INPUT_USD_PER_MTOK: f64 = 1.25;
 const CODEX_OUTPUT_USD_PER_MTOK: f64 = 10.0;
 const CODEX_CACHE_READ_USD_PER_MTOK: f64 = 0.125;
@@ -344,7 +352,7 @@ struct CodexFileState {
 
 /// Machine-wide stats for today, aggregated across Claude and Codex logs.
 /// Updated incrementally — only new bytes are parsed on each refresh.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GlobalStats {
     // Aggregate totals displayed in the UI.
     pub tokens_in: u64,
@@ -373,30 +381,6 @@ pub struct GlobalStats {
     date: String,
 }
 
-impl Default for GlobalStats {
-    fn default() -> Self {
-        Self {
-            tokens_in: 0,
-            tokens_out: 0,
-            tokens_cache_read: 0,
-            tokens_cache_write: 0,
-            claude_tokens_in: 0,
-            claude_tokens_out: 0,
-            claude_tokens_cache_read: 0,
-            claude_tokens_cache_write: 0,
-            codex_tokens_in: 0,
-            codex_tokens_out: 0,
-            codex_tokens_cache_read: 0,
-            file_offsets: HashMap::new(),
-            codex_file_states: HashMap::new(),
-            known_claude_files: Vec::new(),
-            known_codex_files: Vec::new(),
-            last_file_discovery_ts: 0,
-            date: String::new(),
-        }
-    }
-}
-
 impl GlobalStats {
     /// Estimated cost in USD using provider-specific pricing.
     /// Claude: Sonnet ($3 in / $15 out / $0.30 cache-read / $3.75 cache-write per MTok).
@@ -412,17 +396,22 @@ impl GlobalStats {
 
         // Backward compatibility for tests/older state that only set aggregate fields.
         if !has_breakdown {
-            let input = self.tokens_in as f64 * 3.0 / 1_000_000.0;
-            let output = self.tokens_out as f64 * 15.0 / 1_000_000.0;
-            let cache_read = self.tokens_cache_read as f64 * 0.30 / 1_000_000.0;
-            let cache_write = self.tokens_cache_write as f64 * 3.75 / 1_000_000.0;
+            let input = self.tokens_in as f64 * CLAUDE_INPUT_USD_PER_MTOK / 1_000_000.0;
+            let output = self.tokens_out as f64 * CLAUDE_OUTPUT_USD_PER_MTOK / 1_000_000.0;
+            let cache_read =
+                self.tokens_cache_read as f64 * CLAUDE_CACHE_READ_USD_PER_MTOK / 1_000_000.0;
+            let cache_write =
+                self.tokens_cache_write as f64 * CLAUDE_CACHE_WRITE_USD_PER_MTOK / 1_000_000.0;
             return input + output + cache_read + cache_write;
         }
 
-        let claude_input = self.claude_tokens_in as f64 * 3.0 / 1_000_000.0;
-        let claude_output = self.claude_tokens_out as f64 * 15.0 / 1_000_000.0;
-        let claude_cache_read = self.claude_tokens_cache_read as f64 * 0.30 / 1_000_000.0;
-        let claude_cache_write = self.claude_tokens_cache_write as f64 * 3.75 / 1_000_000.0;
+        let claude_input = self.claude_tokens_in as f64 * CLAUDE_INPUT_USD_PER_MTOK / 1_000_000.0;
+        let claude_output =
+            self.claude_tokens_out as f64 * CLAUDE_OUTPUT_USD_PER_MTOK / 1_000_000.0;
+        let claude_cache_read =
+            self.claude_tokens_cache_read as f64 * CLAUDE_CACHE_READ_USD_PER_MTOK / 1_000_000.0;
+        let claude_cache_write =
+            self.claude_tokens_cache_write as f64 * CLAUDE_CACHE_WRITE_USD_PER_MTOK / 1_000_000.0;
 
         let codex_uncached_input_tokens = self
             .codex_tokens_in
@@ -731,14 +720,12 @@ fn process_codex_global_file(path: &PathBuf, stats: &mut GlobalStats, today: &st
             .and_then(|t| t.as_str())
             .is_some_and(|ts| ts.starts_with(today));
 
-        if total_tokens > last_total_tokens {
-            if is_today {
-                let delta_input = total_input_tokens.saturating_sub(last_input_tokens);
-                let delta_output = total_output_tokens.saturating_sub(last_output_tokens);
-                let delta_cache_read =
-                    total_cached_input_tokens.saturating_sub(last_cached_input_tokens);
-                add_codex_usage(stats, delta_input, delta_output, delta_cache_read);
-            }
+        if total_tokens > last_total_tokens && is_today {
+            let delta_input = total_input_tokens.saturating_sub(last_input_tokens);
+            let delta_output = total_output_tokens.saturating_sub(last_output_tokens);
+            let delta_cache_read =
+                total_cached_input_tokens.saturating_sub(last_cached_input_tokens);
+            add_codex_usage(stats, delta_input, delta_output, delta_cache_read);
         }
 
         // Always advance snapshot state; duplicate totals are ignored by the delta check above.
@@ -970,7 +957,7 @@ pub fn extract_assistant_message_text(v: &serde_json::Value) -> Option<String> {
 
 /// Read the last assistant message from a Claude JSONL log file.
 /// Reads only the tail of the file for efficiency on large logs.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn read_last_assistant_message(cwd: &str, uuid: &str) -> Option<String> {
     let escaped = escape_project_path(cwd);
     let home = std::env::var("HOME").ok()?;
@@ -1627,19 +1614,13 @@ mod tests {
         )
         .unwrap();
 
-        // Temporarily override HOME
-        let _lock = HOME_LOCK.lock().unwrap();
-        let orig_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &tmp_dir);
+        let _guard = HomeGuard::set(&tmp_dir);
 
         let msg = read_last_assistant_message("/tmp/test-project", uuid);
         assert_eq!(msg, Some("Here is the answer.".to_string()));
 
-        // Cleanup
-        if let Some(home) = orig_home {
-            std::env::set_var("HOME", home);
-        }
-        let _ = std::fs::remove_dir_all(&tmp_dir.join(".claude"));
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(tmp_dir.join(".claude"));
     }
 
     #[test]
@@ -1661,17 +1642,13 @@ mod tests {
         )
         .unwrap();
 
-        let _lock = HOME_LOCK.lock().unwrap();
-        let orig_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &tmp_dir);
+        let _guard = HomeGuard::set(&tmp_dir);
 
         let msg = read_last_assistant_message("/tmp/parts-project", uuid);
         assert_eq!(msg, Some("Part one. Part two.".to_string()));
 
-        if let Some(home) = orig_home {
-            std::env::set_var("HOME", home);
-        }
-        let _ = std::fs::remove_dir_all(&tmp_dir.join(".claude"));
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(tmp_dir.join(".claude"));
     }
 
     #[test]
@@ -1694,17 +1671,13 @@ mod tests {
         let log_file = projects_dir.join(format!("{uuid}.jsonl"));
         let _ = std::fs::File::create(&log_file).unwrap();
 
-        let _lock = HOME_LOCK.lock().unwrap();
-        let orig_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &tmp_dir);
+        let _guard = HomeGuard::set(&tmp_dir);
 
         let msg = read_last_assistant_message("/tmp/empty-project", uuid);
         assert_eq!(msg, None);
 
-        if let Some(home) = orig_home {
-            std::env::set_var("HOME", home);
-        }
-        let _ = std::fs::remove_dir_all(&tmp_dir.join(".claude"));
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(tmp_dir.join(".claude"));
     }
 
     #[test]
@@ -1723,17 +1696,13 @@ mod tests {
         writeln!(f, r#"{{"type":"user","message":{{"content":"hello"}}}}"#).unwrap();
         writeln!(f, r#"{{"type":"system","message":{{"content":"info"}}}}"#).unwrap();
 
-        let _lock = HOME_LOCK.lock().unwrap();
-        let orig_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &tmp_dir);
+        let _guard = HomeGuard::set(&tmp_dir);
 
         let msg = read_last_assistant_message("/tmp/noassist-project", uuid);
         assert_eq!(msg, None);
 
-        if let Some(home) = orig_home {
-            std::env::set_var("HOME", home);
-        }
-        let _ = std::fs::remove_dir_all(&tmp_dir.join(".claude"));
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(tmp_dir.join(".claude"));
     }
 
     #[test]
@@ -1755,17 +1724,13 @@ mod tests {
         )
         .unwrap();
 
-        let _lock = HOME_LOCK.lock().unwrap();
-        let orig_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &tmp_dir);
+        let _guard = HomeGuard::set(&tmp_dir);
 
         let msg = read_last_assistant_message("/tmp/ws-project", uuid);
         assert_eq!(msg, Some("hello world foo".to_string()));
 
-        if let Some(home) = orig_home {
-            std::env::set_var("HOME", home);
-        }
-        let _ = std::fs::remove_dir_all(&tmp_dir.join(".claude"));
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(tmp_dir.join(".claude"));
     }
 
     #[test]
@@ -1788,17 +1753,13 @@ mod tests {
         )
         .unwrap();
 
-        let _lock = HOME_LOCK.lock().unwrap();
-        let orig_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &tmp_dir);
+        let _guard = HomeGuard::set(&tmp_dir);
 
         let msg = read_last_assistant_message("/tmp/invalid-project", uuid);
         assert_eq!(msg, Some("valid line".to_string()));
 
-        if let Some(home) = orig_home {
-            std::env::set_var("HOME", home);
-        }
-        let _ = std::fs::remove_dir_all(&tmp_dir.join(".claude"));
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(tmp_dir.join(".claude"));
     }
 
     #[test]
@@ -1817,17 +1778,13 @@ mod tests {
         // Empty content array — no text items
         writeln!(f, r#"{{"type":"assistant","message":{{"content":[]}}}}"#).unwrap();
 
-        let _lock = HOME_LOCK.lock().unwrap();
-        let orig_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &tmp_dir);
+        let _guard = HomeGuard::set(&tmp_dir);
 
         let msg = read_last_assistant_message("/tmp/emptycontent-project", uuid);
         assert_eq!(msg, None);
 
-        if let Some(home) = orig_home {
-            std::env::set_var("HOME", home);
-        }
-        let _ = std::fs::remove_dir_all(&tmp_dir.join(".claude"));
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(tmp_dir.join(".claude"));
     }
 
     // ── update_session_stats (HOME wrapper) tests ──────────────────
@@ -2124,8 +2081,10 @@ mod tests {
         ).unwrap();
         drop(f);
 
-        let mut stats = GlobalStats::default();
-        stats.date = today.clone();
+        let mut stats = crate::logs::GlobalStats {
+            date: today.clone(),
+            ..Default::default()
+        };
         update_global_stats_inner(&mut stats, &today, Some(tmp.path()));
 
         assert_eq!(stats.tokens_in, 3000);
@@ -2152,8 +2111,10 @@ mod tests {
         ).unwrap();
         drop(f);
 
-        let mut stats = GlobalStats::default();
-        stats.date = today.clone();
+        let mut stats = crate::logs::GlobalStats {
+            date: today.clone(),
+            ..Default::default()
+        };
         update_global_stats_inner(&mut stats, &today, Some(tmp.path()));
         assert_eq!(stats.tokens_in, 100);
 
@@ -2193,8 +2154,10 @@ mod tests {
         ).unwrap();
         drop(f);
 
-        let mut stats = GlobalStats::default();
-        stats.date = today.clone();
+        let mut stats = crate::logs::GlobalStats {
+            date: today.clone(),
+            ..Default::default()
+        };
         update_global_stats_inner(&mut stats, &today, Some(tmp.path()));
 
         assert_eq!(stats.tokens_in, 100, "should only count today's entries");
@@ -2203,10 +2166,12 @@ mod tests {
 
     #[test]
     fn update_global_stats_resets_on_date_change() {
-        let mut stats = GlobalStats::default();
-        stats.tokens_in = 5000;
-        stats.tokens_out = 1000;
-        stats.date = "2020-01-01".to_string();
+        let mut stats = crate::logs::GlobalStats {
+            tokens_in: 5000,
+            tokens_out: 1000,
+            date: "2020-01-01".to_string(),
+            ..Default::default()
+        };
         stats.file_offsets.insert(PathBuf::from("/fake"), 999);
 
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -2275,8 +2240,10 @@ mod tests {
         ).unwrap();
         drop(f);
 
-        let mut stats = GlobalStats::default();
-        stats.date = today.clone();
+        let mut stats = crate::logs::GlobalStats {
+            date: today.clone(),
+            ..Default::default()
+        };
         update_global_stats_inner(&mut stats, &today, Some(tmp.path()));
 
         assert_eq!(
@@ -2330,8 +2297,10 @@ mod tests {
         .unwrap();
         drop(f);
 
-        let mut stats = GlobalStats::default();
-        stats.date = today.clone();
+        let mut stats = crate::logs::GlobalStats {
+            date: today.clone(),
+            ..Default::default()
+        };
         update_global_stats_inner(&mut stats, &today, Some(tmp.path()));
 
         assert_eq!(stats.codex_tokens_in, 140);
@@ -2493,8 +2462,10 @@ mod tests {
         );
         std::fs::write(&jsonl_path, format!("{line}\n")).unwrap();
 
-        let mut stats = GlobalStats::default();
-        stats.date = today.clone();
+        let mut stats = crate::logs::GlobalStats {
+            date: today.clone(),
+            ..Default::default()
+        };
         update_global_stats_inner(&mut stats, &today, Some(dir.path()));
 
         assert_eq!(stats.tokens_in, 500);
@@ -2516,8 +2487,10 @@ mod tests {
         );
         std::fs::write(&jsonl_path, format!("{line}\n")).unwrap();
 
-        let mut stats = GlobalStats::default();
-        stats.date = today.clone();
+        let mut stats = crate::logs::GlobalStats {
+            date: today.clone(),
+            ..Default::default()
+        };
         update_global_stats_inner(&mut stats, &today, Some(dir.path()));
         assert_eq!(stats.tokens_in, 100);
 
@@ -2546,8 +2519,10 @@ mod tests {
         // Write a .txt file (should be ignored)
         std::fs::write(subdir.join("notes.txt"), "not a jsonl").unwrap();
 
-        let mut stats = GlobalStats::default();
-        stats.date = today.clone();
+        let mut stats = crate::logs::GlobalStats {
+            date: today.clone(),
+            ..Default::default()
+        };
         update_global_stats_inner(&mut stats, &today, Some(dir.path()));
         assert_eq!(stats.tokens_in, 0, "should skip non-jsonl files");
     }
@@ -2562,8 +2537,10 @@ mod tests {
         let line = r#"{"type":"assistant","timestamp":"1999-01-01T12:00:00Z","message":{"usage":{"input_tokens":100,"output_tokens":50},"content":[]}}"#;
         std::fs::write(subdir.join("old.jsonl"), format!("{line}\n")).unwrap();
 
-        let mut stats = GlobalStats::default();
-        stats.date = today.clone();
+        let mut stats = crate::logs::GlobalStats {
+            date: today.clone(),
+            ..Default::default()
+        };
         update_global_stats_inner(&mut stats, &today, Some(dir.path()));
         assert_eq!(stats.tokens_in, 0, "should skip lines from other dates");
     }
@@ -2692,12 +2669,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _guard = HomeGuard::set(dir.path());
 
-        let mut stats = GlobalStats::default();
-        stats.date = "1999-01-01".to_string(); // old date
-        stats.tokens_in = 500;
-        stats.tokens_out = 200;
-        stats.tokens_cache_read = 100;
-        stats.tokens_cache_write = 50;
+        let mut stats = crate::logs::GlobalStats {
+            date: "1999-01-01".to_string(),
+            tokens_in: 500,
+            tokens_out: 200,
+            tokens_cache_read: 100,
+            tokens_cache_write: 50,
+            ..Default::default()
+        };
 
         update_global_stats(&mut stats);
 
@@ -2730,8 +2709,10 @@ mod tests {
         );
         std::fs::write(subdir.join("s.jsonl"), format!("{line}\n")).unwrap();
 
-        let mut stats = GlobalStats::default();
-        stats.date = today.clone();
+        let mut stats = crate::logs::GlobalStats {
+            date: today.clone(),
+            ..Default::default()
+        };
         update_global_stats_inner(&mut stats, &today, Some(dir.path()));
         assert_eq!(
             stats.tokens_in, 0,
@@ -2889,8 +2870,10 @@ mod tests {
         );
         std::fs::write(subdir.join("log.jsonl"), format!("{line}\n")).unwrap();
 
-        let mut stats = GlobalStats::default();
-        stats.date = today.clone();
+        let mut stats = crate::logs::GlobalStats {
+            date: today.clone(),
+            ..Default::default()
+        };
         update_global_stats_inner(&mut stats, &today, Some(dir.path()));
         assert_eq!(stats.tokens_in, 50);
 
@@ -2911,8 +2894,10 @@ mod tests {
         // Short lines (<10 chars) should be skipped
         std::fs::write(subdir.join("log.jsonl"), "short\n{}\n\n").unwrap();
 
-        let mut stats = GlobalStats::default();
-        stats.date = today.clone();
+        let mut stats = crate::logs::GlobalStats {
+            date: today.clone(),
+            ..Default::default()
+        };
         update_global_stats_inner(&mut stats, &today, Some(dir.path()));
         assert_eq!(stats.tokens_in, 0, "short lines should not parse");
     }
@@ -2932,8 +2917,10 @@ mod tests {
             std::os::unix::fs::symlink("/nonexistent/path", subdir.join("bad.jsonl")).unwrap();
         }
 
-        let mut stats = GlobalStats::default();
-        stats.date = today.clone();
+        let mut stats = crate::logs::GlobalStats {
+            date: today.clone(),
+            ..Default::default()
+        };
         // Should not panic — the broken symlink triggers Err on File::open
         update_global_stats_inner(&mut stats, &today, Some(dir.path()));
         assert_eq!(stats.tokens_in, 0);
@@ -3147,9 +3134,7 @@ mod tests {
     fn stats_queue_operation_remove_saturates_at_zero() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log.jsonl");
-        let lines = [
-            r#"{"type":"queue-operation","operation":"remove","taskId":"x"}"#,
-        ];
+        let lines = [r#"{"type":"queue-operation","operation":"remove","taskId":"x"}"#];
         std::fs::write(&path, lines.join("\n") + "\n").unwrap();
 
         let mut stats = SessionStats::default();
@@ -3199,7 +3184,10 @@ mod tests {
                 ]
             }
         });
-        assert_eq!(extract_assistant_message_text(&v), Some("Hello World".to_string()));
+        assert_eq!(
+            extract_assistant_message_text(&v),
+            Some("Hello World".to_string())
+        );
     }
 
     #[test]
@@ -3271,8 +3259,10 @@ mod tests {
         );
         std::fs::write(&path, format!("{line1}\n")).unwrap();
 
-        let mut stats = GlobalStats::default();
-        stats.date = today.clone();
+        let mut stats = crate::logs::GlobalStats {
+            date: today.clone(),
+            ..Default::default()
+        };
         let pb = std::path::PathBuf::from(&path);
         process_claude_global_file(&pb, &mut stats, &today);
         assert_eq!(stats.tokens_in, 100);
@@ -3281,7 +3271,10 @@ mod tests {
 
         // Append a second line
         use std::io::Write;
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         let line2 = format!(
             r#"{{"type":"assistant","timestamp":"{today}T11:00:00Z","message":{{"usage":{{"input_tokens":200,"output_tokens":100,"cache_read_input_tokens":20,"cache_creation_input_tokens":10}},"content":[]}}}}"#
         );
@@ -3305,8 +3298,10 @@ mod tests {
         );
         std::fs::write(&path, format!("{lines}\n")).unwrap();
 
-        let mut stats = GlobalStats::default();
-        stats.date = today.clone();
+        let mut stats = crate::logs::GlobalStats {
+            date: today.clone(),
+            ..Default::default()
+        };
         process_claude_global_file(&std::path::PathBuf::from(&path), &mut stats, &today);
         assert_eq!(stats.tokens_in, 0, "non-assistant lines should be skipped");
     }
@@ -3321,8 +3316,10 @@ mod tests {
         let line = r#"{"type":"assistant","timestamp":"1999-01-01T10:00:00Z","message":{"usage":{"input_tokens":500,"output_tokens":500},"content":[]}}"#;
         std::fs::write(&path, format!("{line}\n")).unwrap();
 
-        let mut stats = GlobalStats::default();
-        stats.date = today.clone();
+        let mut stats = crate::logs::GlobalStats {
+            date: today.clone(),
+            ..Default::default()
+        };
         process_claude_global_file(&std::path::PathBuf::from(&path), &mut stats, &today);
         assert_eq!(stats.tokens_in, 0, "other dates should be skipped");
     }
@@ -3340,8 +3337,10 @@ mod tests {
         );
         std::fs::write(&path, format!("{line}\n")).unwrap();
 
-        let mut stats = GlobalStats::default();
-        stats.date = today.clone();
+        let mut stats = crate::logs::GlobalStats {
+            date: today.clone(),
+            ..Default::default()
+        };
         process_codex_global_file(&std::path::PathBuf::from(&path), &mut stats, &today);
         assert_eq!(stats.codex_tokens_in, 100);
         assert_eq!(stats.codex_tokens_out, 50);
@@ -3359,8 +3358,10 @@ mod tests {
         );
         std::fs::write(&path, format!("{line}\n")).unwrap();
 
-        let mut stats = GlobalStats::default();
-        stats.date = today.clone();
+        let mut stats = crate::logs::GlobalStats {
+            date: today.clone(),
+            ..Default::default()
+        };
         process_codex_global_file(&std::path::PathBuf::from(&path), &mut stats, &today);
         assert_eq!(stats.codex_tokens_in, 0, "non-event_msg should be skipped");
     }
@@ -3377,8 +3378,10 @@ mod tests {
         );
         std::fs::write(&path, format!("{line}\n")).unwrap();
 
-        let mut stats = GlobalStats::default();
-        stats.date = today.clone();
+        let mut stats = crate::logs::GlobalStats {
+            date: today.clone(),
+            ..Default::default()
+        };
         process_codex_global_file(&std::path::PathBuf::from(&path), &mut stats, &today);
         assert_eq!(stats.codex_tokens_in, 0);
     }
@@ -3395,10 +3398,15 @@ mod tests {
         );
         std::fs::write(&path, format!("{line}\n")).unwrap();
 
-        let mut stats = GlobalStats::default();
-        stats.date = today.clone();
+        let mut stats = crate::logs::GlobalStats {
+            date: today.clone(),
+            ..Default::default()
+        };
         process_codex_global_file(&std::path::PathBuf::from(&path), &mut stats, &today);
-        assert_eq!(stats.codex_tokens_in, 0, "non-token_count payload should be skipped");
+        assert_eq!(
+            stats.codex_tokens_in, 0,
+            "non-token_count payload should be skipped"
+        );
     }
 
     #[test]
@@ -3408,15 +3416,18 @@ mod tests {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
         // First line with yesterday's timestamp — should be tracked for delta but not added to today's tokens
-        let line = format!(
-            r#"{{"type":"event_msg","timestamp":"1999-01-01T10:00:00Z","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":100,"output_tokens":50,"cached_input_tokens":0,"total_tokens":150}}}}}}}}"#
-        );
+        let line = r#"{"type":"event_msg","timestamp":"1999-01-01T10:00:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":50,"cached_input_tokens":0,"total_tokens":150}}}}"#.to_string();
         std::fs::write(&path, format!("{line}\n")).unwrap();
 
-        let mut stats = GlobalStats::default();
-        stats.date = today.clone();
+        let mut stats = crate::logs::GlobalStats {
+            date: today.clone(),
+            ..Default::default()
+        };
         process_codex_global_file(&std::path::PathBuf::from(&path), &mut stats, &today);
-        assert_eq!(stats.codex_tokens_in, 0, "yesterday's tokens should not count for today");
+        assert_eq!(
+            stats.codex_tokens_in, 0,
+            "yesterday's tokens should not count for today"
+        );
     }
 
     // ── update_global_stats date change ──
@@ -3427,12 +3438,14 @@ mod tests {
         let _guard = HomeGuard::set(dir.path());
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
-        let mut stats = GlobalStats::default();
-        stats.date = "1999-01-01".to_string();
-        stats.tokens_in = 999;
-        stats.tokens_out = 999;
-        stats.claude_tokens_in = 500;
-        stats.codex_tokens_in = 499;
+        let mut stats = crate::logs::GlobalStats {
+            date: "1999-01-01".to_string(),
+            tokens_in: 999,
+            tokens_out: 999,
+            claude_tokens_in: 500,
+            codex_tokens_in: 499,
+            ..Default::default()
+        };
         stats.codex_file_states.insert(
             std::path::PathBuf::from("/old/file"),
             CodexFileState {
@@ -3443,7 +3456,9 @@ mod tests {
                 last_cached_input_tokens: 0,
             },
         );
-        stats.file_offsets.insert(std::path::PathBuf::from("/old/claude"), 200);
+        stats
+            .file_offsets
+            .insert(std::path::PathBuf::from("/old/claude"), 200);
 
         // Call with the real today — should reset everything
         update_global_stats(&mut stats);
