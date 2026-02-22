@@ -111,6 +111,7 @@ Single-binary Rust TUI (ratatui + crossterm + tokio):
 - **tmux control mode octal escapes**: `decode_octal_escapes()` must decode into a `Vec<u8>` byte buffer, then `String::from_utf8_lossy()`. Each `\NNN` is one raw byte, not one Unicode codepoint — multi-byte UTF-8 characters appear as multiple consecutive escapes (e.g. `\342\227\217` → `●`). Decoding each octal as `char::from_u32()` produces garbled `â` characters.
 - **tmux control mode argument quoting**: Control mode commands are parsed like shell command lines — spaces delimit arguments. `send-keys -t sess -l hello world` splits into two key arguments. Must wrap text in double quotes (`"hello world"`) and escape `\` and `"` inside. Applies to both `send_keys` (key names like `" "` for space) and `send_keys_literal` (arbitrary text).
 - **tmux control mode FIFO ordering**: stdin writes and pending-deque pushes must be under the same lock (`SenderState` bundles both) to guarantee deque order matches pipe order. Fire-and-forget commands must also go through this lock (made async) — spawning a background task to write later breaks ordering.
+- **`cargo install --git` with fuzz targets**: When the repo contains `fuzz/Cargo.toml` (e.g. `hydra-fuzz`), `cargo install --git <URL>` fails with "multiple packages with binaries found". Must pass the crate name as a positional argument: `cargo install --git <URL> hydra --locked`. The `--package` flag is NOT valid with `--git` — use the positional form instead.
 
 ## Common Changes
 

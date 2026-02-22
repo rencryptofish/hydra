@@ -105,7 +105,7 @@ async fn cmd_ls(project_id: &str) -> Result<()> {
 async fn cmd_update() -> Result<()> {
     println!("Updating hydra from latest commit...");
     let status = std::process::Command::new("cargo")
-        .args(["install", "--git", GITHUB_REPO_URL, "--package", "hydra", "--locked"])
+        .args(["install", "--git", GITHUB_REPO_URL, "hydra", "--locked"])
         .env("CARGO_NET_GIT_FETCH_WITH_CLI", "true")
         .status()
         .context("Failed to run cargo — is cargo on PATH?")?;
