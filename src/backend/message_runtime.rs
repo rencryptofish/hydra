@@ -93,6 +93,9 @@ impl MessageRuntime {
             })
             .collect();
 
+        for tmux_name in &result.clear_last_messages {
+            self.last_messages.remove(tmux_name);
+        }
         self.last_messages.extend(result.last_messages);
         self.session_stats = result.session_stats;
         self.global_stats = result.global_stats;

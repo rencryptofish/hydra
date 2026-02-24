@@ -40,6 +40,12 @@ pub trait AgentProvider: Send + Sync {
         claimed_paths: &HashSet<String>,
     ) -> Option<String>;
 
+    /// Whether to periodically re-resolve a cached log path.
+    /// Needed for providers whose backing log file can switch during runtime.
+    fn refresh_cached_log_path(&self) -> bool {
+        false
+    }
+
     fn update_from_log(
         &self,
         log_id: &str,

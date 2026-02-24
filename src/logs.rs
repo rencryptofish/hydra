@@ -1861,6 +1861,8 @@ const GEMINI_CACHE_READ_USD_PER_MTOK: f64 = 0.3125;
 
 /// Parse lsof output to find a `.gemini/tmp/` session JSON path.
 pub fn parse_gemini_session_from_lsof(output: &str) -> Option<PathBuf> {
+    let mut best: Option<(PathBuf, Option<std::time::SystemTime>, String)> = None;
+
     for line in output.lines() {
         if let Some(idx) = line.find(".gemini/tmp/") {
             let before = &line[..idx];
@@ -1872,16 +1874,34 @@ pub fn parse_gemini_session_from_lsof(output: &str) -> Option<PathBuf> {
             let path_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
             let candidate = &rest[..path_end];
             if candidate.ends_with(".json") && candidate.contains("/chats/session-") {
-                return Some(PathBuf::from(candidate));
+                let path = PathBuf::from(candidate);
+                let candidate_key = candidate.to_string();
+                let modified = path.metadata().ok().and_then(|m| m.modified().ok());
+
+                let should_replace =
+                    best.as_ref().is_none_or(|(_, best_modified, best_key)| {
+                        match (modified, *best_modified) {
+                            (Some(current), Some(existing)) => current > existing,
+                            (Some(_), None) => true,
+                            (None, Some(_)) => false,
+                            (None, None) => candidate_key > *best_key,
+                        }
+                    });
+
+                if should_replace {
+                    best = Some((path, modified, candidate_key));
+                }
             }
         }
     }
-    None
+    best.map(|(path, _, _)| path)
 }
 
 /// Find the Gemini chats directory for the given CWD.
 /// Reads ~/.gemini/projects.json to map cwd → project name, then looks
 /// in ~/.gemini/tmp/<project>/chats/.
+#[cfg(test)]
+#[allow(dead_code)]
 fn gemini_chats_dir(cwd: &str) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     let projects_path = PathBuf::from(&home).join(".gemini").join("projects.json");
@@ -1901,11 +1921,53 @@ fn gemini_chats_dir(cwd: &str) -> Option<PathBuf> {
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
+async fn get_process_start_time(pid: u32) -> Option<std::time::SystemTime> {
+    let output = tokio::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output()
+        .await
+        .ok()?;
+    let lstart_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if lstart_str.is_empty() {
+        return None;
+    }
+    // Format: "Tue Feb 24 12:25:04 2026"
+    // Note: timezone is local. chrono::NaiveDateTime::parse_from_str
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(&lstart_str, "%a %b %e %H:%M:%S %Y") {
+        let local_dt = ndt.and_local_timezone(chrono::Local).single()?;
+        Some(std::time::SystemTime::from(local_dt))
+    } else {
+        None
+    }
+}
+
 /// Find the most recently modified Gemini session file in the chats dir,
 /// skipping files that are already claimed by other tmux Gemini sessions.
+/// Also ignores files modified before the tmux pane was created (to prevent
+/// new sessions from stealing old session files).
+#[cfg(test)]
+fn parse_gemini_session_start_from_filename(
+    path: &std::path::Path,
+) -> Option<std::time::SystemTime> {
+    let fname = path.file_name()?.to_str()?;
+    let rest = fname.strip_prefix("session-")?;
+    // Expected: session-YYYY-MM-DDTHH-MM-<id>.json
+    if rest.len() < 16 {
+        return None;
+    }
+    let ts = &rest[..16];
+    let ndt = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H-%M").ok()?;
+    let dt = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc);
+    Some(std::time::SystemTime::from(dt))
+}
+
+#[cfg(test)]
 fn find_latest_gemini_session(
     chats_dir: &std::path::Path,
     claimed_paths: &HashSet<String>,
+    pane_start_time: Option<std::time::SystemTime>,
 ) -> Option<PathBuf> {
     let entries = std::fs::read_dir(chats_dir).ok()?;
     let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
@@ -1924,6 +1986,25 @@ fn find_latest_gemini_session(
         }
         if let Ok(meta) = path.metadata() {
             if let Ok(modified) = meta.modified() {
+                // Ignore files modified before the pane was created
+                if let Some(start_time) = pane_start_time {
+                    // Give a 5-second grace period for clock skew/startup delays
+                    let threshold = start_time
+                        .checked_sub(std::time::Duration::from_secs(5))
+                        .unwrap_or(start_time);
+                    if modified < threshold {
+                        continue;
+                    }
+
+                    // Ignore session files that started before the pane existed.
+                    // This avoids binding new tmux sessions to unrelated older chats.
+                    if let Some(file_start_time) = parse_gemini_session_start_from_filename(&path) {
+                        if file_start_time < threshold {
+                            continue;
+                        }
+                    }
+                }
+
                 if best.as_ref().is_none_or(|(_, t)| modified > *t) {
                     best = Some((path, modified));
                 }
@@ -1934,12 +2015,12 @@ fn find_latest_gemini_session(
 }
 
 /// Resolve the Gemini session JSON file path for a tmux session.
-/// First tries lsof to find an open session file, then falls back to
-/// the most recently modified session file in the project's chats dir.
+/// Strict mode: only accept paths discovered from the pane's live process tree.
+/// If no matching open session file is found, return None.
 pub async fn resolve_gemini_session_path(
     tmux_name: &str,
-    cwd: &str,
-    claimed_paths: &HashSet<String>,
+    _cwd: &str,
+    _claimed_paths: &HashSet<String>,
 ) -> Option<String> {
     let pid = get_pane_pid(tmux_name).await?;
     let all_pids = collect_descendant_pids(pid).await;
@@ -1959,10 +2040,7 @@ pub async fn resolve_gemini_session_path(
         }
     }
 
-    // Fallback: find the most recently modified session file
-    let chats_dir = gemini_chats_dir(cwd)?;
-    let path = find_latest_gemini_session(&chats_dir, claimed_paths)?;
-    Some(path.to_string_lossy().to_string())
+    None
 }
 
 /// Parse a Gemini session JSON file and return conversation entries + stats + last message.
@@ -5893,6 +5971,53 @@ mod tests {
     }
 
     #[test]
+    fn parse_gemini_lsof_prefers_latest_session_when_multiple_open() {
+        let output = concat!(
+            "node 12345 user 25r REG 1,18 50000 ",
+            "/Users/test/.gemini/tmp/hydra/chats/session-2026-02-24T16-20-aaa.json\n",
+            "node 12345 user 26r REG 1,18 50000 ",
+            "/Users/test/.gemini/tmp/hydra/chats/session-2026-02-24T16-25-bbb.json\n",
+        );
+
+        let result = parse_gemini_session_from_lsof(output).unwrap();
+        assert!(result
+            .to_string_lossy()
+            .ends_with("session-2026-02-24T16-25-bbb.json"));
+    }
+
+    #[test]
+    fn parse_gemini_session_start_from_filename_parses_utc_time() {
+        let path = std::path::Path::new("session-2026-02-24T19-04-4977da25.json");
+        let parsed = parse_gemini_session_start_from_filename(path).unwrap();
+        let expected = chrono::NaiveDateTime::parse_from_str("2026-02-24T19-04", "%Y-%m-%dT%H-%M")
+            .unwrap()
+            .and_utc();
+        assert_eq!(parsed, std::time::SystemTime::from(expected));
+    }
+
+    #[test]
+    fn find_latest_gemini_session_skips_files_started_before_pane_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let chats_dir = dir.path().join("chats");
+        std::fs::create_dir_all(&chats_dir).unwrap();
+
+        let now = chrono::Utc::now();
+        let old_ts = (now - chrono::Duration::minutes(10))
+            .format("%Y-%m-%dT%H-%M")
+            .to_string();
+        let old = chats_dir.join(format!("session-{old_ts}-old.json"));
+        std::fs::write(&old, "{}").unwrap();
+
+        let claimed = HashSet::new();
+        let resolved = find_latest_gemini_session(
+            &chats_dir,
+            &claimed,
+            Some(std::time::SystemTime::from(now)),
+        );
+        assert!(resolved.is_none());
+    }
+
+    #[test]
     fn find_latest_gemini_session_skips_claimed_paths() {
         let dir = tempfile::tempdir().unwrap();
         let chats_dir = dir.path().join("chats");
@@ -5906,7 +6031,7 @@ mod tests {
         let mut claimed = HashSet::new();
         claimed.insert(second.to_string_lossy().to_string());
 
-        let resolved = find_latest_gemini_session(&chats_dir, &claimed).unwrap();
+        let resolved = find_latest_gemini_session(&chats_dir, &claimed, None).unwrap();
         assert_eq!(resolved, first);
     }
 
@@ -5925,7 +6050,7 @@ mod tests {
         claimed.insert(first.to_string_lossy().to_string());
         claimed.insert(second.to_string_lossy().to_string());
 
-        let resolved = find_latest_gemini_session(&chats_dir, &claimed);
+        let resolved = find_latest_gemini_session(&chats_dir, &claimed, None);
         assert!(resolved.is_none());
     }
 

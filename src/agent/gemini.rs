@@ -27,6 +27,10 @@ impl AgentProvider for GeminiProvider {
         crate::logs::resolve_gemini_session_path(tmux_name, cwd, claimed_paths).await
     }
 
+    fn refresh_cached_log_path(&self) -> bool {
+        true
+    }
+
     fn update_from_log(
         &self,
         log_id: &str,
@@ -43,7 +47,7 @@ impl AgentProvider for GeminiProvider {
             entries,
             new_offset,
             last_message,
-            replace_conversation: false,
+            replace_conversation: new_offset < offset,
         }
     }
 

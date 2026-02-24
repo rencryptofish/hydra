@@ -38,6 +38,7 @@ pub(crate) struct MessageRefreshResult {
     pub(crate) log_uuids: HashMap<String, String>,
     pub(crate) uuid_retry_cooldowns: HashMap<String, u8>,
     pub(crate) last_messages: HashMap<String, String>,
+    pub(crate) clear_last_messages: HashSet<String>,
     pub(crate) session_stats: HashMap<String, SessionStats>,
     pub(crate) global_stats: GlobalStats,
     pub(crate) diff_files: Vec<DiffFile>,
@@ -257,43 +258,75 @@ async fn compute_message_refresh(
     const UUID_RETRY_COOLDOWN_CYCLES: u8 = 6;
 
     let mut last_messages = HashMap::new();
+    let mut clear_last_messages = HashSet::new();
     let mut conversations: HashMap<String, Vec<ConversationEntry>> = HashMap::new();
     let mut new_conversation_offsets: HashMap<String, u64> = HashMap::new();
     let mut conversation_replace = HashSet::new();
 
     for (tmux_name, agent_type) in &sessions {
         let provider = provider_for(agent_type);
+        let cached_log_id = log_uuids.get(tmux_name).cloned();
+        let has_cached_log = cached_log_id.is_some();
+        let mut log_path_changed = false;
+        let mut log_path_cleared = false;
 
-        // Try to resolve log path if not cached.
-        if !log_uuids.contains_key(tmux_name) {
-            let should_attempt_resolve = match uuid_retry_cooldowns.get_mut(tmux_name) {
-                Some(cooldown) if *cooldown > 0 => {
-                    *cooldown -= 1;
-                    false
+        // Resolve log path for uncached sessions, and periodically re-resolve
+        // providers whose log file can switch while the session stays alive.
+        if !has_cached_log || provider.refresh_cached_log_path() {
+            let should_attempt_resolve = if has_cached_log {
+                true
+            } else {
+                match uuid_retry_cooldowns.get_mut(tmux_name) {
+                    Some(cooldown) if *cooldown > 0 => {
+                        *cooldown -= 1;
+                        false
+                    }
+                    _ => true,
                 }
-                _ => true,
             };
 
             if should_attempt_resolve {
-                let claimed_paths: HashSet<String> = log_uuids.values().cloned().collect();
+                let claimed_paths: HashSet<String> = log_uuids
+                    .iter()
+                    .filter(|(session, _)| *session != tmux_name)
+                    .map(|(_, path)| path.clone())
+                    .collect();
                 let resolved = provider
                     .resolve_log_path(tmux_name, &cwd, &claimed_paths)
                     .await;
 
                 if let Some(id) = resolved {
+                    if cached_log_id.as_deref() != Some(id.as_str()) {
+                        log_path_changed = has_cached_log;
+                    }
                     log_uuids.insert(tmux_name.clone(), id);
                     uuid_retry_cooldowns.remove(tmux_name);
-                } else {
+                } else if has_cached_log && provider.refresh_cached_log_path() {
+                    // If a refresh-capable provider can no longer resolve the
+                    // log path, drop stale bindings instead of showing unrelated logs.
+                    log_uuids.remove(tmux_name);
+                    uuid_retry_cooldowns.remove(tmux_name);
+                    session_stats.remove(tmux_name);
+                    conversation_offsets.remove(tmux_name);
+                    log_path_cleared = true;
+                } else if !has_cached_log {
                     uuid_retry_cooldowns.insert(tmux_name.clone(), UUID_RETRY_COOLDOWN_CYCLES);
                 }
             }
+        }
+
+        if log_path_changed || log_path_cleared {
+            // Switching log files means append-only offsets no longer apply.
+            conversation_replace.insert(tmux_name.clone());
+            clear_last_messages.insert(tmux_name.clone());
         }
 
         // Read last message, update stats, and parse conversation.
         if let Some(log_id) = log_uuids.get(tmux_name).cloned() {
             uuid_retry_cooldowns.remove(tmux_name);
             let stats = session_stats.entry(tmux_name.clone()).or_default();
-            let conv_offset = conversation_offsets.remove(tmux_name).unwrap_or(0);
+            let previous_offset = conversation_offsets.remove(tmux_name).unwrap_or(0);
+            let conv_offset = if log_path_changed { 0 } else { previous_offset };
             let update = provider.update_from_log(&log_id, &cwd, conv_offset, stats);
 
             if let Some(msg) = update.last_message {
@@ -319,6 +352,7 @@ async fn compute_message_refresh(
         log_uuids,
         uuid_retry_cooldowns,
         last_messages,
+        clear_last_messages,
         session_stats,
         global_stats,
         diff_files,
