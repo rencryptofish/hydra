@@ -16,6 +16,10 @@ const CMD_TIMEOUT: Duration = Duration::from_secs(5);
 /// Broadcast channel capacity for tmux notifications.
 const NOTIFICATION_CHANNEL_CAPACITY: usize = 256;
 
+/// Small pause between literal text injection and Enter key submission.
+/// Some TUIs can miss Enter when both arrive in the same burst.
+const COMPOSE_SUBMIT_ENTER_DELAY: Duration = Duration::from_millis(45);
+
 // ── Notification types ─────────────────────────────────────────────
 
 /// Async notifications from tmux control mode.
@@ -152,6 +156,19 @@ fn quote_tmux_arg(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+fn send_keys_command(tmux_name: &str, key: &str) -> String {
+    format!("send-keys -t {tmux_name} {key}")
+}
+
+fn send_keys_literal_command(tmux_name: &str, text: &str) -> String {
+    let quoted = quote_tmux_arg(text);
+    format!("send-keys -t {tmux_name} -l {quoted}")
+}
+
+fn send_enter_command(tmux_name: &str) -> String {
+    send_keys_command(tmux_name, "Enter")
 }
 
 // ── Connection manager ──────────────────────────────────────────────
@@ -712,26 +729,24 @@ impl SessionManager for ControlModeSessionManager {
         // Key names (Enter, Escape, Space, etc.) must NOT be quoted —
         // quoting makes tmux treat them as literal text.
         self.conn
-            .send_command_fire_and_forget(&format!("send-keys -t {tmux_name} {key}"))
+            .send_command_fire_and_forget(&send_keys_command(tmux_name, key))
             .await;
         Ok(())
     }
 
     async fn send_keys_literal(&self, tmux_name: &str, text: &str) -> Result<()> {
-        let quoted = quote_tmux_arg(text);
         self.conn
-            .send_command_fire_and_forget(&format!("send-keys -t {tmux_name} -l {quoted}"))
+            .send_command_fire_and_forget(&send_keys_literal_command(tmux_name, text))
             .await;
         Ok(())
     }
 
     async fn send_text_enter(&self, tmux_name: &str, text: &str) -> Result<()> {
-        let quoted = quote_tmux_arg(text);
         // Send literal text, then Enter. Both are awaited so we can surface
         // failures instead of silently dropping user messages.
         let resp = self
             .conn
-            .send_command(&format!("send-keys -t {tmux_name} -l {quoted}"))
+            .send_command(&send_keys_literal_command(tmux_name, text))
             .await
             .context("Failed to send literal text to tmux")?;
         if !resp.success {
@@ -741,9 +756,11 @@ impl SessionManager for ControlModeSessionManager {
             );
         }
 
+        tokio::time::sleep(COMPOSE_SUBMIT_ENTER_DELAY).await;
+
         let resp = self
             .conn
-            .send_command(&format!("send-keys -t {tmux_name} Enter"))
+            .send_command(&send_enter_command(tmux_name))
             .await
             .context("Failed to send Enter to tmux")?;
         if !resp.success {
@@ -910,6 +927,31 @@ mod tests {
     #[test]
     fn quote_empty_string() {
         assert_eq!(quote_tmux_arg(""), "''");
+    }
+
+    // ── send command builders ────────────────────────────────────────
+
+    #[test]
+    fn send_keys_command_preserves_enter() {
+        assert_eq!(
+            send_keys_command("hydra-test-alpha", "Enter"),
+            "send-keys -t hydra-test-alpha Enter"
+        );
+    }
+
+    #[test]
+    fn send_enter_command_uses_enter_not_ctrl_m() {
+        let cmd = send_enter_command("hydra-test-alpha");
+        assert_eq!(cmd, "send-keys -t hydra-test-alpha Enter");
+        assert!(!cmd.contains("C-m"));
+    }
+
+    #[test]
+    fn send_keys_literal_command_quotes_text() {
+        assert_eq!(
+            send_keys_literal_command("hydra-test-alpha", "it's fine"),
+            "send-keys -t hydra-test-alpha -l 'it'\\''s fine'"
+        );
     }
 
     // ── parse_control_line ──────────────────────────────────────────

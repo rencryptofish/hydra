@@ -12,6 +12,10 @@ const CMD_TIMEOUT: Duration = Duration::from_secs(2);
 /// Longer timeout for scrollback capture (can be large).
 const CMD_TIMEOUT_LONG: Duration = Duration::from_secs(5);
 
+/// Small pause between literal text injection and Enter key submission.
+/// Some TUIs can miss Enter when both arrive in the same burst.
+const COMPOSE_SUBMIT_ENTER_DELAY: Duration = Duration::from_millis(45);
+
 /// Run a Command with a timeout, returning its Output.
 /// On timeout or spawn failure, returns an anyhow error.
 pub async fn run_cmd_timeout(cmd: &mut Command) -> Result<std::process::Output> {
@@ -297,45 +301,6 @@ async fn batch_pane_status_impl() -> Option<HashMap<String, (bool, u64)>> {
     Some(result)
 }
 
-/// Legacy helper retained for integration tests that validate exited-session
-/// detection semantics.
-#[cfg(test)]
-#[allow(dead_code)]
-async fn batch_dead_panes() -> Option<HashSet<String>> {
-    let status_map = batch_pane_status_impl().await?;
-    Some(
-        status_map
-            .into_iter()
-            .filter_map(|(session, (is_dead, _))| is_dead.then_some(session))
-            .collect(),
-    )
-}
-
-/// Check if the pane in a tmux session has exited (requires remain-on-exit).
-/// Returns `true` when the session can't be queried (gone/dead) — a session
-/// we can't reach is effectively dead rather than silently "Idle".
-/// Note: Production code uses `batch_pane_status_impl()` instead; this is retained
-/// for integration tests that check individual sessions.
-#[cfg(test)]
-async fn is_pane_dead(tmux_name: &str) -> bool {
-    let output = run_cmd_timeout(Command::new("tmux").args([
-        "list-panes",
-        "-t",
-        tmux_name,
-        "-F",
-        "#{pane_dead}",
-    ]))
-    .await;
-
-    match output {
-        Ok(o) if o.status.success() => {
-            // Only treat as alive when we get a definitive "not dead" answer
-            String::from_utf8_lossy(&o.stdout).trim() != "0"
-        }
-        _ => true, // Can't reach session → treat as dead
-    }
-}
-
 /// Read the HYDRA_AGENT_TYPE env var from the tmux session.
 async fn get_agent_type(tmux_name: &str) -> Option<AgentType> {
     let output = run_cmd_timeout(Command::new("tmux").args([
@@ -492,8 +457,9 @@ pub async fn capture_pane_scrollback(tmux_name: &str) -> Result<String> {
 /// Fire-and-forget: spawns the subprocess and reaps it in the background.
 /// The exit code provides no actionable info (session-not-found is discovered on next tick).
 pub async fn send_keys(tmux_name: &str, key: &str) -> Result<()> {
+    let args = send_keys_args(tmux_name, key);
     let mut child = Command::new("tmux")
-        .args(["send-keys", "-t", tmux_name, key])
+        .args(&args)
         .spawn()
         .context("Failed to spawn tmux send-keys")?;
     tokio::spawn(async move {
@@ -505,8 +471,9 @@ pub async fn send_keys(tmux_name: &str, key: &str) -> Result<()> {
 /// Send literal text (including raw escape sequences) to a tmux session.
 /// Fire-and-forget: spawns the subprocess and reaps it in the background.
 pub async fn send_keys_literal(tmux_name: &str, text: &str) -> Result<()> {
+    let args = send_keys_literal_args(tmux_name, text);
     let mut child = Command::new("tmux")
-        .args(["send-keys", "-t", tmux_name, "-l", text])
+        .args(&args)
         .spawn()
         .context("Failed to spawn tmux send-keys -l")?;
     tokio::spawn(async move {
@@ -519,23 +486,48 @@ pub async fn send_keys_literal(tmux_name: &str, text: &str) -> Result<()> {
 /// Using two awaited subprocesses preserves ordering and ensures Enter is
 /// interpreted as a key (not literal text).
 pub async fn send_text_enter(tmux_name: &str, text: &str) -> Result<()> {
-    let status =
-        run_status_timeout(Command::new("tmux").args(["send-keys", "-t", tmux_name, "-l", text]))
-            .await
-            .context("Failed to send literal text to tmux")?;
+    let literal_args = send_keys_literal_args(tmux_name, text);
+    let status = run_status_timeout(Command::new("tmux").args(&literal_args))
+        .await
+        .context("Failed to send literal text to tmux")?;
     if !status.success() {
         bail!("tmux send-keys -l failed for '{tmux_name}'");
     }
 
-    let status =
-        run_status_timeout(Command::new("tmux").args(["send-keys", "-t", tmux_name, "Enter"]))
-            .await
-            .context("Failed to send Enter to tmux")?;
+    tokio::time::sleep(COMPOSE_SUBMIT_ENTER_DELAY).await;
+
+    let enter_args = send_enter_args(tmux_name);
+    let status = run_status_timeout(Command::new("tmux").args(&enter_args))
+        .await
+        .context("Failed to send Enter to tmux")?;
     if !status.success() {
         bail!("tmux send-keys Enter failed for '{tmux_name}'");
     }
 
     Ok(())
+}
+
+fn send_keys_args(tmux_name: &str, key: &str) -> [String; 4] {
+    [
+        "send-keys".to_string(),
+        "-t".to_string(),
+        tmux_name.to_string(),
+        key.to_string(),
+    ]
+}
+
+fn send_keys_literal_args(tmux_name: &str, text: &str) -> [String; 5] {
+    [
+        "send-keys".to_string(),
+        "-t".to_string(),
+        tmux_name.to_string(),
+        "-l".to_string(),
+        text.to_string(),
+    ]
+}
+
+fn send_enter_args(tmux_name: &str) -> [String; 4] {
+    send_keys_args(tmux_name, "Enter")
 }
 
 /// Map a crossterm KeyCode + KeyModifiers to a tmux key name.
@@ -833,6 +825,44 @@ mod tests {
         let mods = KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT;
         // Shift applied first (innermost), then Alt, then Ctrl (outermost)
         assert_eq!(apply_tmux_modifiers("F1", mods), "C-M-S-F1");
+    }
+
+    // ── send-keys argument builders ────────────────────────────────
+
+    #[test]
+    fn send_keys_args_preserves_enter() {
+        let args = send_keys_args("hydra-test-alpha", "Enter");
+        assert_eq!(args[3], "Enter");
+    }
+
+    #[test]
+    fn send_enter_args_uses_enter_not_ctrl_m() {
+        let args = send_enter_args("hydra-test-alpha");
+        assert_eq!(
+            args,
+            [
+                "send-keys".to_string(),
+                "-t".to_string(),
+                "hydra-test-alpha".to_string(),
+                "Enter".to_string()
+            ]
+        );
+        assert!(!args[3].contains("C-m"));
+    }
+
+    #[test]
+    fn send_keys_literal_args_include_l_flag() {
+        let args = send_keys_literal_args("hydra-test-alpha", "echo hello");
+        assert_eq!(
+            args,
+            [
+                "send-keys".to_string(),
+                "-t".to_string(),
+                "hydra-test-alpha".to_string(),
+                "-l".to_string(),
+                "echo hello".to_string()
+            ]
+        );
     }
 
     // ── TmuxSessionManager agent cache ───────────────────────────────
@@ -1165,75 +1195,6 @@ mod tests {
         let recorded = std::fs::read_to_string(&marker_path).unwrap_or_default();
         assert_eq!(recorded.trim(), "HYDRA_SEND_TEXT_ENTER");
         let _ = std::fs::remove_file(&marker_path);
-
-        cleanup_session(&name).await;
-    }
-
-    #[tokio::test]
-    async fn integration_is_pane_dead_live_session() {
-        let name = test_session_name();
-        let status = run_status_timeout(Command::new("tmux").args([
-            "new-session",
-            "-d",
-            "-s",
-            &name,
-            "-x",
-            "80",
-            "-y",
-            "24",
-            "sleep",
-            "30",
-        ]))
-        .await
-        .unwrap();
-        assert!(status.success());
-
-        let dead = is_pane_dead(&name).await;
-        assert!(!dead, "live session should not be dead");
-
-        cleanup_session(&name).await;
-    }
-
-    #[tokio::test]
-    async fn integration_is_pane_dead_nonexistent() {
-        let dead = is_pane_dead("hydra-test-nonexistent-xyz").await;
-        assert!(dead, "nonexistent session should be dead");
-    }
-
-    #[tokio::test]
-    async fn integration_is_pane_dead_exited_session() {
-        let name = test_session_name();
-        // Create session with remain-on-exit, running a command that exits immediately
-        let status = run_status_timeout(Command::new("tmux").args([
-            "new-session",
-            "-d",
-            "-s",
-            &name,
-            "-x",
-            "80",
-            "-y",
-            "24",
-            "true",
-        ]))
-        .await
-        .unwrap();
-        assert!(status.success());
-
-        // Set remain-on-exit so the pane stays
-        let _ = run_status_timeout(Command::new("tmux").args([
-            "set-option",
-            "-t",
-            &name,
-            "remain-on-exit",
-            "on",
-        ]))
-        .await;
-
-        // Wait for command to exit
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        let dead = is_pane_dead(&name).await;
-        assert!(dead, "exited session with remain-on-exit should be dead");
 
         cleanup_session(&name).await;
     }
