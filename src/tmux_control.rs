@@ -596,11 +596,7 @@ impl SessionManager for ControlModeSessionManager {
 
         // Wrap command to unset Claude Code env vars that leak from the tmux
         // global environment (tmux captures the parent process env on startup).
-        let wrapped_cmd = format!(
-            "unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS; \
-             unset $(env | grep -o '^CLAUDE_CODE_[^=]*') 2>/dev/null; exec {}",
-            cmd
-        );
+        let wrapped_cmd = crate::tmux::wrap_agent_command(cmd);
         let quoted_cmd = quote_tmux_arg(&wrapped_cmd);
 
         // Create the session

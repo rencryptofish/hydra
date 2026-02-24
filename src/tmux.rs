@@ -185,7 +185,7 @@ impl SessionManager for TmuxSessionManager {
                 let status = if dead {
                     SessionStatus::Exited
                 } else {
-                    // Default to Idle; App will upgrade to Running via content comparison
+                    // Default to Idle; Backend upgrades to Running via output/log activity.
                     SessionStatus::Idle
                 };
                 Session {
@@ -242,10 +242,6 @@ impl SessionManager for TmuxSessionManager {
 
     async fn send_keys_literal(&self, tmux_name: &str, text: &str) -> Result<()> {
         send_keys_literal(tmux_name, text).await
-    }
-
-    async fn send_text_enter(&self, tmux_name: &str, text: &str) -> Result<()> {
-        send_text_enter(tmux_name, text).await
     }
 
     async fn capture_pane_scrollback(&self, tmux_name: &str) -> Result<String> {
@@ -369,6 +365,22 @@ async fn get_agent_type(tmux_name: &str) -> Option<AgentType> {
     val.parse().ok()
 }
 
+/// Wrap an agent command to sanitize inherited env and normalize terminal type.
+///
+/// Some tmux servers can propagate `TERM=dumb` into new panes (for example
+/// when started from non-interactive control clients). Codex blocks startup in
+/// that case with an interactive confirmation prompt. Normalize TERM up front
+/// so agent startup does not get stuck waiting for manual confirmation.
+pub(crate) fn wrap_agent_command(cmd: &str) -> String {
+    format!(
+        "unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS; \
+         unset $(env | grep -o '^CLAUDE_CODE_[^=]*') 2>/dev/null; \
+         case \"${{TERM:-}}\" in ''|dumb|tmux*) export TERM=xterm-256color ;; esac; \
+         exec {}",
+        cmd
+    )
+}
+
 /// Create a new detached tmux session running the given agent command.
 /// If `command_override` is provided, it is used instead of `agent.command()`.
 pub async fn create_session(
@@ -384,11 +396,7 @@ pub async fn create_session(
     // Wrap command to unset Claude Code env vars so agents don't detect
     // a nested session when Hydra is launched from within Claude Code.
     // Use env -u for each known var, plus unset any CLAUDE_CODE_* vars the shell inherited.
-    let wrapped_cmd = format!(
-        "unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS; \
-         unset $(env | grep -o '^CLAUDE_CODE_[^=]*') 2>/dev/null; exec {}",
-        cmd
-    );
+    let wrapped_cmd = wrap_agent_command(cmd);
 
     let status = run_status_timeout(Command::new("tmux").args([
         "new-session",
@@ -516,30 +524,6 @@ pub async fn send_keys_literal(tmux_name: &str, text: &str) -> Result<()> {
     tokio::spawn(async move {
         let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
     });
-    Ok(())
-}
-
-/// Send literal text followed by Enter in a single tmux invocation.
-/// Uses `tmux send-keys -l TEXT \; send-keys Enter` so both arrive atomically
-/// (no race between separate fire-and-forget subprocesses).
-async fn send_text_enter(tmux_name: &str, text: &str) -> Result<()> {
-    let status = run_status_timeout(Command::new("tmux").args([
-        "send-keys",
-        "-t",
-        tmux_name,
-        "-l",
-        text,
-        ";",
-        "send-keys",
-        "-t",
-        tmux_name,
-        "Enter",
-    ]))
-    .await
-    .context("Failed to send text+enter to tmux")?;
-    if !status.success() {
-        bail!("tmux send-keys failed for '{tmux_name}'");
-    }
     Ok(())
 }
 
@@ -883,6 +867,36 @@ mod tests {
         let live: HashSet<String> = ["x".to_string()].into_iter().collect();
         prune_agent_cache(&mut cache, &live);
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn wrap_agent_command_includes_nested_env_sanitization() {
+        let wrapped = wrap_agent_command("codex --yolo");
+        assert!(
+            wrapped.contains(
+                "unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS;"
+            ),
+            "wrapped command should unset known Claude env vars"
+        );
+        assert!(
+            wrapped.contains("unset $(env | grep -o '^CLAUDE_CODE_[^=]*')"),
+            "wrapped command should unset dynamic CLAUDE_CODE_* vars"
+        );
+        assert!(
+            wrapped.ends_with("exec codex --yolo"),
+            "wrapped command should exec the original agent command"
+        );
+    }
+
+    #[test]
+    fn wrap_agent_command_normalizes_problematic_term_values() {
+        let wrapped = wrap_agent_command("codex --yolo");
+        assert!(
+            wrapped.contains(
+                "case \"${TERM:-}\" in ''|dumb|tmux*) export TERM=xterm-256color ;; esac;"
+            ),
+            "wrapped command should normalize TERM when unset/dumb/tmux-*"
+        );
     }
 
     // ── Default trait implementations ───────────────────────────────

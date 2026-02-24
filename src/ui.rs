@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
@@ -51,10 +51,10 @@ fn status_color(status: &SessionStatus) -> Color {
 }
 
 pub fn draw_sidebar(frame: &mut Frame, app: &UiApp, area: Rect) {
-    // Show stats if global stats have any tokens
-    let has_stats = app.global_stats.tokens_in + app.global_stats.tokens_out > 0;
+    // Show stats when there is any machine-wide agent usage.
+    let has_stats = app.global_stats.has_usage();
 
-    let stats_height = if has_stats { 3 } else { 0 }; // 1 line + top/bottom border
+    let stats_height = if has_stats { 5 } else { 0 }; // 3 lines + top/bottom border
 
     // Update diff tree cache if inputs changed (diff_files or sidebar width).
     // Avoids recomputing sort + format on every frame (~4+ FPS) when data
@@ -202,13 +202,222 @@ fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct DiffAggregate {
+    insertions: u32,
+    deletions: u32,
+    untracked: u32,
+}
+
+impl DiffAggregate {
+    fn add_file(&mut self, f: &crate::app::DiffFile) {
+        self.insertions = self.insertions.saturating_add(f.insertions);
+        self.deletions = self.deletions.saturating_add(f.deletions);
+        if f.untracked {
+            self.untracked = self.untracked.saturating_add(1);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DiffTreeFile {
+    name: String,
+    diff: crate::app::DiffFile,
+}
+
+#[derive(Debug, Default)]
+struct DiffTreeNode {
+    dirs: BTreeMap<String, DiffTreeNode>,
+    files: Vec<DiffTreeFile>,
+    aggregate: DiffAggregate,
+}
+
+impl DiffTreeNode {
+    fn add_path(&mut self, f: &crate::app::DiffFile) {
+        if f.path.ends_with('/') {
+            return;
+        }
+
+        let mut parts: Vec<&str> = f.path.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return;
+        }
+
+        let filename = match parts.pop() {
+            Some(name) if !name.is_empty() => name,
+            _ => return,
+        };
+
+        self.aggregate.add_file(f);
+
+        let mut node = self;
+        for segment in parts {
+            node = node.dirs.entry(segment.to_string()).or_default();
+            node.aggregate.add_file(f);
+        }
+
+        node.files.push(DiffTreeFile {
+            name: filename.to_string(),
+            diff: f.clone(),
+        });
+    }
+
+    fn sort_recursive(&mut self) {
+        self.files.sort_by(|a, b| a.name.cmp(&b.name));
+        for child in self.dirs.values_mut() {
+            child.sort_recursive();
+        }
+    }
+}
+
+enum DiffTreeEntry<'a> {
+    Dir {
+        name: &'a str,
+        node: &'a DiffTreeNode,
+    },
+    File(&'a DiffTreeFile),
+}
+
+fn tree_prefix(ancestors_have_next: &[bool], is_last: bool) -> String {
+    let mut prefix = String::new();
+    for has_next in ancestors_have_next {
+        prefix.push_str(if *has_next { "│ " } else { "  " });
+    }
+    prefix.push_str(if is_last { "└ " } else { "├ " });
+    prefix
+}
+
+fn format_tree_stat(aggregate: DiffAggregate) -> String {
+    if aggregate.insertions == 0 && aggregate.deletions == 0 {
+        return match aggregate.untracked {
+            0 => String::new(),
+            1 => "new".to_string(),
+            n => format!("new{n}"),
+        };
+    }
+    format_compact_diff(aggregate.insertions, aggregate.deletions)
+}
+
+fn push_tree_line(
+    lines: &mut Vec<Line<'static>>,
+    width: usize,
+    prefix: &str,
+    label: String,
+    aggregate: DiffAggregate,
+    is_untracked_file: bool,
+) {
+    let green = Style::default().fg(Color::Green);
+    let red = Style::default().fg(Color::Red);
+    let cyan = Style::default().fg(Color::Cyan);
+
+    let inner_w = width.saturating_sub(1); // leave 1 char margin
+    let stat = format_tree_stat(aggregate);
+    let stat_len = stat.chars().count();
+    let prefix_len = prefix.chars().count();
+    let min_gap = usize::from(!stat.is_empty());
+    let available = inner_w.saturating_sub(prefix_len + stat_len + min_gap);
+
+    let label_chars = label.chars().count();
+    let clipped_label = if available == 0 {
+        String::new()
+    } else if label_chars > available && available > 1 {
+        format!("{}…", truncate_chars(&label, available - 1))
+    } else if label_chars > available {
+        truncate_chars(&label, available)
+    } else {
+        label
+    };
+
+    let clipped_chars = clipped_label.chars().count();
+    let padding = if stat.is_empty() {
+        0
+    } else {
+        inner_w.saturating_sub(prefix_len + clipped_chars + stat_len)
+    };
+
+    let mut spans = vec![Span::styled(
+        format!("{prefix}{clipped_label}{}", " ".repeat(padding)),
+        Style::default(),
+    )];
+
+    if !stat.is_empty() {
+        if aggregate.insertions == 0 && aggregate.deletions == 0 {
+            spans.push(Span::styled(stat, cyan));
+        } else {
+            if aggregate.insertions > 0 {
+                spans.push(Span::styled(format!("+{}", aggregate.insertions), green));
+            }
+            if aggregate.deletions > 0 {
+                spans.push(Span::styled(format!("-{}", aggregate.deletions), red));
+            }
+            if is_untracked_file && aggregate.untracked > 0 {
+                spans.push(Span::styled("new", cyan));
+            }
+        }
+    }
+
+    lines.push(Line::from(spans));
+}
+
+fn render_diff_tree(
+    node: &DiffTreeNode,
+    lines: &mut Vec<Line<'static>>,
+    width: usize,
+    ancestors_have_next: &[bool],
+) {
+    let total_entries = node.dirs.len() + node.files.len();
+    if total_entries == 0 {
+        return;
+    }
+
+    let mut entries: Vec<DiffTreeEntry<'_>> = Vec::with_capacity(total_entries);
+    for (name, child) in &node.dirs {
+        entries.push(DiffTreeEntry::Dir { name, node: child });
+    }
+    for file in &node.files {
+        entries.push(DiffTreeEntry::File(file));
+    }
+
+    for (idx, entry) in entries.iter().enumerate() {
+        let is_last = idx + 1 == total_entries;
+        let prefix = tree_prefix(ancestors_have_next, is_last);
+
+        match entry {
+            DiffTreeEntry::Dir { name, node } => {
+                push_tree_line(
+                    lines,
+                    width,
+                    &prefix,
+                    format!("{name}/"),
+                    node.aggregate,
+                    false,
+                );
+
+                let mut next_ancestors = ancestors_have_next.to_vec();
+                next_ancestors.push(!is_last);
+                render_diff_tree(node, lines, width, &next_ancestors);
+            }
+            DiffTreeEntry::File(file) => {
+                let aggregate = DiffAggregate {
+                    insertions: file.diff.insertions,
+                    deletions: file.diff.deletions,
+                    untracked: u32::from(file.diff.untracked),
+                };
+                push_tree_line(
+                    lines,
+                    width,
+                    &prefix,
+                    file.name.clone(),
+                    aggregate,
+                    file.diff.untracked,
+                );
+            }
+        }
+    }
+}
+
 /// Build lines for a compact diff tree grouped by directory.
-/// Files sorted by path, grouped under directory headers.
-/// Output example:
-///   src/
-///    app.rs       +45-12
-///    ui.rs        +30-5
-///   README.md     +3
+/// Renders nested directories with branch guides and per-directory rollups.
 pub fn build_diff_tree_lines(
     diff_files: &[crate::app::DiffFile],
     width: usize,
@@ -217,96 +426,14 @@ pub fn build_diff_tree_lines(
         return vec![];
     }
 
-    let green = Style::default().fg(Color::Green);
-    let red = Style::default().fg(Color::Red);
-    let cyan = Style::default().fg(Color::Cyan);
-
-    let mut sorted: Vec<&crate::app::DiffFile> = diff_files.iter().collect();
-    sorted.sort_by(|a, b| a.path.cmp(&b.path));
-
-    let mut lines: Vec<Line> = Vec::new();
-    let mut current_dir: Option<&str> = None;
-    let inner_w = width.saturating_sub(1); // leave 1 char margin
-
-    for f in &sorted {
-        let (dir, basename) = match f.path.rfind('/') {
-            Some(i) => (Some(&f.path[..=i]), &f.path[i + 1..]),
-            None => (None, f.path.as_str()),
-        };
-
-        // Skip entries with empty basenames (e.g. trailing-slash paths)
-        if basename.is_empty() {
-            continue;
-        }
-
-        // Emit directory header if changed
-        let dir_str = dir.unwrap_or("");
-        let show_dir = match current_dir {
-            Some(prev) => prev != dir_str,
-            None => dir.is_some(),
-        };
-        if show_dir {
-            if let Some(d) = dir {
-                let display: String = if d.chars().count() > inner_w {
-                    truncate_chars(d, inner_w)
-                } else {
-                    d.to_string()
-                };
-                lines.push(Line::from(Span::styled(
-                    format!(" {display}"),
-                    Style::default(),
-                )));
-            }
-            current_dir = Some(dir_str);
-        }
-
-        // Build diff stat string
-        let stat = if f.untracked {
-            "new".to_string()
-        } else {
-            format_compact_diff(f.insertions, f.deletions)
-        };
-        let indent = if dir.is_some() { "  " } else { " " };
-
-        // Compute available space for filename
-        let stat_len = stat.chars().count();
-        let prefix_len = indent.len();
-        let available = inner_w.saturating_sub(prefix_len + stat_len + 1);
-
-        let basename_chars = basename.chars().count();
-        let name: String = if available == 0 {
-            String::new()
-        } else if basename_chars > available && available > 3 {
-            format!("{}…", truncate_chars(basename, available - 1))
-        } else if basename_chars > available {
-            truncate_chars(basename, available)
-        } else {
-            basename.to_string()
-        };
-
-        let name_chars = name.chars().count();
-        let padding = inner_w.saturating_sub(prefix_len + name_chars + stat_len);
-        let pad_str: String = " ".repeat(padding);
-
-        let mut spans = vec![Span::styled(
-            format!("{indent}{name}{pad_str}"),
-            Style::default(),
-        )];
-
-        if f.untracked {
-            spans.push(Span::styled("new", cyan));
-        } else {
-            if f.insertions > 0 {
-                spans.push(Span::styled(format!("+{}", f.insertions), green));
-            }
-            if f.deletions > 0 {
-                spans.push(Span::styled(format!("-{}", f.deletions), red));
-            }
-        }
-
-        lines.push(Line::from(spans));
+    let mut root = DiffTreeNode::default();
+    for f in diff_files {
+        root.add_path(f);
     }
+    root.sort_recursive();
 
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    render_diff_tree(&root, &mut lines, width, &[]);
     lines
 }
 
@@ -339,41 +466,80 @@ fn draw_diff_tree(frame: &mut Frame, lines: &[Line], area: Rect) {
 }
 
 pub fn draw_stats(frame: &mut Frame, app: &UiApp, area: Rect) {
-    // Use machine-wide global stats for cost and tokens
-    let total_cost = app.global_stats.cost_usd();
-    let total_tokens = app.global_stats.tokens_in + app.global_stats.tokens_out;
+    let inner_width = area.width.saturating_sub(2) as usize;
 
-    // Edits are hydra-specific (per-session)
-    let total_edits: u16 = app.session_stats.values().map(|s| s.edits).sum();
+    let claude_line = format_agent_stats_line(
+        "Claude",
+        "Cl",
+        app.global_stats.claude_cost_usd(),
+        app.global_stats.claude_display_tokens(),
+        inner_width,
+    );
+    let codex_line = format_agent_stats_line(
+        "Codex",
+        "Cx",
+        app.global_stats.codex_cost_usd(),
+        app.global_stats.codex_display_tokens(),
+        inner_width,
+    );
+    let gemini_line = format_agent_stats_line(
+        "Gemini",
+        "Ge",
+        app.global_stats.gemini_cost_usd(),
+        app.global_stats.gemini_display_tokens(),
+        inner_width,
+    );
 
-    let val = Style::default();
-
-    // Total diff across all files
-    let total_diff: u32 = app
-        .diff_files
-        .iter()
-        .map(|f| f.insertions + f.deletions)
-        .sum();
-
-    let mut spans = vec![
-        Span::styled(format_cost(total_cost), Style::default().fg(Color::Green)),
-        Span::styled(format!(" {}", format_tokens(total_tokens)), val),
-        Span::styled(format!(" {}✎", total_edits), val),
+    let lines = vec![
+        Line::from(Span::styled(claude_line, Style::default())),
+        Line::from(Span::styled(codex_line, Style::default())),
+        Line::from(Span::styled(gemini_line, Style::default())),
     ];
-
-    if total_diff > 0 {
-        spans.push(Span::styled(format!(" Δ{total_diff}"), val));
-    }
-
-    let line = Line::from(spans);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Stats ")
         .border_style(Style::default().fg(Color::Cyan));
 
-    let paragraph = Paragraph::new(line).block(block);
+    let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, area);
+}
+
+fn format_agent_stats_line(
+    label: &str,
+    short_label: &str,
+    cost_usd: f64,
+    tokens: u64,
+    inner_width: usize,
+) -> String {
+    if inner_width == 0 {
+        return String::new();
+    }
+
+    let cost = format_cost(cost_usd);
+    let tokens = format_tokens(tokens);
+
+    let full = format!("{label} {cost} {tokens}");
+    if full.chars().count() <= inner_width {
+        return full;
+    }
+
+    let short_with_tokens = format!("{short_label} {cost} {tokens}");
+    if short_with_tokens.chars().count() <= inner_width {
+        return short_with_tokens;
+    }
+
+    let no_tokens = format!("{label} {cost}");
+    if no_tokens.chars().count() <= inner_width {
+        return no_tokens;
+    }
+
+    let short_no_tokens = format!("{short_label} {cost}");
+    if short_no_tokens.chars().count() <= inner_width {
+        return short_no_tokens;
+    }
+
+    truncate_chars(&short_no_tokens, inner_width)
 }
 
 pub fn draw_preview(frame: &mut Frame, app: &UiApp, area: Rect) {
