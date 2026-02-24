@@ -185,7 +185,10 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
             }
             Some(Event::Mouse(mouse)) => {
                 if !matches!(mouse.kind, MouseEventKind::Moved) {
-                    app.handle_mouse(mouse);
+                    let size = terminal.size()?;
+                    let frame_area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+                    let layout = ui::compute_layout(frame_area);
+                    app.handle_mouse(mouse, &layout);
                 }
             }
             Some(Event::Tick) => {

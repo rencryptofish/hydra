@@ -171,16 +171,17 @@ impl SessionManager for TmuxSessionManager {
             }
         }
 
-        // Pass 2: Batch is_pane_dead via single `tmux list-panes -a` call
-        let dead_set = batch_dead_panes().await;
+        // Pass 2: Batch pane status via single `tmux list-panes -a` call
+        let status_map = batch_pane_status_impl().await;
 
         let sessions = parsed
             .into_iter()
             .zip(cached_agents)
             .map(|((name, tmux_name), agent)| {
-                let dead = dead_set
+                let dead = status_map
                     .as_ref()
-                    .map(|s| s.contains(&tmux_name))
+                    .and_then(|m| m.get(&tmux_name))
+                    .map(|(is_dead, _)| *is_dead)
                     .unwrap_or(false);
                 let status = if dead {
                     SessionStatus::Exited
@@ -244,6 +245,10 @@ impl SessionManager for TmuxSessionManager {
         send_keys_literal(tmux_name, text).await
     }
 
+    async fn send_text_enter(&self, tmux_name: &str, text: &str) -> Result<()> {
+        send_text_enter(tmux_name, text).await
+    }
+
     async fn capture_pane_scrollback(&self, tmux_name: &str) -> Result<String> {
         capture_pane_scrollback(tmux_name).await
     }
@@ -292,10 +297,24 @@ async fn batch_pane_status_impl() -> Option<HashMap<String, (bool, u64)>> {
     Some(result)
 }
 
+/// Legacy helper retained for integration tests that validate exited-session
+/// detection semantics.
+#[cfg(test)]
+#[allow(dead_code)]
+async fn batch_dead_panes() -> Option<HashSet<String>> {
+    let status_map = batch_pane_status_impl().await?;
+    Some(
+        status_map
+            .into_iter()
+            .filter_map(|(session, (is_dead, _))| is_dead.then_some(session))
+            .collect(),
+    )
+}
+
 /// Check if the pane in a tmux session has exited (requires remain-on-exit).
 /// Returns `true` when the session can't be queried (gone/dead) — a session
 /// we can't reach is effectively dead rather than silently "Idle".
-/// Note: Production code uses `batch_dead_panes()` instead; this is retained
+/// Note: Production code uses `batch_pane_status_impl()` instead; this is retained
 /// for integration tests that check individual sessions.
 #[cfg(test)]
 async fn is_pane_dead(tmux_name: &str) -> bool {
@@ -315,37 +334,6 @@ async fn is_pane_dead(tmux_name: &str) -> bool {
         }
         _ => true, // Can't reach session → treat as dead
     }
-}
-
-/// Batch-check all tmux sessions for dead panes in a single subprocess call.
-/// Returns a set of session names whose panes are dead, or None on error.
-async fn batch_dead_panes() -> Option<HashSet<String>> {
-    let output = run_cmd_timeout(Command::new("tmux").args([
-        "list-panes",
-        "-a",
-        "-F",
-        "#{session_name} #{pane_dead}",
-    ]))
-    .await
-    .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let dead: HashSet<String> = stdout
-        .lines()
-        .filter_map(|line| {
-            let (session, flag) = line.rsplit_once(' ')?;
-            if flag != "0" {
-                Some(session.to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
-    Some(dead)
 }
 
 /// Read the HYDRA_AGENT_TYPE env var from the tmux session.
@@ -524,6 +512,29 @@ pub async fn send_keys_literal(tmux_name: &str, text: &str) -> Result<()> {
     tokio::spawn(async move {
         let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
     });
+    Ok(())
+}
+
+/// Send literal text then Enter as two synchronous tmux calls.
+/// Using two awaited subprocesses preserves ordering and ensures Enter is
+/// interpreted as a key (not literal text).
+pub async fn send_text_enter(tmux_name: &str, text: &str) -> Result<()> {
+    let status =
+        run_status_timeout(Command::new("tmux").args(["send-keys", "-t", tmux_name, "-l", text]))
+            .await
+            .context("Failed to send literal text to tmux")?;
+    if !status.success() {
+        bail!("tmux send-keys -l failed for '{tmux_name}'");
+    }
+
+    let status =
+        run_status_timeout(Command::new("tmux").args(["send-keys", "-t", tmux_name, "Enter"]))
+            .await
+            .context("Failed to send Enter to tmux")?;
+    if !status.success() {
+        bail!("tmux send-keys Enter failed for '{tmux_name}'");
+    }
+
     Ok(())
 }
 
@@ -1118,6 +1129,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn integration_send_text_enter_submits_command() {
+        let name = test_session_name();
+        let marker_path = format!("/tmp/hydra_send_text_enter_{}", std::process::id());
+        let _ = std::fs::remove_file(&marker_path);
+        let reader_cmd = format!("read line; echo \"$line\" > {marker_path}; sleep 30");
+
+        let status = run_status_timeout(Command::new("tmux").args([
+            "new-session",
+            "-d",
+            "-s",
+            &name,
+            "-x",
+            "80",
+            "-y",
+            "24",
+            &reader_cmd,
+        ]))
+        .await
+        .unwrap();
+        assert!(status.success());
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        send_text_enter(&name, "HYDRA_SEND_TEXT_ENTER")
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        assert!(
+            std::path::Path::new(&marker_path).exists(),
+            "expected marker file to exist after send_text_enter: {marker_path}"
+        );
+        let recorded = std::fs::read_to_string(&marker_path).unwrap_or_default();
+        assert_eq!(recorded.trim(), "HYDRA_SEND_TEXT_ENTER");
+        let _ = std::fs::remove_file(&marker_path);
+
+        cleanup_session(&name).await;
+    }
+
+    #[tokio::test]
     async fn integration_is_pane_dead_live_session() {
         let name = test_session_name();
         let status = run_status_timeout(Command::new("tmux").args([
@@ -1546,13 +1598,13 @@ mod tests {
         );
     }
 
-    // ── batch_dead_panes integration tests ──────────────────────────
+    // ── batch_pane_status_impl integration tests ──────────────────────────
 
     #[tokio::test]
-    async fn integration_batch_dead_panes_returns_some() {
-        // batch_dead_panes should work when a tmux server is running.
+    async fn integration_batch_pane_status_impl_returns_some() {
+        // batch_pane_status_impl should work when a tmux server is running.
         // If no server is running, it returns None (not an error).
-        let result = batch_dead_panes().await;
+        let result = batch_pane_status_impl().await;
         // We can't guarantee a tmux server is running, so just verify no panic.
         // If a server is running, we should get Some(set).
         if let Some(dead) = &result {
@@ -1562,7 +1614,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn integration_batch_dead_panes_detects_exited_session() {
+    async fn integration_batch_pane_status_impl_detects_exited_session() {
         let name = test_session_name();
         // Create session with a command that sleeps briefly (giving us time to set
         // remain-on-exit), then exits.
@@ -1596,19 +1648,22 @@ mod tests {
         // Wait for the command to finish exiting.
         tokio::time::sleep(Duration::from_millis(600)).await;
 
-        let dead_set = batch_dead_panes()
+        let status_map = batch_pane_status_impl()
             .await
             .expect("tmux server should be running");
         assert!(
-            dead_set.contains(&name),
-            "exited session should appear in batch dead set: {dead_set:?}"
+            status_map
+                .get(&name)
+                .map(|(dead, _)| *dead)
+                .unwrap_or(false),
+            "exited session should appear dead in batch status map: {status_map:?}"
         );
 
         cleanup_session(&name).await;
     }
 
     #[tokio::test]
-    async fn integration_batch_dead_panes_live_session_not_dead() {
+    async fn integration_batch_pane_status_impl_live_session_not_dead() {
         let name = test_session_name();
         let status = run_status_timeout(Command::new("tmux").args([
             "new-session",
@@ -1626,12 +1681,15 @@ mod tests {
         .unwrap();
         assert!(status.success());
 
-        let dead_set = batch_dead_panes()
+        let status_map = batch_pane_status_impl()
             .await
             .expect("tmux server should be running");
         assert!(
-            !dead_set.contains(&name),
-            "live session should NOT appear in dead set"
+            !status_map
+                .get(&name)
+                .map(|(dead, _)| *dead)
+                .unwrap_or(false),
+            "live session should NOT appear dead in batch map"
         );
 
         cleanup_session(&name).await;

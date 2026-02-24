@@ -1,3 +1,5 @@
+pub mod state;
+
 use std::collections::{BTreeMap, VecDeque};
 
 use ratatui::{
@@ -12,27 +14,41 @@ use crate::app::{Mode, UiApp};
 use crate::logs::{format_cost, format_tokens, ConversationEntry};
 use crate::session::{format_duration, AgentType, SessionStatus};
 
-pub fn draw(frame: &mut Frame, app: &UiApp) {
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UiLayout {
+    pub main: Rect,
+    pub help: Rect,
+    pub sidebar: Rect,
+    pub preview: Rect,
+}
+
+pub fn compute_layout(frame_area: Rect) -> UiLayout {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(frame.area());
+        .split(frame_area);
 
-    let main_area = chunks[0];
-    let help_area = chunks[1];
-
-    // Main layout: sidebar | preview
+    let main = chunks[0];
+    let help = chunks[1];
     let panels = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(20), Constraint::Percentage(80)])
-        .split(main_area);
+        .split(main);
 
-    app.sidebar_area.set(panels[0]);
-    app.preview_area.set(panels[1]);
+    UiLayout {
+        main,
+        help,
+        sidebar: panels[0],
+        preview: panels[1],
+    }
+}
 
-    draw_sidebar(frame, app, panels[0]);
-    draw_preview(frame, app, panels[1]);
-    draw_help_bar(frame, app, help_area);
+pub fn draw(frame: &mut Frame, app: &UiApp) {
+    let layout = compute_layout(frame.area());
+
+    draw_sidebar(frame, app, layout.sidebar);
+    draw_preview(frame, app, layout.preview);
+    draw_help_bar(frame, app, layout.help);
 
     // Draw modal overlays
     match app.mode {

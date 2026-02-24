@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use hydra::app::{StateSnapshot, UiApp};
 use hydra::session::{AgentType, Session, SessionStatus};
+use hydra::ui;
+use ratatui::layout::Rect;
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -49,6 +51,10 @@ fn make_app_with_n_sessions(n: usize) -> UiApp {
     app
 }
 
+fn benchmark_layout() -> ui::UiLayout {
+    ui::compute_layout(Rect::new(0, 0, 80, 24))
+}
+
 // ── Benchmarks ──────────────────────────────────────────────────────
 
 fn bench_handle_browse_key(c: &mut Criterion) {
@@ -86,8 +92,6 @@ fn bench_handle_browse_key(c: &mut Criterion) {
 }
 
 fn bench_handle_mouse(c: &mut Criterion) {
-    use ratatui::layout::Rect;
-
     let mut group = c.benchmark_group("handle_mouse");
 
     // Sidebar click
@@ -95,19 +99,18 @@ fn bench_handle_mouse(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let app = make_app_with_n_sessions(10);
-                app.sidebar_area.set(Rect::new(0, 0, 20, 24));
-                app.preview_area.set(Rect::new(20, 0, 60, 24));
-                app
+                let layout = benchmark_layout();
+                (app, layout)
             },
-            |mut app| {
+            |(mut app, layout)| {
                 let mouse = MouseEvent {
                     kind: MouseEventKind::Down(MouseButton::Left),
                     column: 10,
                     row: 5,
                     modifiers: KeyModifiers::NONE,
                 };
-                app.handle_mouse(black_box(mouse));
-                app
+                app.handle_mouse(black_box(mouse), &layout);
+                (app, layout)
             },
             criterion::BatchSize::SmallInput,
         );
@@ -118,20 +121,19 @@ fn bench_handle_mouse(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let mut app = make_app_with_n_sessions(3);
-                app.sidebar_area.set(Rect::new(0, 0, 20, 24));
-                app.preview_area.set(Rect::new(20, 0, 60, 24));
                 app.preview.set_text("line\n".repeat(200));
-                app
+                let layout = benchmark_layout();
+                (app, layout)
             },
-            |mut app| {
+            |(mut app, layout)| {
                 let mouse = MouseEvent {
                     kind: MouseEventKind::ScrollUp,
                     column: 40,
                     row: 12,
                     modifiers: KeyModifiers::NONE,
                 };
-                app.handle_mouse(black_box(mouse));
-                app
+                app.handle_mouse(black_box(mouse), &layout);
+                (app, layout)
             },
             criterion::BatchSize::SmallInput,
         );
@@ -143,20 +145,19 @@ fn bench_handle_mouse(c: &mut Criterion) {
             || {
                 let mut app = make_app_with_n_sessions(3);
                 app.mode = hydra::app::Mode::Compose;
-                app.sidebar_area.set(Rect::new(0, 0, 20, 24));
-                app.preview_area.set(Rect::new(20, 0, 60, 24));
                 app.preview.scroll_offset = 10;
-                app
+                let layout = benchmark_layout();
+                (app, layout)
             },
-            |mut app| {
+            |(mut app, layout)| {
                 let mouse = MouseEvent {
                     kind: MouseEventKind::Down(MouseButton::Left),
                     column: 40,
                     row: 12,
                     modifiers: KeyModifiers::NONE,
                 };
-                app.handle_mouse(black_box(mouse));
-                app
+                app.handle_mouse(black_box(mouse), &layout);
+                (app, layout)
             },
             criterion::BatchSize::SmallInput,
         );
