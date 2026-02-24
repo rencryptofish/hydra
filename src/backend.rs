@@ -5,58 +5,12 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::app::{
-    ActivityDetector, BackendCommand, BackgroundRefreshState, ConversationBuffer, DiffFile,
-    PreviewUpdate, StateSnapshot, StatusDetector, TaskTimers,
-};
+use crate::app::{BackendCommand, PreviewUpdate, StateSnapshot};
 use crate::logs::{GlobalStats, SessionStats};
 use crate::session::{AgentType, Session, SessionStatus};
+use crate::state::{BackgroundRefreshState, ConversationBuffer, OutputDetector, TaskTimers};
 use crate::tmux::SessionManager;
 use crate::tmux_control::{TmuxControlConnection, TmuxNotification};
-
-// ── OutputDetector ─────────────────────────────────────────────────
-
-/// Detects session status from `%output` notifications.
-/// Sessions with recent output are Running; sessions silent for longer
-/// than the idle threshold are Idle.
-#[derive(Default)]
-pub struct OutputDetector {
-    last_output: HashMap<String, Instant>,
-}
-
-impl OutputDetector {
-    /// How long after the last `%output` before a session is considered Idle.
-    const IDLE_THRESHOLD: Duration = Duration::from_secs(6);
-
-    pub fn new() -> Self {
-        Self {
-            last_output: HashMap::new(),
-        }
-    }
-
-    /// Record that a session produced output.
-    pub fn record_output(&mut self, session: &str) {
-        self.last_output.insert(session.to_string(), Instant::now());
-    }
-
-    /// Get the status of a session based on its output history.
-    pub fn status(&self, session: &str) -> SessionStatus {
-        match self.last_output.get(session) {
-            Some(t) if t.elapsed() < Self::IDLE_THRESHOLD => SessionStatus::Running,
-            _ => SessionStatus::Idle,
-        }
-    }
-
-    /// Returns true if this session has ever produced output.
-    pub fn has_output(&self, session: &str) -> bool {
-        self.last_output.contains_key(session)
-    }
-
-    /// Remove entries for sessions that no longer exist.
-    pub fn prune(&mut self, live_keys: &HashSet<&String>) {
-        self.last_output.retain(|k, _| live_keys.contains(k));
-    }
-}
 
 // ── Backend actor ──────────────────────────────────────────────────
 
@@ -71,24 +25,27 @@ pub struct Backend {
 
     // Session state
     sessions: Vec<Session>,
-    status: StatusDetector,
-    activity: ActivityDetector,
     output_detector: OutputDetector,
     timers: TaskTimers,
+    dead_ticks: HashMap<String, u8>,
 
     // Data state
     last_messages: HashMap<String, String>,
     session_stats: HashMap<String, SessionStats>,
     global_stats: GlobalStats,
-    diff_files: Vec<DiffFile>,
+    diff_files: Vec<crate::models::DiffFile>,
     conversations: HashMap<String, ConversationBuffer>,
     bg: BackgroundRefreshState,
+
+    // Preview state
+    preview_capture_cache: HashMap<String, String>,
+    dirty_preview_sessions: HashSet<String>,
 
     // Status message
     status_message: Option<String>,
 
     // Channels
-    state_tx: watch::Sender<StateSnapshot>,
+    state_tx: watch::Sender<Arc<StateSnapshot>>,
     preview_tx: mpsc::Sender<PreviewUpdate>,
 
     // Control mode connection (for pane-to-session mapping)
@@ -96,12 +53,15 @@ pub struct Backend {
 }
 
 impl Backend {
+    const DEAD_TICK_THRESHOLD: u8 = 3;
+    const DEAD_TICK_SUBAGENT_THRESHOLD: u8 = 15;
+
     pub fn new(
         manager: Box<dyn SessionManager>,
         project_id: String,
         cwd: String,
         manifest_dir: PathBuf,
-        state_tx: watch::Sender<StateSnapshot>,
+        state_tx: watch::Sender<Arc<StateSnapshot>>,
         preview_tx: mpsc::Sender<PreviewUpdate>,
         control_conn: Option<Arc<TmuxControlConnection>>,
     ) -> Self {
@@ -111,16 +71,17 @@ impl Backend {
             cwd,
             manifest_dir,
             sessions: Vec::new(),
-            status: StatusDetector::new(),
-            activity: ActivityDetector::new(),
             output_detector: OutputDetector::new(),
             timers: TaskTimers::new(),
+            dead_ticks: HashMap::new(),
             last_messages: HashMap::new(),
             session_stats: HashMap::new(),
             global_stats: GlobalStats::default(),
             diff_files: Vec::new(),
             conversations: HashMap::new(),
             bg: BackgroundRefreshState::new(),
+            preview_capture_cache: HashMap::new(),
+            dirty_preview_sessions: HashSet::new(),
             status_message: None,
             state_tx,
             preview_tx,
@@ -139,28 +100,21 @@ impl Backend {
         let mut notif_rx: Option<broadcast::Receiver<TmuxNotification>> =
             self.control_conn.as_ref().map(|c| c.subscribe());
 
-        // Session refresh interval: 1s with control mode (status comes from %output),
-        // 200ms without (capture-based status detection needs fast polling).
-        let session_interval = if self.control_conn.is_some() {
-            std::time::Duration::from_millis(1000)
-        } else {
-            std::time::Duration::from_millis(200)
-        };
-        let mut session_tick = tokio::time::interval(session_interval);
+        // Status/preview refresh cadence.
+        let mut session_tick = tokio::time::interval(Duration::from_millis(500));
         session_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // Message/stats refresh every ~50ms (bg.tick() internally gates at 40-tick cadence)
-        let mut message_tick = tokio::time::interval(std::time::Duration::from_millis(50));
+        let mut message_tick = tokio::time::interval(Duration::from_millis(50));
         message_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
                 Some(cmd) = cmd_rx.recv() => {
                     if self.handle_command(cmd).await {
-                        break; // Quit received
+                        break;
                     }
                 }
-                // Handle tmux %output notifications for event-driven status
                 notif = async {
                     match notif_rx.as_mut() {
                         Some(rx) => rx.recv().await,
@@ -187,19 +141,17 @@ impl Backend {
     fn handle_notification(&mut self, notif: TmuxNotification) {
         match notif {
             TmuxNotification::PaneOutput { pane_id, .. } => {
-                // Resolve pane ID to session name
                 if let Some(session_name) = self
                     .control_conn
                     .as_ref()
                     .and_then(|c| c.pane_session_name(&pane_id))
                 {
                     self.output_detector.record_output(&session_name);
-                    // Immediate snapshot so UI sees Running status quickly
+                    self.dirty_preview_sessions.insert(session_name);
                     self.send_snapshot();
                 }
             }
             TmuxNotification::PaneExited { pane_id } => {
-                // Mark session as exited immediately
                 if let Some(session_name) = self
                     .control_conn
                     .as_ref()
@@ -215,7 +167,7 @@ impl Backend {
                 }
             }
             TmuxNotification::SessionChanged { .. } => {
-                // Session list may have changed, refresh on next tick
+                // Session list may have changed, refresh on next tick.
             }
         }
     }
@@ -233,7 +185,10 @@ impl Backend {
                 self.send_snapshot();
             }
             BackendCommand::SendCompose { tmux_name, text } => {
-                let _ = self.manager.send_text_enter(&tmux_name, &text).await;
+                if let Err(e) = self.manager.send_text_enter(&tmux_name, &text).await {
+                    self.status_message = Some(format!("Failed to send message: {e}"));
+                    self.send_snapshot();
+                }
             }
             BackendCommand::SendKeys { tmux_name, key } => {
                 let _ = self.manager.send_keys(&tmux_name, &key).await;
@@ -311,7 +266,6 @@ impl Backend {
             return;
         }
 
-        // Pre-populate agent type cache from manifest
         let agent_mapping: HashMap<String, AgentType> = manifest
             .sessions
             .iter()
@@ -385,10 +339,40 @@ impl Backend {
         }
     }
 
+    fn apply_exited_debounce(
+        &mut self,
+        tmux_name: &str,
+        prev_statuses: &HashMap<String, SessionStatus>,
+    ) -> SessionStatus {
+        let has_active_subagents = self
+            .session_stats
+            .get(tmux_name)
+            .map(|st| st.active_subagents > 0)
+            .unwrap_or(false);
+
+        let threshold = if has_active_subagents {
+            Self::DEAD_TICK_SUBAGENT_THRESHOLD
+        } else {
+            Self::DEAD_TICK_THRESHOLD
+        };
+
+        let count = self.dead_ticks.entry(tmux_name.to_string()).or_insert(0);
+        *count = count.saturating_add(1);
+
+        if *count < threshold {
+            prev_statuses
+                .get(tmux_name)
+                .filter(|s| **s != SessionStatus::Exited)
+                .cloned()
+                .unwrap_or(SessionStatus::Idle)
+        } else {
+            SessionStatus::Exited
+        }
+    }
+
     async fn refresh_sessions(&mut self) {
         let pid = self.project_id.clone();
         let result = self.manager.list_sessions(&pid).await;
-        let has_output_detector = self.control_conn.is_some();
 
         match result {
             Ok(mut sessions) => {
@@ -401,149 +385,40 @@ impl Backend {
 
                 let pane_status = self.manager.batch_pane_status().await;
 
-                // ── Status detection priority ──
-                // 1. OutputDetector (from %output notifications, if control mode)
-                // 2. ActivityDetector (pane_activity timestamps, for Claude sessions)
-                // 3. StatusDetector (capture-based, for Codex sessions without %output)
-
-                // Track which sessions have been handled by higher-priority detectors
-                let mut handled: HashSet<String> = HashSet::new();
-
-                // Phase 1: OutputDetector for sessions with recent %output events
-                if has_output_detector {
-                    for session in sessions.iter_mut() {
-                        if self.output_detector.has_output(&session.tmux_name) {
-                            // Check dead status from pane_status first
-                            let is_dead = pane_status
-                                .as_ref()
-                                .and_then(|m| m.get(&session.tmux_name))
-                                .map(|&(dead, _)| dead)
-                                .unwrap_or(false);
-
-                            if is_dead {
-                                session.status = SessionStatus::Exited;
-                            } else {
-                                // Use JSONL log-based status as primary for Claude sessions
-                                // (task_elapsed is more accurate than %output timing)
-                                if session.agent_type == AgentType::Claude {
-                                    if let Some(stats) = self.session_stats.get(&session.tmux_name)
-                                    {
-                                        if stats.task_elapsed().is_some() {
-                                            session.status = SessionStatus::Running;
-                                        } else {
-                                            session.status =
-                                                self.output_detector.status(&session.tmux_name);
-                                        }
-                                    } else {
-                                        session.status =
-                                            self.output_detector.status(&session.tmux_name);
-                                    }
-                                } else {
-                                    session.status =
-                                        self.output_detector.status(&session.tmux_name);
-                                }
-                            }
-                            handled.insert(session.tmux_name.clone());
-                        }
-                    }
-                }
-
-                // Phase 2: ActivityDetector for Claude sessions not handled by OutputDetector
-                if let Some(ref status_map) = pane_status {
-                    for session in sessions.iter_mut() {
-                        if handled.contains(&session.tmux_name) {
-                            continue;
-                        }
-                        if session.agent_type != AgentType::Claude {
-                            continue;
-                        }
-                        if let Some(&(is_dead, activity)) = status_map.get(&session.tmux_name) {
-                            if is_dead {
-                                session.status = SessionStatus::Exited;
-                            } else {
-                                let stats = self.session_stats.get(&session.tmux_name);
-                                session.status = self.activity.update_claude_status(
-                                    &session.tmux_name,
-                                    activity,
-                                    stats,
-                                );
-                            }
-                            handled.insert(session.tmux_name.clone());
-                        }
-                    }
-                }
-
-                // Dead-tick debounce for sessions handled by output/activity detectors
                 for session in sessions.iter_mut() {
-                    if !handled.contains(&session.tmux_name) {
-                        continue;
-                    }
-                    let name = session.tmux_name.clone();
-                    let has_active_subagents = self
-                        .session_stats
-                        .get(&name)
-                        .map(|st| st.active_subagents > 0)
+                    let tmux_name = session.tmux_name.clone();
+                    let is_dead = pane_status
+                        .as_ref()
+                        .and_then(|m| m.get(&tmux_name))
+                        .map(|&(dead, _)| dead)
                         .unwrap_or(false);
 
-                    if session.status == SessionStatus::Exited {
-                        let count = self.status.dead_ticks.entry(name.clone()).or_insert(0);
-                        *count = count.saturating_add(1);
-                        let threshold = if has_active_subagents {
-                            StatusDetector::DEAD_TICK_SUBAGENT_THRESHOLD
+                    if is_dead {
+                        session.status = self.apply_exited_debounce(&tmux_name, &prev_statuses);
+                        continue;
+                    }
+
+                    self.dead_ticks.insert(tmux_name.clone(), 0);
+
+                    let log_running = self
+                        .session_stats
+                        .get(&tmux_name)
+                        .and_then(|stats| stats.task_elapsed())
+                        .is_some();
+                    let recent_output =
+                        self.output_detector.status(&tmux_name) == SessionStatus::Running;
+
+                    session.status = if self.control_conn.is_some() {
+                        if recent_output || log_running {
+                            SessionStatus::Running
                         } else {
-                            StatusDetector::DEAD_TICK_THRESHOLD
-                        };
-                        if *count < threshold {
-                            session.status = prev_statuses
-                                .get(&name)
-                                .filter(|s| **s != SessionStatus::Exited)
-                                .cloned()
-                                .unwrap_or(SessionStatus::Idle);
+                            SessionStatus::Idle
                         }
+                    } else if log_running || recent_output {
+                        SessionStatus::Running
                     } else {
-                        self.status.dead_ticks.insert(name, 0);
-                    }
-                }
-
-                // Phase 3: Capture-based status for remaining sessions (fallback only).
-                // When control mode is active, %output notifications handle all sessions.
-                // Only run capture-based detection when no control mode.
-                if !has_output_detector {
-                    const IDLE_CAPTURE_SKIP_THRESHOLD: u8 = 40;
-                    let codex_names: Vec<String> = sessions
-                        .iter()
-                        .filter(|s| !handled.contains(&s.tmux_name))
-                        .filter(|s| s.status != SessionStatus::Exited)
-                        .filter(|s| {
-                            self.status.idle_ticks_for(&s.tmux_name) < IDLE_CAPTURE_SKIP_THRESHOLD
-                        })
-                        .map(|s| s.tmux_name.clone())
-                        .collect();
-                    let capture_results = self.manager.capture_panes(&codex_names).await;
-                    let mut captures: HashMap<String, String> = codex_names
-                        .into_iter()
-                        .zip(capture_results)
-                        .map(|(name, res)| (name, res.unwrap_or_default()))
-                        .collect();
-                    for s in sessions.iter() {
-                        if !handled.contains(&s.tmux_name)
-                            && s.status != SessionStatus::Exited
-                            && !captures.contains_key(&s.tmux_name)
-                        {
-                            if let Some(prev) = self.status.raw_captures.get(&s.tmux_name) {
-                                captures.insert(s.tmux_name.clone(), prev.clone());
-                            }
-                        }
-                    }
-
-                    self.status.update_statuses(
-                        &mut sessions,
-                        &captures,
-                        &prev_statuses,
-                        &self.session_stats,
-                    );
-
-                    self.status.latest_pane_captures = captures;
+                        SessionStatus::Idle
+                    };
                 }
 
                 self.timers.update(&mut sessions, &self.session_stats, now);
@@ -558,22 +433,24 @@ impl Backend {
                 self.sessions = sessions;
             }
             Err(e) => {
-                self.status.latest_pane_captures.clear();
+                self.preview_capture_cache.clear();
                 self.status_message = Some(format!("Error listing sessions: {e}"));
             }
         }
 
-        // Prune stale entries
         {
             let live_keys: HashSet<&String> = self.sessions.iter().map(|s| &s.tmux_name).collect();
-            self.status.prune(&live_keys);
-            self.activity.prune(&live_keys);
             self.output_detector.prune(&live_keys);
             self.timers.prune(&live_keys);
             self.last_messages.retain(|k, _| live_keys.contains(k));
             self.session_stats.retain(|k, _| live_keys.contains(k));
             self.conversations.retain(|k, _| live_keys.contains(k));
             self.bg.prune(&live_keys);
+            self.dead_ticks.retain(|k, _| live_keys.contains(k));
+            self.preview_capture_cache
+                .retain(|k, _| live_keys.contains(k));
+            self.dirty_preview_sessions
+                .retain(|k| live_keys.contains(k));
         }
     }
 
@@ -588,6 +465,7 @@ impl Backend {
             .iter()
             .map(|(k, v)| (k.clone(), v.read_offset))
             .collect();
+
         if let Some(result) = self.bg.tick(
             &sessions,
             &self.session_stats,
@@ -595,10 +473,28 @@ impl Backend {
             &self.cwd,
             conversation_offsets,
         ) {
+            let changed_sessions: Vec<String> = result
+                .conversation_offsets
+                .iter()
+                .filter_map(|(tmux_name, new_offset)| {
+                    let old_offset = self
+                        .conversations
+                        .get(tmux_name)
+                        .map(|buf| buf.read_offset)
+                        .unwrap_or(0);
+                    if *new_offset != old_offset {
+                        Some(tmux_name.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
             self.last_messages.extend(result.last_messages);
             self.session_stats = result.session_stats;
             self.global_stats = result.global_stats;
             self.diff_files = result.diff_files;
+
             for (tmux_name, new_entries) in result.conversations {
                 let buf = self
                     .conversations
@@ -607,8 +503,17 @@ impl Backend {
                 if let Some(&new_offset) = result.conversation_offsets.get(&tmux_name) {
                     buf.read_offset = new_offset;
                 }
+                if result.conversation_replace.contains(&tmux_name) {
+                    buf.entries.clear();
+                }
                 buf.extend(new_entries);
             }
+
+            for tmux_name in changed_sessions {
+                self.output_detector.record_output(&tmux_name);
+                self.dirty_preview_sessions.insert(tmux_name);
+            }
+
             self.send_snapshot();
         }
     }
@@ -629,109 +534,103 @@ impl Backend {
             conversations,
             status_message: self.status_message.clone(),
         };
-        let _ = self.state_tx.send(snapshot);
+
+        let _ = self.state_tx.send(Arc::new(snapshot));
+    }
+
+    fn build_preview_from_content(
+        tmux_name: String,
+        content: String,
+        has_scrollback: bool,
+    ) -> PreviewUpdate {
+        let line_count = content.lines().count().min(u16::MAX as usize) as u16;
+        let text = ansi_to_tui::IntoText::into_text(&content).ok();
+        PreviewUpdate {
+            tmux_name,
+            text,
+            content,
+            line_count,
+            has_scrollback,
+        }
+    }
+
+    fn preview_from_conversation(&self, tmux_name: &str) -> Option<PreviewUpdate> {
+        let conv = self.conversations.get(tmux_name)?;
+        if conv.entries.is_empty() {
+            return None;
+        }
+
+        let text = crate::ui::render_conversation(&conv.entries);
+        let line_count = text.lines.len() as u16;
+        Some(PreviewUpdate {
+            tmux_name: tmux_name.to_string(),
+            text: Some(text),
+            content: String::new(),
+            line_count,
+            has_scrollback: false,
+        })
+    }
+
+    /// Resolve preview content using a single fallback chain:
+    /// 1. conversation entries
+    /// 2. cached pane capture
+    /// 3. live capture-pane
+    async fn resolve_preview(
+        &mut self,
+        tmux_name: &str,
+        wants_scrollback: bool,
+        force_live_capture: bool,
+    ) -> PreviewUpdate {
+        if wants_scrollback {
+            let content = self
+                .manager
+                .capture_pane_scrollback(tmux_name)
+                .await
+                .unwrap_or_else(|_| "[unable to capture pane]".to_string());
+            return Self::build_preview_from_content(tmux_name.to_string(), content, true);
+        }
+
+        if let Some(update) = self.preview_from_conversation(tmux_name) {
+            return update;
+        }
+
+        if !force_live_capture {
+            if let Some(content) = self.preview_capture_cache.get(tmux_name) {
+                return Self::build_preview_from_content(
+                    tmux_name.to_string(),
+                    content.clone(),
+                    false,
+                );
+            }
+        }
+
+        let content = self
+            .manager
+            .capture_pane(tmux_name)
+            .await
+            .unwrap_or_else(|_| "[unable to capture pane]".to_string());
+        self.preview_capture_cache
+            .insert(tmux_name.to_string(), content.clone());
+        Self::build_preview_from_content(tmux_name.to_string(), content, false)
     }
 
     async fn send_preview_for_all(&mut self) {
-        for session in &self.sessions {
-            let tmux_name = &session.tmux_name;
+        let tmux_names: Vec<String> = self.sessions.iter().map(|s| s.tmux_name.clone()).collect();
 
-            // Check if there's conversation data
-            if let Some(conv) = self.conversations.get(tmux_name) {
-                if !conv.entries.is_empty() {
-                    let text = crate::ui::render_conversation(&conv.entries);
-                    let line_count = text.lines.len() as u16;
-                    let _ = self.preview_tx.try_send(PreviewUpdate {
-                        tmux_name: tmux_name.clone(),
-                        text: Some(text),
-                        content: String::new(),
-                        line_count,
-                        has_scrollback: false,
-                    });
-                    continue;
-                }
-            }
-
-            // Fallback to pane capture (cached or live)
-            let content = if let Some(cached) = self.status.latest_pane_captures.get(tmux_name) {
-                cached.clone()
-            } else {
-                // Live capture for sessions without cached data (e.g. control mode Codex)
-                self.manager
-                    .capture_pane(tmux_name)
-                    .await
-                    .unwrap_or_default()
-            };
-            if !content.is_empty() {
-                let line_count = content.lines().count().min(u16::MAX as usize) as u16;
-                let text = ansi_to_tui::IntoText::into_text(&content).ok();
-                let _ = self.preview_tx.try_send(PreviewUpdate {
-                    tmux_name: tmux_name.clone(),
-                    text,
-                    content,
-                    line_count,
-                    has_scrollback: false,
-                });
-            }
+        for tmux_name in tmux_names {
+            let force_live_capture = self.dirty_preview_sessions.remove(&tmux_name);
+            let update = self
+                .resolve_preview(&tmux_name, false, force_live_capture)
+                .await;
+            let _ = self.preview_tx.try_send(update);
         }
     }
 
     async fn send_preview(&mut self, tmux_name: &str, wants_scrollback: bool) {
-        if wants_scrollback {
-            let result = self.manager.capture_pane_scrollback(tmux_name).await;
-            let content = result.unwrap_or_else(|_| "[unable to capture pane]".to_string());
-            let line_count = content.lines().count().min(u16::MAX as usize) as u16;
-            let text = ansi_to_tui::IntoText::into_text(&content).ok();
-            let _ = self.preview_tx.try_send(PreviewUpdate {
-                tmux_name: tmux_name.to_string(),
-                text,
-                content,
-                line_count,
-                has_scrollback: true,
-            });
-        } else {
-            // Check for conversation data first
-            if let Some(conv) = self.conversations.get(tmux_name) {
-                if !conv.entries.is_empty() {
-                    let text = crate::ui::render_conversation(&conv.entries);
-                    let line_count = text.lines.len() as u16;
-                    let _ = self.preview_tx.try_send(PreviewUpdate {
-                        tmux_name: tmux_name.to_string(),
-                        text: Some(text),
-                        content: String::new(),
-                        line_count,
-                        has_scrollback: false,
-                    });
-                    return;
-                }
-            }
-
-            // Use cached capture
-            if let Some(content) = self.status.latest_pane_captures.get(tmux_name) {
-                let line_count = content.lines().count().min(u16::MAX as usize) as u16;
-                let text = ansi_to_tui::IntoText::into_text(content).ok();
-                let _ = self.preview_tx.try_send(PreviewUpdate {
-                    tmux_name: tmux_name.to_string(),
-                    text,
-                    content: content.clone(),
-                    line_count,
-                    has_scrollback: false,
-                });
-            } else {
-                // Live capture as last resort
-                let result = self.manager.capture_pane(tmux_name).await;
-                let content = result.unwrap_or_else(|_| "[unable to capture pane]".to_string());
-                let line_count = content.lines().count().min(u16::MAX as usize) as u16;
-                let text = ansi_to_tui::IntoText::into_text(&content).ok();
-                let _ = self.preview_tx.try_send(PreviewUpdate {
-                    tmux_name: tmux_name.to_string(),
-                    text,
-                    content,
-                    line_count,
-                    has_scrollback: false,
-                });
-            }
-        }
+        let update = self
+            .resolve_preview(tmux_name, wants_scrollback, false)
+            .await;
+        let _ = self.preview_tx.try_send(update);
     }
 }
 
@@ -757,7 +656,6 @@ mod tests {
     #[test]
     fn output_detector_old_output_is_idle() {
         let mut detector = OutputDetector::new();
-        // Manually insert an old timestamp
         detector.last_output.insert(
             "test-session".to_string(),
             Instant::now() - Duration::from_secs(10),

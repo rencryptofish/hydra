@@ -6,6 +6,7 @@ use hydra::ui;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
+use std::sync::Arc;
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -44,7 +45,7 @@ fn make_app_with_n_sessions(n: usize) -> UiApp {
         .collect();
 
     let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel(1);
-    let (_state_tx, state_rx) = tokio::sync::watch::channel(StateSnapshot::default());
+    let (_state_tx, state_rx) = tokio::sync::watch::channel(Arc::new(StateSnapshot::default()));
     let (_preview_tx, preview_rx) = tokio::sync::mpsc::channel(1);
     let mut app = UiApp::new(state_rx, preview_rx, cmd_tx);
     app.sessions = sessions;

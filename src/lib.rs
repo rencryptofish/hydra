@@ -1,9 +1,13 @@
+pub mod agent;
 pub mod app;
 pub mod backend;
 pub mod event;
 pub mod logs;
 pub mod manifest;
+pub mod models;
 pub mod session;
+pub mod state;
+pub mod system;
 pub mod tmux;
 pub mod tmux_control;
 pub mod ui;

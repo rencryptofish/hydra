@@ -142,7 +142,7 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
 
     // Set up channels between Backend and UiApp
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
-    let (state_tx, state_rx) = tokio::sync::watch::channel(StateSnapshot::default());
+    let (state_tx, state_rx) = tokio::sync::watch::channel(Arc::new(StateSnapshot::default()));
     let (preview_tx, preview_rx) = tokio::sync::mpsc::channel(16);
 
     let manifest_dir = manifest::default_base_dir();

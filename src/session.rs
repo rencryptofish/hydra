@@ -86,6 +86,47 @@ pub struct Session {
     pub _alive: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SessionId(String);
+
+impl SessionId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<String> for SessionId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for SessionId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl Session {
+    pub fn id(&self) -> SessionId {
+        SessionId(self.tmux_name.clone())
+    }
+}
+
 pub fn format_duration(d: Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
@@ -189,6 +230,13 @@ mod tests {
     fn tmux_session_name_with_empty_name() {
         let name = tmux_session_name("abcd1234", "");
         assert_eq!(name, "hydra-abcd1234-");
+    }
+
+    #[test]
+    fn session_id_new_and_display() {
+        let id = SessionId::new("hydra-abcd1234-alpha");
+        assert_eq!(id.as_str(), "hydra-abcd1234-alpha");
+        assert_eq!(id.to_string(), "hydra-abcd1234-alpha");
     }
 
     // ── parse_session_name tests ──────────────────────────────────────

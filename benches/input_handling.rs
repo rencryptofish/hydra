@@ -1,5 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use std::sync::Arc;
 
 use hydra::app::{StateSnapshot, UiApp};
 use hydra::session::{AgentType, Session, SessionStatus};
@@ -41,7 +42,7 @@ fn make_app_with_n_sessions(n: usize) -> UiApp {
         .collect();
 
     let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel(1);
-    let (_state_tx, state_rx) = tokio::sync::watch::channel(StateSnapshot::default());
+    let (_state_tx, state_rx) = tokio::sync::watch::channel(Arc::new(StateSnapshot::default()));
     let (_preview_tx, preview_rx) = tokio::sync::mpsc::channel(1);
     let mut app = UiApp::new(state_rx, preview_rx, cmd_tx);
     app.sessions = sessions;
@@ -49,38 +50,6 @@ fn make_app_with_n_sessions(n: usize) -> UiApp {
 }
 
 // ── Benchmarks ──────────────────────────────────────────────────────
-
-fn bench_normalize_capture(c: &mut Criterion) {
-    let mut group = c.benchmark_group("normalize_capture");
-
-    // Clean text ~1.5KB
-    let clean = "Hello from Claude\nI'll help you with that.\n\
-                 Let me look at the code...\n"
-        .repeat(30);
-    group.bench_function("clean_1_5kb", |b| {
-        b.iter(|| hydra::app::normalize_capture(black_box(&clean)));
-    });
-
-    // Noisy text ~4KB with ANSI escapes and braille spinners
-    let noisy = (0..100)
-        .map(|i| {
-            format!(
-                "\x1b[32mline {i}\x1b[0m \u{2800}\u{280B}\u{2839} some text \x1b[1;34mcolored\x1b[0m\n"
-            )
-        })
-        .collect::<String>();
-    group.bench_function("noisy_4kb", |b| {
-        b.iter(|| hydra::app::normalize_capture(black_box(&noisy)));
-    });
-
-    // Large text ~50KB
-    let large = "This is a longer line of terminal output with various content.\n".repeat(800);
-    group.bench_function("large_50kb", |b| {
-        b.iter(|| hydra::app::normalize_capture(black_box(&large)));
-    });
-
-    group.finish();
-}
 
 fn bench_handle_browse_key(c: &mut Criterion) {
     let mut group = c.benchmark_group("handle_browse_key");
@@ -214,7 +183,6 @@ fn bench_parse_diff_numstat(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_normalize_capture,
     bench_handle_browse_key,
     bench_handle_mouse,
     bench_parse_diff_numstat,

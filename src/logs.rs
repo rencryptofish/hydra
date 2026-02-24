@@ -391,11 +391,8 @@ pub struct GlobalStats {
 }
 
 impl GlobalStats {
-    /// Estimated cost in USD using provider-specific pricing.
-    /// Claude: Sonnet ($3 in / $15 out / $0.30 cache-read / $3.75 cache-write per MTok).
-    /// Codex: GPT-5 Codex estimate ($1.25 in / $10 out / $0.125 cache-read per MTok).
-    pub fn cost_usd(&self) -> f64 {
-        let has_breakdown = self.claude_tokens_in > 0
+    fn has_provider_breakdown(&self) -> bool {
+        self.claude_tokens_in > 0
             || self.claude_tokens_out > 0
             || self.claude_tokens_cache_read > 0
             || self.claude_tokens_cache_write > 0
@@ -404,10 +401,55 @@ impl GlobalStats {
             || self.codex_tokens_cache_read > 0
             || self.gemini_tokens_in > 0
             || self.gemini_tokens_out > 0
-            || self.gemini_tokens_cached > 0;
+            || self.gemini_tokens_cached > 0
+    }
 
-        // Backward compatibility for tests/older state that only set aggregate fields.
-        if !has_breakdown {
+    pub fn has_usage(&self) -> bool {
+        if self.has_provider_breakdown() {
+            self.claude_tokens_in > 0
+                || self.claude_tokens_out > 0
+                || self.claude_tokens_cache_read > 0
+                || self.claude_tokens_cache_write > 0
+                || self.codex_tokens_in > 0
+                || self.codex_tokens_out > 0
+                || self.codex_tokens_cache_read > 0
+                || self.gemini_tokens_in > 0
+                || self.gemini_tokens_out > 0
+                || self.gemini_tokens_cached > 0
+        } else {
+            self.tokens_in > 0
+                || self.tokens_out > 0
+                || self.tokens_cache_read > 0
+                || self.tokens_cache_write > 0
+        }
+    }
+
+    pub fn claude_display_tokens(&self) -> u64 {
+        if self.has_provider_breakdown() {
+            self.claude_tokens_in + self.claude_tokens_out
+        } else {
+            self.tokens_in + self.tokens_out
+        }
+    }
+
+    pub fn codex_display_tokens(&self) -> u64 {
+        if self.has_provider_breakdown() {
+            self.codex_tokens_in + self.codex_tokens_out
+        } else {
+            0
+        }
+    }
+
+    pub fn gemini_display_tokens(&self) -> u64 {
+        if self.has_provider_breakdown() {
+            self.gemini_tokens_in + self.gemini_tokens_out
+        } else {
+            0
+        }
+    }
+
+    pub fn claude_cost_usd(&self) -> f64 {
+        if !self.has_provider_breakdown() {
             let input = self.tokens_in as f64 * CLAUDE_INPUT_USD_PER_MTOK / 1_000_000.0;
             let output = self.tokens_out as f64 * CLAUDE_OUTPUT_USD_PER_MTOK / 1_000_000.0;
             let cache_read =
@@ -425,6 +467,14 @@ impl GlobalStats {
         let claude_cache_write =
             self.claude_tokens_cache_write as f64 * CLAUDE_CACHE_WRITE_USD_PER_MTOK / 1_000_000.0;
 
+        claude_input + claude_output + claude_cache_read + claude_cache_write
+    }
+
+    pub fn codex_cost_usd(&self) -> f64 {
+        if !self.has_provider_breakdown() {
+            return 0.0;
+        }
+
         let codex_uncached_input_tokens = self
             .codex_tokens_in
             .saturating_sub(self.codex_tokens_cache_read);
@@ -433,6 +483,14 @@ impl GlobalStats {
         let codex_output = self.codex_tokens_out as f64 * CODEX_OUTPUT_USD_PER_MTOK / 1_000_000.0;
         let codex_cache_read =
             self.codex_tokens_cache_read as f64 * CODEX_CACHE_READ_USD_PER_MTOK / 1_000_000.0;
+
+        codex_input + codex_output + codex_cache_read
+    }
+
+    pub fn gemini_cost_usd(&self) -> f64 {
+        if !self.has_provider_breakdown() {
+            return 0.0;
+        }
 
         let gemini_uncached_input = self
             .gemini_tokens_in
@@ -443,16 +501,14 @@ impl GlobalStats {
         let gemini_cache_read =
             self.gemini_tokens_cached as f64 * GEMINI_CACHE_READ_USD_PER_MTOK / 1_000_000.0;
 
-        claude_input
-            + claude_output
-            + claude_cache_read
-            + claude_cache_write
-            + codex_input
-            + codex_output
-            + codex_cache_read
-            + gemini_input
-            + gemini_output
-            + gemini_cache_read
+        gemini_input + gemini_output + gemini_cache_read
+    }
+
+    /// Estimated cost in USD using provider-specific pricing.
+    /// Claude: Sonnet ($3 in / $15 out / $0.30 cache-read / $3.75 cache-write per MTok).
+    /// Codex: GPT-5 Codex estimate ($1.25 in / $10 out / $0.125 cache-read per MTok).
+    pub fn cost_usd(&self) -> f64 {
+        self.claude_cost_usd() + self.codex_cost_usd() + self.gemini_cost_usd()
     }
 }
 
@@ -1845,8 +1901,12 @@ fn gemini_chats_dir(cwd: &str) -> Option<PathBuf> {
     }
 }
 
-/// Find the most recently modified Gemini session file in the chats dir.
-fn find_latest_gemini_session(chats_dir: &std::path::Path) -> Option<PathBuf> {
+/// Find the most recently modified Gemini session file in the chats dir,
+/// skipping files that are already claimed by other tmux Gemini sessions.
+fn find_latest_gemini_session(
+    chats_dir: &std::path::Path,
+    claimed_paths: &HashSet<String>,
+) -> Option<PathBuf> {
     let entries = std::fs::read_dir(chats_dir).ok()?;
     let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
     for entry in entries.flatten() {
@@ -1856,6 +1916,10 @@ fn find_latest_gemini_session(chats_dir: &std::path::Path) -> Option<PathBuf> {
         }
         let fname = path.file_name()?.to_str()?;
         if !fname.starts_with("session-") {
+            continue;
+        }
+        let path_key = path.to_string_lossy().to_string();
+        if claimed_paths.contains(&path_key) {
             continue;
         }
         if let Ok(meta) = path.metadata() {
@@ -1872,7 +1936,11 @@ fn find_latest_gemini_session(chats_dir: &std::path::Path) -> Option<PathBuf> {
 /// Resolve the Gemini session JSON file path for a tmux session.
 /// First tries lsof to find an open session file, then falls back to
 /// the most recently modified session file in the project's chats dir.
-pub async fn resolve_gemini_session_path(tmux_name: &str, cwd: &str) -> Option<String> {
+pub async fn resolve_gemini_session_path(
+    tmux_name: &str,
+    cwd: &str,
+    claimed_paths: &HashSet<String>,
+) -> Option<String> {
     let pid = get_pane_pid(tmux_name).await?;
     let all_pids = collect_descendant_pids(pid).await;
 
@@ -1893,7 +1961,7 @@ pub async fn resolve_gemini_session_path(tmux_name: &str, cwd: &str) -> Option<S
 
     // Fallback: find the most recently modified session file
     let chats_dir = gemini_chats_dir(cwd)?;
-    let path = find_latest_gemini_session(&chats_dir)?;
+    let path = find_latest_gemini_session(&chats_dir, claimed_paths)?;
     Some(path.to_string_lossy().to_string())
 }
 
@@ -3449,6 +3517,80 @@ mod tests {
         // Uncached input should saturate at 0, so only cached pricing applies.
         let expected = 200.0 * CODEX_CACHE_READ_USD_PER_MTOK / 1_000_000.0;
         assert!((cost - expected).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn global_stats_cost_calculation_with_gemini_breakdown() {
+        let stats = GlobalStats {
+            gemini_tokens_in: 1_000_000,
+            gemini_tokens_out: 100_000,
+            gemini_tokens_cached: 200_000,
+            ..Default::default()
+        };
+        let cost = stats.cost_usd();
+        assert!(
+            (cost - 2.0625).abs() < 0.01,
+            "expected ~$2.06, got ${cost:.2}"
+        );
+        assert!((stats.gemini_cost_usd() - cost).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn global_stats_gemini_cost_saturates_when_cache_exceeds_input() {
+        let stats = GlobalStats {
+            gemini_tokens_in: 100,
+            gemini_tokens_out: 0,
+            gemini_tokens_cached: 200,
+            ..Default::default()
+        };
+        let expected = 200.0 * GEMINI_CACHE_READ_USD_PER_MTOK / 1_000_000.0;
+        assert!((stats.gemini_cost_usd() - expected).abs() < f64::EPSILON);
+        assert!((stats.cost_usd() - expected).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn global_stats_helper_methods_fallback_to_aggregate_fields() {
+        let stats = GlobalStats {
+            tokens_in: 1_500,
+            tokens_out: 500,
+            tokens_cache_read: 100,
+            tokens_cache_write: 50,
+            ..Default::default()
+        };
+
+        assert!(stats.has_usage());
+        assert_eq!(stats.claude_display_tokens(), 2_000);
+        assert_eq!(stats.codex_display_tokens(), 0);
+        assert_eq!(stats.gemini_display_tokens(), 0);
+        assert!((stats.codex_cost_usd() - 0.0).abs() < f64::EPSILON);
+        assert!((stats.gemini_cost_usd() - 0.0).abs() < f64::EPSILON);
+        assert!((stats.claude_cost_usd() - stats.cost_usd()).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn global_stats_helper_methods_use_provider_breakdown_when_present() {
+        let stats = GlobalStats {
+            tokens_in: 99_999,
+            tokens_out: 88_888,
+            claude_tokens_in: 1_000,
+            claude_tokens_out: 100,
+            claude_tokens_cache_read: 25,
+            claude_tokens_cache_write: 10,
+            codex_tokens_in: 2_000,
+            codex_tokens_out: 200,
+            codex_tokens_cache_read: 400,
+            gemini_tokens_in: 3_000,
+            gemini_tokens_out: 300,
+            gemini_tokens_cached: 600,
+            ..Default::default()
+        };
+
+        assert!(stats.has_usage());
+        assert_eq!(stats.claude_display_tokens(), 1_100);
+        assert_eq!(stats.codex_display_tokens(), 2_200);
+        assert_eq!(stats.gemini_display_tokens(), 3_300);
+        let combined = stats.claude_cost_usd() + stats.codex_cost_usd() + stats.gemini_cost_usd();
+        assert!((stats.cost_usd() - combined).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -5751,6 +5893,43 @@ mod tests {
     }
 
     #[test]
+    fn find_latest_gemini_session_skips_claimed_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let chats_dir = dir.path().join("chats");
+        std::fs::create_dir_all(&chats_dir).unwrap();
+
+        let first = chats_dir.join("session-2026-02-24T16-20-a.json");
+        let second = chats_dir.join("session-2026-02-24T16-21-b.json");
+        std::fs::write(&first, "{}").unwrap();
+        std::fs::write(&second, "{}").unwrap();
+
+        let mut claimed = HashSet::new();
+        claimed.insert(second.to_string_lossy().to_string());
+
+        let resolved = find_latest_gemini_session(&chats_dir, &claimed).unwrap();
+        assert_eq!(resolved, first);
+    }
+
+    #[test]
+    fn find_latest_gemini_session_returns_none_when_all_claimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let chats_dir = dir.path().join("chats");
+        std::fs::create_dir_all(&chats_dir).unwrap();
+
+        let first = chats_dir.join("session-2026-02-24T16-20-a.json");
+        let second = chats_dir.join("session-2026-02-24T16-21-b.json");
+        std::fs::write(&first, "{}").unwrap();
+        std::fs::write(&second, "{}").unwrap();
+
+        let mut claimed = HashSet::new();
+        claimed.insert(first.to_string_lossy().to_string());
+        claimed.insert(second.to_string_lossy().to_string());
+
+        let resolved = find_latest_gemini_session(&chats_dir, &claimed);
+        assert!(resolved.is_none());
+    }
+
+    #[test]
     fn apply_gemini_stats_replaces_values() {
         let mut stats = SessionStats::default();
         stats.turns = 5;
@@ -5818,5 +5997,85 @@ mod tests {
         assert_eq!(stats.gemini_tokens_cached, 50);
         assert_eq!(stats.tokens_in, 500);
         assert_eq!(stats.tokens_out, 100);
+    }
+
+    #[test]
+    fn gemini_global_stats_reparse_replaces_prior_file_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("myproject").join("chats");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let session_path = project_dir.join("session-2026-02-24T10-00-abc12345.json");
+
+        let first = r#"{
+            "sessionId": "abc-123",
+            "messages": [
+                {
+                    "type": "gemini",
+                    "timestamp": "2026-02-24T10:00:05Z",
+                    "tokens": {"input": 100, "output": 20, "cached": 10}
+                }
+            ]
+        }"#;
+        std::fs::write(&session_path, first).unwrap();
+
+        let mut stats = GlobalStats::default();
+        stats.date = "2026-02-24".to_string();
+
+        process_gemini_global_file(&session_path, &mut stats, "2026-02-24");
+        assert_eq!(stats.gemini_tokens_in, 100);
+        assert_eq!(stats.gemini_tokens_out, 20);
+        assert_eq!(stats.gemini_tokens_cached, 10);
+        assert_eq!(stats.tokens_in, 100);
+        assert_eq!(stats.tokens_out, 20);
+        assert_eq!(stats.tokens_cache_read, 10);
+
+        // Gemini rewrites files; totals should be replaced, not incremented.
+        let rewritten = r#"{
+            "sessionId": "abc-123",
+            "messages": [
+                {
+                    "type": "gemini",
+                    "timestamp": "2026-02-24T11:00:05Z",
+                    "tokens": {"input": 300, "output": 50, "cached": 40}
+                },
+                {
+                    "type": "gemini",
+                    "timestamp": "2026-02-24T11:01:05Z",
+                    "tokens": {"input": 200, "output": 25, "cached": 10}
+                }
+            ]
+        }"#;
+        std::fs::write(&session_path, rewritten).unwrap();
+        process_gemini_global_file(&session_path, &mut stats, "2026-02-24");
+
+        assert_eq!(stats.gemini_tokens_in, 500);
+        assert_eq!(stats.gemini_tokens_out, 75);
+        assert_eq!(stats.gemini_tokens_cached, 50);
+        assert_eq!(stats.tokens_in, 500);
+        assert_eq!(stats.tokens_out, 75);
+        assert_eq!(stats.tokens_cache_read, 50);
+
+        // If rewritten file no longer contains today's messages, contribution
+        // from this file should be removed.
+        let old_only = r#"{
+            "sessionId": "abc-123",
+            "messages": [
+                {
+                    "type": "gemini",
+                    "timestamp": "2026-02-23T11:00:05Z",
+                    "tokens": {"input": 999, "output": 999, "cached": 999}
+                }
+            ]
+        }"#;
+        std::fs::write(&session_path, old_only).unwrap();
+        process_gemini_global_file(&session_path, &mut stats, "2026-02-24");
+
+        assert_eq!(stats.gemini_tokens_in, 0);
+        assert_eq!(stats.gemini_tokens_out, 0);
+        assert_eq!(stats.gemini_tokens_cached, 0);
+        assert_eq!(stats.tokens_in, 0);
+        assert_eq!(stats.tokens_out, 0);
+        assert_eq!(stats.tokens_cache_read, 0);
     }
 }
