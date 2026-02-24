@@ -1,4 +1,4 @@
-.PHONY: install build test nextest review coverage deny mutants fuzz bench check
+.PHONY: install build test nextest review coverage coverage-lcov deny mutants fuzz bench udeps check
 
 install:
 	cargo install --path .
@@ -37,7 +37,10 @@ fuzz:
 bench:
 	cargo bench
 
+udeps:
+	cargo +nightly udeps --all-targets
+
 # Run all quality checks (good for CI)
-check: test deny
+check: test deny udeps
 	cargo fmt --check
 	cargo clippy -- -D warnings
