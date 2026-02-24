@@ -1,4 +1,5 @@
 pub mod app;
+pub mod backend;
 pub mod event;
 pub mod logs;
 pub mod manifest;

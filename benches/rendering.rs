@@ -1,45 +1,11 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use hydra::app::{App, DiffFile};
+use hydra::app::{DiffFile, StateSnapshot, UiApp};
 use hydra::logs::GlobalStats;
 use hydra::session::{AgentType, Session, SessionStatus};
-use hydra::tmux::SessionManager;
 use hydra::ui;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
-
-// ── Noop session manager for benchmarks ─────────────────────────────
-
-struct NoopSessionManager;
-
-#[async_trait::async_trait]
-impl SessionManager for NoopSessionManager {
-    async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> {
-        Ok(vec![])
-    }
-    async fn create_session(
-        &self,
-        _: &str,
-        _: &str,
-        _: &AgentType,
-        _: &str,
-        _: Option<&str>,
-    ) -> anyhow::Result<String> {
-        Ok(String::new())
-    }
-    async fn capture_pane(&self, _: &str) -> anyhow::Result<String> {
-        Ok(String::new())
-    }
-    async fn kill_session(&self, _: &str) -> anyhow::Result<()> {
-        Ok(())
-    }
-    async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> {
-        Ok(())
-    }
-    async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> {
-        Ok(String::new())
-    }
-}
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -60,7 +26,7 @@ const NATO: &[&str] = &[
     "uniform", "victor", "whiskey", "xray", "yankee", "zulu",
 ];
 
-fn make_app_with_n_sessions(n: usize) -> App {
+fn make_app_with_n_sessions(n: usize) -> UiApp {
     let sessions: Vec<Session> = (0..n)
         .map(|i| {
             let name = if i < NATO.len() {
@@ -77,11 +43,10 @@ fn make_app_with_n_sessions(n: usize) -> App {
         })
         .collect();
 
-    let mut app = App::new_with_manager(
-        "bench-project".to_string(),
-        "/tmp/bench".to_string(),
-        Box::new(NoopSessionManager),
-    );
+    let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel(1);
+    let (_state_tx, state_rx) = tokio::sync::watch::channel(StateSnapshot::default());
+    let (_preview_tx, preview_rx) = tokio::sync::mpsc::channel(1);
+    let mut app = UiApp::new(state_rx, preview_rx, cmd_tx);
     app.sessions = sessions;
 
     // Add last messages for each session

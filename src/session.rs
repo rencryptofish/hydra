@@ -6,6 +6,7 @@ use std::time::Duration;
 pub enum AgentType {
     Claude,
     Codex,
+    Gemini,
 }
 
 impl AgentType {
@@ -13,11 +14,12 @@ impl AgentType {
         match self {
             AgentType::Claude => "claude --dangerously-skip-permissions",
             AgentType::Codex => "codex -c check_for_update_on_startup=false --yolo",
+            AgentType::Gemini => "gemini --yolo",
         }
     }
 
     pub fn all() -> &'static [AgentType] {
-        &[AgentType::Claude, AgentType::Codex]
+        &[AgentType::Claude, AgentType::Codex, AgentType::Gemini]
     }
 }
 
@@ -26,6 +28,7 @@ impl fmt::Display for AgentType {
         match self {
             AgentType::Claude => write!(f, "Claude"),
             AgentType::Codex => write!(f, "Codex"),
+            AgentType::Gemini => write!(f, "Gemini"),
         }
     }
 }
@@ -37,8 +40,9 @@ impl std::str::FromStr for AgentType {
         match s.to_lowercase().as_str() {
             "claude" => Ok(AgentType::Claude),
             "codex" => Ok(AgentType::Codex),
+            "gemini" => Ok(AgentType::Gemini),
             _ => Err(anyhow::anyhow!(
-                "Unknown agent type: {s}. Use 'claude' or 'codex'."
+                "Unknown agent type: {s}. Use 'claude', 'codex', or 'gemini'."
             )),
         }
     }
@@ -236,14 +240,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn agent_type_command_gemini() {
+        assert_eq!(AgentType::Gemini.command(), "gemini --yolo");
+    }
+
     // ── AgentType::all tests ──────────────────────────────────────────
 
     #[test]
-    fn agent_type_all_returns_both_variants() {
+    fn agent_type_all_returns_all_variants() {
         let all = AgentType::all();
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 3);
         assert_eq!(all[0], AgentType::Claude);
         assert_eq!(all[1], AgentType::Codex);
+        assert_eq!(all[2], AgentType::Gemini);
     }
 
     // ── AgentType Display tests ───────────────────────────────────────
@@ -256,6 +266,11 @@ mod tests {
     #[test]
     fn agent_type_display_codex() {
         assert_eq!(format!("{}", AgentType::Codex), "Codex");
+    }
+
+    #[test]
+    fn agent_type_display_gemini() {
+        assert_eq!(format!("{}", AgentType::Gemini), "Gemini");
     }
 
     // ── AgentType FromStr tests ───────────────────────────────────────
@@ -282,6 +297,18 @@ mod tests {
     fn agent_type_from_str_case_insensitive_mixed() {
         let agent = AgentType::from_str("Codex").unwrap();
         assert_eq!(agent, AgentType::Codex);
+    }
+
+    #[test]
+    fn agent_type_from_str_gemini_lowercase() {
+        let agent = AgentType::from_str("gemini").unwrap();
+        assert_eq!(agent, AgentType::Gemini);
+    }
+
+    #[test]
+    fn agent_type_from_str_gemini_mixed_case() {
+        let agent = AgentType::from_str("Gemini").unwrap();
+        assert_eq!(agent, AgentType::Gemini);
     }
 
     #[test]

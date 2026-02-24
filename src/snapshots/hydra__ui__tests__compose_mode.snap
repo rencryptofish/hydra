@@ -23,6 +23,6 @@ expression: output
 │              │┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 │              │╔ Compose ═════════════════════════════════════════════════════╗
 │              │║                                                              ║
-│              │║Ctrl+Enter: send | Esc: cancel                                ║
+│              │║Enter: send | Esc: cancel                                     ║
 └──────────────┘╚══════════════════════════════════════════════════════════════╝
- Ctrl+Enter: send  Enter: newline  Esc: cancel
+ Enter: send  Esc: cancel

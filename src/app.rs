@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -7,8 +7,34 @@ use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKin
 use ratatui::layout::{Position, Rect};
 use ratatui::text::Text;
 
-use crate::logs::{GlobalStats, SessionStats};
+use crate::logs::{ConversationEntry, GlobalStats, SessionStats};
 use crate::session::{AgentType, Session, SessionStatus};
+
+/// Per-session conversation buffer parsed from JSONL logs.
+pub(crate) struct ConversationBuffer {
+    pub(crate) entries: VecDeque<ConversationEntry>,
+    pub(crate) read_offset: u64,
+}
+
+impl ConversationBuffer {
+    const MAX_ENTRIES: usize = 500;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            read_offset: 0,
+        }
+    }
+
+    pub(crate) fn extend(&mut self, new_entries: Vec<ConversationEntry>) {
+        for entry in new_entries {
+            if self.entries.len() >= Self::MAX_ENTRIES {
+                self.entries.pop_front();
+            }
+            self.entries.push_back(entry);
+        }
+    }
+}
 
 /// Results from a background message/stats refresh task.
 pub struct MessageRefreshResult {
@@ -18,15 +44,94 @@ pub struct MessageRefreshResult {
     pub session_stats: HashMap<String, SessionStats>,
     pub global_stats: GlobalStats,
     pub diff_files: Vec<DiffFile>,
+    pub conversations: HashMap<String, Vec<ConversationEntry>>,
+    pub conversation_offsets: HashMap<String, u64>,
+    /// Sessions whose conversation buffer should be fully replaced (not extended).
+    /// Parsers can set this when they cannot provide append-only incremental entries.
+    pub conversation_replace: HashSet<String>,
 }
 use crate::tmux::{SessionManager, TmuxSessionManager};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mode {
     Browse,
-    Attached,
+    Compose,
     NewSessionAgent,
     ConfirmDelete,
+}
+
+/// State for the compose input area in Compose mode.
+pub struct ComposeState {
+    pub(crate) lines: Vec<String>,
+    pub(crate) cursor_row: usize,
+    pub(crate) cursor_col: usize,
+}
+
+impl ComposeState {
+    fn new() -> Self {
+        Self {
+            lines: vec![String::new()],
+            cursor_row: 0,
+            cursor_col: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.lines = vec![String::new()];
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+    }
+
+    /// Get the full text content of the compose buffer.
+    pub(crate) fn text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        let line = &mut self.lines[self.cursor_row];
+        let byte_idx = char_to_byte_index(line, self.cursor_col);
+        line.insert(byte_idx, ch);
+        self.cursor_col += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor_col > 0 {
+            let line = &mut self.lines[self.cursor_row];
+            let byte_idx = char_to_byte_index(line, self.cursor_col - 1);
+            let end_idx = char_to_byte_index(line, self.cursor_col);
+            line.replace_range(byte_idx..end_idx, "");
+            self.cursor_col -= 1;
+        } else if self.cursor_row > 0 {
+            let current_line = self.lines.remove(self.cursor_row);
+            self.cursor_row -= 1;
+            self.cursor_col = self.lines[self.cursor_row].chars().count();
+            self.lines[self.cursor_row].push_str(&current_line);
+        }
+    }
+
+    fn move_left(&mut self) {
+        if self.cursor_col > 0 {
+            self.cursor_col -= 1;
+        } else if self.cursor_row > 0 {
+            self.cursor_row -= 1;
+            self.cursor_col = self.lines[self.cursor_row].chars().count();
+        }
+    }
+
+    fn move_right(&mut self) {
+        let line_chars = self.lines[self.cursor_row].chars().count();
+        if self.cursor_col < line_chars {
+            self.cursor_col += 1;
+        }
+    }
+}
+
+/// Convert a character index to a byte index in a string.
+fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
 }
 
 /// Tracks per-session pane content changes and debounces status transitions.
@@ -45,7 +150,7 @@ impl StatusDetector {
     /// Extended dead tick threshold when subagents are active (~3s), allowing orchestration to settle.
     pub(crate) const DEAD_TICK_SUBAGENT_THRESHOLD: u8 = 15;
 
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             prev_captures: HashMap::new(),
             raw_captures: HashMap::new(),
@@ -132,7 +237,8 @@ impl StatusDetector {
                 };
 
                 let changed = !unchanged
-                    || (session.agent_type == AgentType::Codex && raw_changed_but_normalized_same);
+                    || (matches!(session.agent_type, AgentType::Codex | AgentType::Gemini)
+                        && raw_changed_but_normalized_same);
 
                 if first_capture {
                     session.status = SessionStatus::Running;
@@ -176,6 +282,79 @@ impl StatusDetector {
     }
 }
 
+/// Activity-based status detector for Claude sessions using pane_activity timestamps.
+/// Falls back to capture-based StatusDetector for Codex sessions.
+pub(crate) struct ActivityDetector {
+    /// Last observed pane_activity timestamp per session.
+    pub(crate) last_activity: HashMap<String, u64>,
+    /// Consecutive ticks with unchanged activity per session.
+    pub(crate) unchanged_ticks: HashMap<String, u8>,
+}
+
+impl ActivityDetector {
+    /// Seconds of unchanged pane_activity before declaring Idle.
+    const IDLE_THRESHOLD_SECS: u64 = 6;
+    /// Shorter idle threshold when JSONL logs indicate task is complete.
+    const IDLE_THRESHOLD_LOG_SECS: u64 = 3;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            last_activity: HashMap::new(),
+            unchanged_ticks: HashMap::new(),
+        }
+    }
+
+    /// Update status for a Claude session based on pane_activity timestamp.
+    /// Returns the determined status, or None if no activity data is available.
+    pub(crate) fn update_claude_status(
+        &mut self,
+        tmux_name: &str,
+        activity_epoch: u64,
+        session_stats: Option<&SessionStats>,
+    ) -> SessionStatus {
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let log_idle = session_stats
+            .map(|st| st.task_elapsed().is_none())
+            .unwrap_or(false);
+        let threshold = if log_idle {
+            Self::IDLE_THRESHOLD_LOG_SECS
+        } else {
+            Self::IDLE_THRESHOLD_SECS
+        };
+
+        let prev_activity = self.last_activity.get(tmux_name).copied();
+        self.last_activity
+            .insert(tmux_name.to_string(), activity_epoch);
+
+        let activity_changed = match prev_activity {
+            Some(prev) => activity_epoch != prev,
+            None => true, // First observation
+        };
+
+        if activity_changed {
+            self.unchanged_ticks.insert(tmux_name.to_string(), 0);
+            SessionStatus::Running
+        } else {
+            let elapsed = now_epoch.saturating_sub(activity_epoch);
+            if elapsed >= threshold {
+                SessionStatus::Idle
+            } else {
+                SessionStatus::Running
+            }
+        }
+    }
+
+    /// Remove entries for sessions that no longer exist.
+    pub(crate) fn prune(&mut self, live_keys: &HashSet<&String>) {
+        self.last_activity.retain(|k, _| live_keys.contains(k));
+        self.unchanged_ticks.retain(|k, _| live_keys.contains(k));
+    }
+}
+
 /// Tracks per-session task start/last-active timestamps for elapsed timer display.
 pub(crate) struct TaskTimers {
     pub(crate) task_starts: HashMap<String, Instant>,
@@ -183,7 +362,7 @@ pub(crate) struct TaskTimers {
 }
 
 impl TaskTimers {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             task_starts: HashMap::new(),
             task_last_active: HashMap::new(),
@@ -306,7 +485,7 @@ pub(crate) struct BackgroundRefreshState {
 }
 
 impl BackgroundRefreshState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             log_uuids: HashMap::new(),
             uuid_retry_cooldowns: HashMap::new(),
@@ -319,10 +498,11 @@ impl BackgroundRefreshState {
     /// Returns `Some(result)` when a background task completes.
     pub(crate) fn tick(
         &mut self,
-        tmux_names: &[String],
+        sessions: &[(String, AgentType)],
         session_stats: &HashMap<String, SessionStats>,
         global_stats: &GlobalStats,
         cwd: &str,
+        conversation_offsets: HashMap<String, u64>,
     ) -> Option<MessageRefreshResult> {
         let mut completed = None;
 
@@ -345,8 +525,8 @@ impl BackgroundRefreshState {
         }
 
         self.message_tick = self.message_tick.wrapping_add(1);
-        // Run every 100 ticks (~5 seconds at 50ms tick rate).
-        if !self.message_tick.is_multiple_of(100) {
+        // Run every 40 ticks (~2 seconds at 50ms tick rate).
+        if !self.message_tick.is_multiple_of(40) {
             return completed;
         }
 
@@ -356,7 +536,7 @@ impl BackgroundRefreshState {
         }
 
         // Clone data for background task
-        let tmux_names = tmux_names.to_vec();
+        let sessions = sessions.to_vec();
         let log_uuids = self.log_uuids.clone();
         let uuid_retry_cooldowns = self.uuid_retry_cooldowns.clone();
         let session_stats = session_stats.clone();
@@ -368,12 +548,13 @@ impl BackgroundRefreshState {
 
         tokio::spawn(async move {
             let result = compute_message_refresh(
-                tmux_names,
+                sessions,
                 log_uuids,
                 uuid_retry_cooldowns,
                 session_stats,
                 global_stats,
                 cwd,
+                conversation_offsets,
             )
             .await;
             let _ = tx.send(result);
@@ -403,6 +584,7 @@ pub struct App {
     pub sidebar_area: Cell<Rect>,
     pub preview_area: Cell<Rect>,
     pub(crate) status: StatusDetector,
+    pub(crate) activity: ActivityDetector,
     pub(crate) timers: TaskTimers,
     pub last_messages: HashMap<String, String>,
     pub session_stats: HashMap<String, SessionStats>,
@@ -410,6 +592,8 @@ pub struct App {
     /// Per-file git diff stats from `git diff --numstat`
     pub diff_files: Vec<DiffFile>,
     pub(crate) bg: BackgroundRefreshState,
+    pub(crate) conversations: HashMap<String, ConversationBuffer>,
+    pub(crate) compose: ComposeState,
     pub manifest_dir: PathBuf,
     manager: Box<dyn SessionManager>,
     /// Pending literal keys to send to tmux (tmux_name, text).
@@ -445,12 +629,15 @@ impl App {
             sidebar_area: Cell::new(Rect::default()),
             preview_area: Cell::new(Rect::default()),
             status: StatusDetector::new(),
+            activity: ActivityDetector::new(),
             timers: TaskTimers::new(),
             last_messages: HashMap::new(),
             session_stats: HashMap::new(),
             global_stats: GlobalStats::default(),
             diff_files: Vec::new(),
             bg: BackgroundRefreshState::new(),
+            conversations: HashMap::new(),
+            compose: ComposeState::new(),
             manifest_dir: crate::manifest::default_base_dir(),
             manager,
             pending_literal_keys: None,
@@ -471,35 +658,103 @@ impl App {
                     .map(|s| (s.tmux_name.clone(), s.status.clone()))
                     .collect();
 
-                // Batch-capture pane content in parallel for non-exited sessions.
-                // Skip sessions that have been idle for many ticks — their content
-                // hasn't changed, so recapturing wastes subprocess calls.
-                // Reuse cached captures for skipped sessions so status detection
-                // still runs (hysteresis state machine needs input every tick).
+                // Get activity timestamps for all sessions (single tmux call).
+                let pane_status = self.manager.batch_pane_status().await;
+
+                // Apply activity-based status for Claude sessions with activity data.
+                // Codex sessions need capture-based detection (no JSONL logs).
+                let mut claude_handled: HashSet<String> = HashSet::new();
+                if let Some(ref status_map) = pane_status {
+                    for session in sessions.iter_mut() {
+                        if session.agent_type != AgentType::Claude {
+                            continue;
+                        }
+                        if let Some(&(is_dead, activity)) = status_map.get(&session.tmux_name) {
+                            if is_dead {
+                                session.status = SessionStatus::Exited;
+                            } else {
+                                let stats = self.session_stats.get(&session.tmux_name);
+                                session.status = self.activity.update_claude_status(
+                                    &session.tmux_name,
+                                    activity,
+                                    stats,
+                                );
+                            }
+                            claude_handled.insert(session.tmux_name.clone());
+                        }
+                    }
+                }
+
+                // Apply dead-tick debounce for Claude sessions (same as before).
+                for session in sessions.iter_mut() {
+                    if !claude_handled.contains(&session.tmux_name) {
+                        continue;
+                    }
+                    let name = session.tmux_name.clone();
+                    let has_active_subagents = self
+                        .session_stats
+                        .get(&name)
+                        .map(|st| st.active_subagents > 0)
+                        .unwrap_or(false);
+
+                    if session.status == SessionStatus::Exited {
+                        let count = self.status.dead_ticks.entry(name.clone()).or_insert(0);
+                        *count = count.saturating_add(1);
+                        let threshold = if has_active_subagents {
+                            StatusDetector::DEAD_TICK_SUBAGENT_THRESHOLD
+                        } else {
+                            StatusDetector::DEAD_TICK_THRESHOLD
+                        };
+                        if *count < threshold {
+                            session.status = prev_statuses
+                                .get(&name)
+                                .filter(|s| **s != SessionStatus::Exited)
+                                .cloned()
+                                .unwrap_or(SessionStatus::Idle);
+                        }
+                    } else {
+                        self.status.dead_ticks.insert(name, 0);
+                    }
+                }
+
+                // For Codex sessions (and any Claude without activity data),
+                // use capture-based status detection.
                 const IDLE_CAPTURE_SKIP_THRESHOLD: u8 = 40;
-                let live_names: Vec<String> = sessions
+                let codex_names: Vec<String> = sessions
                     .iter()
+                    .filter(|s| !claude_handled.contains(&s.tmux_name))
                     .filter(|s| s.status != SessionStatus::Exited)
                     .filter(|s| {
                         self.status.idle_ticks_for(&s.tmux_name) < IDLE_CAPTURE_SKIP_THRESHOLD
                     })
                     .map(|s| s.tmux_name.clone())
                     .collect();
-                let capture_results = self.manager.capture_panes(&live_names).await;
-                let mut captures: HashMap<String, String> = live_names
+                let capture_results = self.manager.capture_panes(&codex_names).await;
+                let mut captures: HashMap<String, String> = codex_names
                     .into_iter()
                     .zip(capture_results)
                     .map(|(name, res)| (name, res.unwrap_or_default()))
                     .collect();
-                // For stable-idle sessions we skipped, reuse last known capture
-                // so the status detector still processes them.
+                // For stable-idle Codex sessions we skipped, reuse last known capture.
                 for s in sessions.iter() {
-                    if s.status != SessionStatus::Exited && !captures.contains_key(&s.tmux_name) {
+                    if !claude_handled.contains(&s.tmux_name)
+                        && s.status != SessionStatus::Exited
+                        && !captures.contains_key(&s.tmux_name)
+                    {
                         if let Some(prev) = self.status.raw_captures.get(&s.tmux_name) {
                             captures.insert(s.tmux_name.clone(), prev.clone());
                         }
                     }
                 }
+
+                // Run capture-based status detection for Codex sessions.
+                // Claude sessions already have their status set via activity detector,
+                // so we save their statuses and restore after update_statuses.
+                let claude_statuses: HashMap<String, SessionStatus> = sessions
+                    .iter()
+                    .filter(|s| claude_handled.contains(&s.tmux_name))
+                    .map(|s| (s.tmux_name.clone(), s.status.clone()))
+                    .collect();
 
                 self.status.update_statuses(
                     &mut sessions,
@@ -507,6 +762,13 @@ impl App {
                     &prev_statuses,
                     &self.session_stats,
                 );
+
+                // Restore activity-based statuses for Claude sessions
+                for session in sessions.iter_mut() {
+                    if let Some(status) = claude_statuses.get(&session.tmux_name) {
+                        session.status = status.clone();
+                    }
+                }
 
                 self.timers.update(&mut sessions, &self.session_stats, now);
                 // Remember which session was selected before re-sorting
@@ -546,9 +808,11 @@ impl App {
         {
             let live_keys: HashSet<&String> = self.sessions.iter().map(|s| &s.tmux_name).collect();
             self.status.prune(&live_keys);
+            self.activity.prune(&live_keys);
             self.timers.prune(&live_keys);
             self.last_messages.retain(|k, _| live_keys.contains(k));
             self.session_stats.retain(|k, _| live_keys.contains(k));
+            self.conversations.retain(|k, _| live_keys.contains(k));
             self.bg.prune(&live_keys);
         }
 
@@ -568,11 +832,21 @@ impl App {
     /// Used for Browse-mode key presses where responsiveness matters more than
     /// freshness — the next tick will correct any stale content within 50ms.
     pub fn refresh_preview_from_cache(&mut self) {
-        let tmux_name = self
-            .sessions
-            .get(self.selected)
-            .map(|s| s.tmux_name.clone());
+        let session = self.sessions.get(self.selected);
+        let tmux_name = session.map(|s| s.tmux_name.clone());
         if let Some(tmux_name) = tmux_name {
+            // For sessions with conversation data, render from JSONL
+            if let Some(conv) = self.conversations.get(&tmux_name) {
+                if !conv.entries.is_empty() {
+                    let text = crate::ui::render_conversation(&conv.entries);
+                    self.preview.line_count = text.lines.len() as u16;
+                    self.preview.text = Some(text);
+                    self.preview.content = String::new();
+                    self.preview.session = Some(tmux_name);
+                    return;
+                }
+            }
+            // Fallback: no conversation yet
             if let Some(content) = self.status.latest_pane_captures.get(&tmux_name) {
                 self.preview.set_content(content.clone(), false);
             }
@@ -585,18 +859,23 @@ impl App {
         }
     }
 
-    /// Refresh preview with a forced live pane capture (bypasses cache/idle skip).
-    /// Used for attached-mode typing where low input-to-echo latency matters.
-    pub async fn refresh_preview_live(&mut self) {
-        self.refresh_preview_impl(true).await;
-    }
-
     async fn refresh_preview_impl(&mut self, force_live_capture: bool) {
-        let tmux_name = self
-            .sessions
-            .get(self.selected)
-            .map(|s| s.tmux_name.clone());
+        let session = self.sessions.get(self.selected);
+        let tmux_name = session.map(|s| s.tmux_name.clone());
         if let Some(tmux_name) = tmux_name {
+            // For sessions with conversation data, render from JSONL
+            if let Some(conv) = self.conversations.get(&tmux_name) {
+                if !conv.entries.is_empty() {
+                    let text = crate::ui::render_conversation(&conv.entries);
+                    self.preview.line_count = text.lines.len() as u16;
+                    self.preview.text = Some(text);
+                    self.preview.content = String::new();
+                    self.preview.session = Some(tmux_name);
+                    return;
+                }
+            }
+
+            // No conversation yet: fall back to capture_pane
             let same_session = self.preview.session.as_ref() == Some(&tmux_name);
             let wants_scrollback = self.preview.scroll_offset > 0;
 
@@ -657,17 +936,42 @@ impl App {
     /// Non-blocking: spawns heavy I/O (JSONL parsing, git diff, UUID resolution)
     /// on a background tokio task and polls results via oneshot channel.
     pub fn refresh_messages(&mut self) {
-        let tmux_names: Vec<String> = self.sessions.iter().map(|s| s.tmux_name.clone()).collect();
+        let sessions: Vec<(String, AgentType)> = self
+            .sessions
+            .iter()
+            .map(|s| (s.tmux_name.clone(), s.agent_type.clone()))
+            .collect();
+        let conversation_offsets: HashMap<String, u64> = self
+            .conversations
+            .iter()
+            .map(|(k, v)| (k.clone(), v.read_offset))
+            .collect();
         if let Some(result) = self.bg.tick(
-            &tmux_names,
+            &sessions,
             &self.session_stats,
             &self.global_stats,
             &self.cwd,
+            conversation_offsets,
         ) {
             self.last_messages.extend(result.last_messages);
             self.session_stats = result.session_stats;
             self.global_stats = result.global_stats;
             self.diff_files = result.diff_files;
+            // Extend conversation buffers with new entries
+            for (tmux_name, new_entries) in result.conversations {
+                let buf = self
+                    .conversations
+                    .entry(tmux_name.clone())
+                    .or_insert_with(ConversationBuffer::new);
+                if let Some(&new_offset) = result.conversation_offsets.get(&tmux_name) {
+                    buf.read_offset = new_offset;
+                }
+                if result.conversation_replace.contains(&tmux_name) {
+                    // Non-append-only parser path: replace entire buffer
+                    buf.entries.clear();
+                }
+                buf.extend(new_entries);
+            }
         }
     }
 
@@ -697,16 +1001,16 @@ impl App {
         self.preview.scroll_down();
     }
 
-    pub fn attach_selected(&mut self) {
+    pub fn enter_compose(&mut self) {
         if !self.sessions.is_empty() {
-            self.mode = Mode::Attached;
+            self.compose.reset();
+            self.mode = Mode::Compose;
         }
     }
 
-    pub fn detach(&mut self) {
+    pub fn exit_compose(&mut self) {
         self.mode = Mode::Browse;
-        self.selected = 0;
-        self.preview.scroll_offset = 0;
+        self.compose.reset();
     }
 
     pub fn start_new_session(&mut self) {
@@ -791,6 +1095,19 @@ impl App {
         if manifest.sessions.is_empty() {
             return;
         }
+
+        // Pre-populate the agent type cache from the manifest so
+        // list_sessions() won't need to query `tmux show-environment`.
+        let agent_mapping: HashMap<String, AgentType> = manifest
+            .sessions
+            .iter()
+            .filter_map(|(name, record)| {
+                let agent: AgentType = record.agent_type.parse().ok()?;
+                let tmux_name = crate::session::tmux_session_name(&pid, name);
+                Some((tmux_name, agent))
+            })
+            .collect();
+        self.manager.prepopulate_agent_cache(&agent_mapping);
 
         // Get live session names
         let live = self.manager.list_sessions(&pid).await.unwrap_or_default();
@@ -918,7 +1235,7 @@ impl App {
                             }
                         }
                     } else if preview.contains(pos) {
-                        self.attach_selected();
+                        self.enter_compose();
                     }
                 }
                 MouseEventKind::ScrollUp => {
@@ -937,7 +1254,7 @@ impl App {
                 }
                 _ => {}
             },
-            Mode::Attached => match mouse.kind {
+            Mode::Compose => match mouse.kind {
                 MouseEventKind::ScrollUp => {
                     if preview.contains(pos) {
                         self.scroll_preview_up();
@@ -953,12 +1270,12 @@ impl App {
                         // Reset scroll to bottom so user sees live output after clicking.
                         self.preview.scroll_offset = 0;
                     } else {
-                        self.detach();
+                        self.exit_compose();
                     }
                 }
                 MouseEventKind::Down(_) => {
                     if !inner(preview).contains(pos) {
-                        self.detach();
+                        self.exit_compose();
                     }
                 }
                 _ => {}
@@ -983,38 +1300,67 @@ impl App {
 
     pub async fn handle_key(&mut self, key: KeyEvent) {
         match self.mode {
-            Mode::Browse => self.handle_browse_key(key.code),
-            Mode::Attached => self.handle_attached_key(key).await,
+            Mode::Browse => self.handle_browse_key(key).await,
+            Mode::Compose => self.handle_compose_key(key).await,
             Mode::NewSessionAgent => self.handle_agent_select_key(key.code).await,
             Mode::ConfirmDelete => self.handle_confirm_delete_key(key.code).await,
         }
     }
 
-    pub fn handle_browse_key(&mut self, code: KeyCode) {
-        match code {
+    pub async fn handle_browse_key(&mut self, key: KeyEvent) {
+        use crossterm::event::KeyModifiers;
+        match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('j') | KeyCode::Down => self.select_next(),
             KeyCode::Char('k') | KeyCode::Up => self.select_prev(),
-            KeyCode::Enter => self.attach_selected(),
+            KeyCode::Enter => self.enter_compose(),
             KeyCode::Char('n') => self.start_new_session(),
             KeyCode::Char('d') => self.request_delete(),
-            KeyCode::Char('c') => self.mouse_captured = !self.mouse_captured,
+            KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.mouse_captured = !self.mouse_captured;
+            }
+            // Ctrl+C sends interrupt to the selected session
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(session) = self.sessions.get(self.selected) {
+                    let tmux_name = session.tmux_name.clone();
+                    let _ = self.manager.send_keys(&tmux_name, "C-c").await;
+                }
+            }
             _ => {}
         }
     }
 
-    pub async fn handle_attached_key(&mut self, key: KeyEvent) {
-        if key.code == KeyCode::Esc {
-            self.detach();
+    pub async fn handle_compose_key(&mut self, key: KeyEvent) {
+        use crossterm::event::KeyModifiers;
+        match key.code {
+            KeyCode::Esc => self.exit_compose(),
+            // Ctrl+C cancels compose
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.exit_compose();
+            }
+            KeyCode::Enter => self.send_compose_message().await,
+            KeyCode::Backspace => self.compose.backspace(),
+            KeyCode::Left => self.compose.move_left(),
+            KeyCode::Right => self.compose.move_right(),
+            KeyCode::Char(ch) => self.compose.insert_char(ch),
+            _ => {}
+        }
+    }
+
+    async fn send_compose_message(&mut self) {
+        let text = self.compose.text();
+        if text.trim().is_empty() {
+            self.exit_compose();
             return;
         }
-
         if let Some(session) = self.sessions.get(self.selected) {
-            if let Some(tmux_key) = crate::tmux::keycode_to_tmux(key.code, key.modifiers) {
-                let tmux_name = session.tmux_name.clone();
-                let _ = self.manager.send_keys(&tmux_name, &tmux_key).await;
+            let tmux_name = session.tmux_name.clone();
+            if let Err(e) = self.manager.send_text_enter(&tmux_name, &text).await {
+                self.status_message = Some(format!("Failed to send message: {e}"));
+                return;
             }
         }
+        self.exit_compose();
     }
 
     pub async fn handle_agent_select_key(&mut self, code: KeyCode) {
@@ -1046,22 +1392,30 @@ pub struct DiffFile {
 }
 
 /// Background task: compute message refresh results off the main event loop.
-/// Runs UUID resolution, JSONL parsing, global stats, and git diff in a background task.
+/// Runs UUID/rollout resolution, JSONL parsing, global stats, and git diff in a background task.
 async fn compute_message_refresh(
-    tmux_names: Vec<String>,
+    sessions: Vec<(String, AgentType)>,
     mut log_uuids: HashMap<String, String>,
     mut uuid_retry_cooldowns: HashMap<String, u8>,
     mut session_stats: HashMap<String, SessionStats>,
     mut global_stats: GlobalStats,
     cwd: String,
+    mut conversation_offsets: HashMap<String, u64>,
 ) -> MessageRefreshResult {
     /// Retry unresolved UUID discovery every ~30s (6 refresh cycles at 5s each).
     const UUID_RETRY_COOLDOWN_CYCLES: u8 = 6;
 
     let mut last_messages = HashMap::new();
+    let mut conversations: HashMap<String, Vec<ConversationEntry>> = HashMap::new();
+    let mut new_conversation_offsets: HashMap<String, u64> = HashMap::new();
+    let conversation_replace = HashSet::new();
 
-    for tmux_name in &tmux_names {
-        // Try to resolve UUID if not cached
+    for (tmux_name, agent_type) in &sessions {
+        let is_codex = *agent_type == AgentType::Codex;
+        let is_claude = *agent_type == AgentType::Claude;
+        let is_gemini = *agent_type == AgentType::Gemini;
+
+        // Try to resolve log path if not cached
         if !log_uuids.contains_key(tmux_name) {
             let should_attempt_resolve = match uuid_retry_cooldowns.get_mut(tmux_name) {
                 Some(cooldown) if *cooldown > 0 => {
@@ -1072,8 +1426,23 @@ async fn compute_message_refresh(
             };
 
             if should_attempt_resolve {
-                if let Some(uuid) = crate::logs::resolve_session_uuid(tmux_name).await {
-                    log_uuids.insert(tmux_name.clone(), uuid);
+                let resolved = if is_codex {
+                    // For Codex, resolve rollout file path and store as string
+                    crate::logs::resolve_codex_rollout_path(tmux_name)
+                        .await
+                        .map(|p| p.to_string_lossy().to_string())
+                } else if is_gemini {
+                    // For Gemini, resolve session JSON file path
+                    crate::logs::resolve_gemini_session_path(tmux_name, &cwd).await
+                } else if is_claude {
+                    // For Claude, resolve session UUID
+                    crate::logs::resolve_session_uuid(tmux_name).await
+                } else {
+                    None
+                };
+
+                if let Some(id) = resolved {
+                    log_uuids.insert(tmux_name.clone(), id);
                     uuid_retry_cooldowns.remove(tmux_name);
                 } else {
                     uuid_retry_cooldowns.insert(tmux_name.clone(), UUID_RETRY_COOLDOWN_CYCLES);
@@ -1081,14 +1450,61 @@ async fn compute_message_refresh(
             }
         }
 
-        // Read last message and update stats if UUID is known
-        if let Some(uuid) = log_uuids.get(tmux_name).cloned() {
+        // Read last message, update stats, and parse conversation
+        if let Some(log_id) = log_uuids.get(tmux_name).cloned() {
             uuid_retry_cooldowns.remove(tmux_name);
-            let stats = session_stats.entry(tmux_name.clone()).or_default();
-            if let Some(msg) =
-                crate::logs::update_session_stats_and_last_message(&cwd, &uuid, stats)
-            {
-                last_messages.insert(tmux_name.clone(), msg);
+
+            if is_codex {
+                // Codex: log_id is a file path
+                let path = std::path::PathBuf::from(&log_id);
+                let conv_offset = conversation_offsets.remove(tmux_name).unwrap_or(0);
+                let (entries, new_offset) =
+                    crate::logs::parse_codex_conversation_entries(&path, conv_offset);
+                if !entries.is_empty() {
+                    // Extract last agent message for sidebar display
+                    for entry in entries.iter().rev() {
+                        if let ConversationEntry::AssistantText { text } = entry {
+                            last_messages.insert(tmux_name.clone(), text.clone());
+                            break;
+                        }
+                    }
+                    conversations.insert(tmux_name.clone(), entries);
+                }
+                new_conversation_offsets.insert(tmux_name.clone(), new_offset);
+            } else if is_gemini {
+                // Gemini: log_id is a session JSON file path.
+                let path = std::path::PathBuf::from(&log_id);
+                let conv_offset = conversation_offsets.remove(tmux_name).unwrap_or(0);
+                let (entries, new_offset, last_msg, gemini_stats) =
+                    crate::logs::parse_gemini_session_entries(&path, conv_offset);
+                if let Some(msg) = last_msg {
+                    last_messages.insert(tmux_name.clone(), msg);
+                }
+                if !entries.is_empty() {
+                    conversations.insert(tmux_name.clone(), entries);
+                }
+                // Apply Gemini stats (full replace since it's monolithic)
+                let stats = session_stats.entry(tmux_name.clone()).or_default();
+                crate::logs::apply_gemini_stats(stats, &gemini_stats);
+                new_conversation_offsets.insert(tmux_name.clone(), new_offset);
+            } else {
+                // Claude: log_id is a UUID
+                let stats = session_stats.entry(tmux_name.clone()).or_default();
+                if let Some(msg) =
+                    crate::logs::update_session_stats_and_last_message(&cwd, &log_id, stats)
+                {
+                    last_messages.insert(tmux_name.clone(), msg);
+                }
+
+                // Parse conversation entries incrementally
+                let conv_offset = conversation_offsets.remove(tmux_name).unwrap_or(0);
+                let path = crate::logs::session_jsonl_path(&cwd, &log_id);
+                let (entries, new_offset) =
+                    crate::logs::parse_conversation_entries(&path, conv_offset);
+                if !entries.is_empty() {
+                    conversations.insert(tmux_name.clone(), entries);
+                }
+                new_conversation_offsets.insert(tmux_name.clone(), new_offset);
             }
         }
     }
@@ -1106,6 +1522,9 @@ async fn compute_message_refresh(
         session_stats,
         global_stats,
         diff_files,
+        conversations,
+        conversation_offsets: new_conversation_offsets,
+        conversation_replace,
     }
 }
 
@@ -1249,6 +1668,455 @@ async fn get_git_diff_numstat(cwd: &str) -> Vec<DiffFile> {
     files
 }
 
+// ── Backend/UI channel types ──────────────────────────────────────
+
+/// Command from UI → Backend.
+#[derive(Debug)]
+pub enum BackendCommand {
+    CreateSession {
+        agent_type: AgentType,
+    },
+    DeleteSession {
+        tmux_name: String,
+        name: String,
+    },
+    SendCompose {
+        tmux_name: String,
+        text: String,
+    },
+    SendKeys {
+        tmux_name: String,
+        key: String,
+    },
+    SendInterrupt {
+        tmux_name: String,
+    },
+    SendLiteralKeys {
+        tmux_name: String,
+        text: String,
+    },
+    RequestPreview {
+        tmux_name: String,
+        wants_scrollback: bool,
+    },
+    Quit,
+}
+
+/// Snapshot of backend state sent to UI for rendering.
+/// Uses latest-value semantics via `watch` channel.
+#[derive(Debug, Clone, Default)]
+pub struct StateSnapshot {
+    pub sessions: Vec<Session>,
+    pub last_messages: HashMap<String, String>,
+    pub session_stats: HashMap<String, SessionStats>,
+    pub global_stats: GlobalStats,
+    pub diff_files: Vec<DiffFile>,
+    pub conversations: HashMap<String, VecDeque<ConversationEntry>>,
+    pub status_message: Option<String>,
+}
+
+/// Preview data sent from Backend → UI.
+#[derive(Debug, Clone)]
+pub struct PreviewUpdate {
+    pub tmux_name: String,
+    pub text: Option<Text<'static>>,
+    pub content: String,
+    pub line_count: u16,
+    pub has_scrollback: bool,
+}
+
+// ── UiApp ─────────────────────────────────────────────────────────
+
+/// UI-only application state, separated from I/O.
+/// Receives state snapshots from the Backend actor via channels.
+/// Exposes the same public field names as `App` so that `ui.rs` draw
+/// functions can switch from `&App` to `&UiApp` with minimal changes.
+pub struct UiApp {
+    // Snapshot-derived fields (updated via poll_state)
+    pub sessions: Vec<Session>,
+    pub last_messages: HashMap<String, String>,
+    pub session_stats: HashMap<String, SessionStats>,
+    pub global_stats: GlobalStats,
+    pub diff_files: Vec<DiffFile>,
+    pub conversations: HashMap<String, VecDeque<ConversationEntry>>,
+    pub status_message: Option<String>,
+
+    // Local UI state
+    pub selected: usize,
+    pub mode: Mode,
+    pub agent_selection: usize,
+    pub should_quit: bool,
+    pub preview: PreviewState,
+    pub compose: ComposeState,
+    pub sidebar_area: Cell<Rect>,
+    pub preview_area: Cell<Rect>,
+    pub mouse_captured: bool,
+    pub diff_tree_cache: RefCell<(Vec<DiffFile>, usize, Vec<ratatui::text::Line<'static>>)>,
+
+    // Preview cache (session → latest PreviewUpdate)
+    preview_cache: HashMap<String, PreviewUpdate>,
+
+    // Channels
+    cmd_tx: tokio::sync::mpsc::Sender<BackendCommand>,
+    state_rx: tokio::sync::watch::Receiver<StateSnapshot>,
+    preview_rx: tokio::sync::mpsc::Receiver<PreviewUpdate>,
+}
+
+impl UiApp {
+    pub fn new(
+        state_rx: tokio::sync::watch::Receiver<StateSnapshot>,
+        preview_rx: tokio::sync::mpsc::Receiver<PreviewUpdate>,
+        cmd_tx: tokio::sync::mpsc::Sender<BackendCommand>,
+    ) -> Self {
+        Self {
+            sessions: Vec::new(),
+            last_messages: HashMap::new(),
+            session_stats: HashMap::new(),
+            global_stats: GlobalStats::default(),
+            diff_files: Vec::new(),
+            conversations: HashMap::new(),
+            status_message: None,
+            selected: 0,
+            mode: Mode::Browse,
+            agent_selection: 0,
+            should_quit: false,
+            preview: PreviewState::new(),
+            compose: ComposeState::new(),
+            sidebar_area: Cell::new(Rect::default()),
+            preview_area: Cell::new(Rect::default()),
+            mouse_captured: true,
+            diff_tree_cache: RefCell::new((Vec::new(), 0, Vec::new())),
+            preview_cache: HashMap::new(),
+            cmd_tx,
+            state_rx,
+            preview_rx,
+        }
+    }
+
+    /// Test constructor with dummy channels.
+    #[cfg(test)]
+    pub fn new_test() -> Self {
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel(1);
+        let (_state_tx, state_rx) = tokio::sync::watch::channel(StateSnapshot::default());
+        let (_preview_tx, preview_rx) = tokio::sync::mpsc::channel(1);
+        Self::new(state_rx, preview_rx, cmd_tx)
+    }
+
+    /// Poll for new state from the backend. Call once per tick.
+    pub fn poll_state(&mut self) {
+        // Check for state snapshot updates
+        if self.state_rx.has_changed().unwrap_or(false) {
+            let snapshot = self.state_rx.borrow_and_update().clone();
+            self.sessions = snapshot.sessions;
+            self.last_messages = snapshot.last_messages;
+            self.session_stats = snapshot.session_stats;
+            self.global_stats = snapshot.global_stats;
+            self.diff_files = snapshot.diff_files;
+            self.conversations = snapshot.conversations;
+            self.status_message = snapshot.status_message;
+            // Clamp selected index
+            if !self.sessions.is_empty() && self.selected >= self.sessions.len() {
+                self.selected = self.sessions.len() - 1;
+            }
+        }
+
+        // Drain preview updates
+        while let Ok(update) = self.preview_rx.try_recv() {
+            self.preview_cache.insert(update.tmux_name.clone(), update);
+        }
+
+        // Apply preview for currently selected session
+        self.refresh_preview_from_cache();
+    }
+
+    /// Update preview from cached data for the currently selected session.
+    pub fn refresh_preview_from_cache(&mut self) {
+        if let Some(session) = self.sessions.get(self.selected) {
+            if let Some(update) = self.preview_cache.get(&session.tmux_name) {
+                self.preview.text = update.text.clone();
+                self.preview.content = update.content.clone();
+                self.preview.line_count = update.line_count;
+            }
+        }
+    }
+
+    /// Handle a key event. Synchronous — sends BackendCommand for I/O.
+    pub fn handle_key(&mut self, key: KeyEvent) {
+        match self.mode {
+            Mode::Browse => self.handle_browse_key(key),
+            Mode::Compose => self.handle_compose_key(key),
+            Mode::NewSessionAgent => self.handle_agent_select_key(key.code),
+            Mode::ConfirmDelete => self.handle_confirm_delete_key(key.code),
+        }
+    }
+
+    fn handle_browse_key(&mut self, key: KeyEvent) {
+        use crossterm::event::KeyModifiers;
+        match key.code {
+            KeyCode::Char('q') => {
+                let _ = self.cmd_tx.try_send(BackendCommand::Quit);
+                self.should_quit = true;
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.select_next(),
+            KeyCode::Char('k') | KeyCode::Up => self.select_prev(),
+            KeyCode::Enter => self.enter_compose(),
+            KeyCode::Char('n') => self.start_new_session(),
+            KeyCode::Char('d') => self.request_delete(),
+            KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.mouse_captured = !self.mouse_captured;
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(session) = self.sessions.get(self.selected) {
+                    let _ = self.cmd_tx.try_send(BackendCommand::SendInterrupt {
+                        tmux_name: session.tmux_name.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_compose_key(&mut self, key: KeyEvent) {
+        use crossterm::event::KeyModifiers;
+        match key.code {
+            KeyCode::Esc => self.exit_compose(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.exit_compose();
+            }
+            KeyCode::Enter => self.send_compose_message(),
+            KeyCode::Backspace => self.compose.backspace(),
+            KeyCode::Left => self.compose.move_left(),
+            KeyCode::Right => self.compose.move_right(),
+            KeyCode::Char(ch) => self.compose.insert_char(ch),
+            _ => {}
+        }
+    }
+
+    fn send_compose_message(&mut self) {
+        let text = self.compose.text();
+        if text.trim().is_empty() {
+            self.exit_compose();
+            return;
+        }
+        if let Some(session) = self.sessions.get(self.selected) {
+            let _ = self.cmd_tx.try_send(BackendCommand::SendCompose {
+                tmux_name: session.tmux_name.clone(),
+                text,
+            });
+        }
+        self.exit_compose();
+    }
+
+    fn handle_agent_select_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Enter => {
+                let agents = AgentType::all();
+                if let Some(agent_type) = agents.get(self.agent_selection) {
+                    let _ = self.cmd_tx.try_send(BackendCommand::CreateSession {
+                        agent_type: agent_type.clone(),
+                    });
+                }
+                self.mode = Mode::Browse;
+            }
+            KeyCode::Esc => self.cancel_mode(),
+            KeyCode::Char('j') | KeyCode::Down => self.agent_select_next(),
+            KeyCode::Char('k') | KeyCode::Up => self.agent_select_prev(),
+            _ => {}
+        }
+    }
+
+    fn handle_confirm_delete_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') => {
+                if let Some(session) = self.sessions.get(self.selected) {
+                    let _ = self.cmd_tx.try_send(BackendCommand::DeleteSession {
+                        tmux_name: session.tmux_name.clone(),
+                        name: session.name.clone(),
+                    });
+                }
+                self.mode = Mode::Browse;
+                if self.selected > 0 && self.selected >= self.sessions.len().saturating_sub(1) {
+                    self.selected = self.sessions.len().saturating_sub(2);
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('n') => self.cancel_mode(),
+            _ => {}
+        }
+    }
+
+    // ── Navigation helpers (match App methods) ────────────────────
+
+    pub fn select_next(&mut self) {
+        if !self.sessions.is_empty() {
+            self.selected = (self.selected + 1) % self.sessions.len();
+            self.preview.reset_on_selection_change();
+            self.refresh_preview_from_cache();
+        }
+    }
+
+    pub fn select_prev(&mut self) {
+        if !self.sessions.is_empty() {
+            self.selected = if self.selected == 0 {
+                self.sessions.len() - 1
+            } else {
+                self.selected - 1
+            };
+            self.preview.reset_on_selection_change();
+            self.refresh_preview_from_cache();
+        }
+    }
+
+    pub fn enter_compose(&mut self) {
+        if !self.sessions.is_empty() {
+            self.compose.reset();
+            self.mode = Mode::Compose;
+        }
+    }
+
+    pub fn exit_compose(&mut self) {
+        self.mode = Mode::Browse;
+        self.compose.reset();
+    }
+
+    pub fn start_new_session(&mut self) {
+        self.mode = Mode::NewSessionAgent;
+        self.agent_selection = 0;
+        self.status_message = None;
+    }
+
+    pub fn request_delete(&mut self) {
+        if !self.sessions.is_empty() {
+            self.mode = Mode::ConfirmDelete;
+            self.status_message = None;
+        }
+    }
+
+    pub fn cancel_mode(&mut self) {
+        self.mode = Mode::Browse;
+    }
+
+    pub fn agent_select_next(&mut self) {
+        let count = AgentType::all().len();
+        self.agent_selection = (self.agent_selection + 1) % count;
+    }
+
+    pub fn agent_select_prev(&mut self) {
+        let count = AgentType::all().len();
+        self.agent_selection = if self.agent_selection == 0 {
+            count - 1
+        } else {
+            self.agent_selection - 1
+        };
+    }
+
+    pub fn scroll_preview_up(&mut self) {
+        self.preview.scroll_up();
+    }
+
+    pub fn scroll_preview_down(&mut self) {
+        self.preview.scroll_down();
+    }
+
+    /// Handle mouse events. Synchronous.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let pos = Position::new(mouse.column, mouse.row);
+        let sidebar = self.sidebar_area.get();
+        let preview = self.preview_area.get();
+
+        fn inner(r: Rect) -> Rect {
+            if r.width < 2 || r.height < 2 {
+                Rect::default()
+            } else {
+                Rect::new(r.x + 1, r.y + 1, r.width - 2, r.height - 2)
+            }
+        }
+
+        match self.mode {
+            Mode::Browse => match mouse.kind {
+                MouseEventKind::Down(_) => {
+                    let sidebar_inner = inner(sidebar);
+                    if sidebar_inner.contains(pos) {
+                        let row_offset = (mouse.row - sidebar_inner.y) as usize;
+                        let mut cumulative = 0usize;
+                        let mut target_idx = None;
+                        let mut current_group: Option<u8> = None;
+                        for (i, session) in self.sessions.iter().enumerate() {
+                            let group = session.status.sort_order();
+                            if current_group != Some(group) {
+                                current_group = Some(group);
+                                if row_offset == cumulative {
+                                    break;
+                                }
+                                cumulative += 1;
+                            }
+                            let item_height = if self.last_messages.contains_key(&session.tmux_name)
+                            {
+                                2
+                            } else {
+                                1
+                            };
+                            if row_offset < cumulative + item_height {
+                                target_idx = Some(i);
+                                break;
+                            }
+                            cumulative += item_height;
+                        }
+                        if let Some(idx) = target_idx {
+                            if self.selected != idx {
+                                self.selected = idx;
+                                self.preview.reset_on_selection_change();
+                            }
+                        }
+                    } else if preview.contains(pos) {
+                        self.enter_compose();
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    if preview.contains(pos) {
+                        self.scroll_preview_up();
+                    } else if sidebar.contains(pos) {
+                        self.select_prev();
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    if preview.contains(pos) {
+                        self.scroll_preview_down();
+                    } else if sidebar.contains(pos) {
+                        self.select_next();
+                    }
+                }
+                _ => {}
+            },
+            Mode::Compose => match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    if preview.contains(pos) {
+                        self.scroll_preview_up();
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    if preview.contains(pos) {
+                        self.scroll_preview_down();
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if inner(preview).contains(pos) {
+                        self.preview.scroll_offset = 0;
+                    } else {
+                        self.exit_compose();
+                    }
+                }
+                MouseEventKind::Down(_) => {
+                    if !inner(preview).contains(pos) {
+                        self.exit_compose();
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1272,6 +2140,7 @@ mod tests {
         capture_result: Option<Result<String, String>>,
         kill_result: Option<Result<(), String>>,
         scrollback_result: Option<Result<String, String>>,
+        send_text_enter_result: Option<Result<(), String>>,
         // Call tracking
         sent_keys: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
         sent_literals: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
@@ -1293,6 +2162,7 @@ mod tests {
                 capture_result: None,
                 kill_result: None,
                 scrollback_result: None,
+                send_text_enter_result: None,
                 sent_keys: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 sent_literals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 capture_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1328,6 +2198,10 @@ mod tests {
             F: Fn(usize) -> String + Send + Sync + 'static,
         {
             self.capture_fn = Some(std::sync::Arc::new(f));
+            self
+        }
+        fn with_send_text_enter_error(mut self, msg: &str) -> Self {
+            self.send_text_enter_result = Some(Err(msg.to_string()));
             self
         }
         fn with_list_fn<F>(mut self, f: F) -> Self
@@ -1399,6 +2273,20 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((tmux_name.to_string(), text.to_string()));
+            Ok(())
+        }
+        async fn send_text_enter(&self, tmux_name: &str, text: &str) -> anyhow::Result<()> {
+            if let Some(Err(msg)) = &self.send_text_enter_result {
+                return Err(anyhow::anyhow!("{}", msg));
+            }
+            self.sent_literals
+                .lock()
+                .unwrap()
+                .push((tmux_name.to_string(), text.to_string()));
+            self.sent_keys
+                .lock()
+                .unwrap()
+                .push((tmux_name.to_string(), "Enter".to_string()));
             Ok(())
         }
         async fn capture_pane_scrollback(&self, _tmux_name: &str) -> anyhow::Result<String> {
@@ -1604,18 +2492,18 @@ mod tests {
     }
 
     #[test]
-    fn attach_selected_with_sessions_transitions_to_attached() {
+    fn enter_compose_with_sessions_transitions_to_compose() {
         let sessions = vec![make_session("s1", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
-        app.attach_selected();
-        assert_eq!(app.mode, Mode::Attached);
+        app.enter_compose();
+        assert_eq!(app.mode, Mode::Compose);
     }
 
     #[test]
-    fn attach_selected_with_no_sessions_stays_in_browse() {
+    fn enter_compose_with_no_sessions_stays_in_browse() {
         let mut app = test_app();
         assert!(app.sessions.is_empty());
-        app.attach_selected();
+        app.enter_compose();
         assert_eq!(
             app.mode,
             Mode::Browse,
@@ -1627,8 +2515,8 @@ mod tests {
     fn detach_transitions_to_browse() {
         let sessions = vec![make_session("s1", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
-        app.mode = Mode::Attached;
-        app.detach();
+        app.mode = Mode::Compose;
+        app.exit_compose();
         assert_eq!(app.mode, Mode::Browse);
     }
 
@@ -1903,7 +2791,7 @@ mod tests {
     fn detach_from_already_browse_stays_browse() {
         let mut app = test_app();
         assert_eq!(app.mode, Mode::Browse);
-        app.detach();
+        app.exit_compose();
         assert_eq!(
             app.mode,
             Mode::Browse,
@@ -2100,7 +2988,7 @@ mod tests {
             row: 5,
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
-        assert_eq!(app.mode, Mode::Attached);
+        assert_eq!(app.mode, Mode::Compose);
     }
 
     #[test]
@@ -2170,7 +3058,7 @@ mod tests {
     fn mouse_attached_click_outside_detaches() {
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
-        app.mode = Mode::Attached;
+        app.mode = Mode::Compose;
         app.sidebar_area.set(Rect::new(0, 0, 24, 20));
         app.preview_area.set(Rect::new(24, 0, 56, 20));
 
@@ -2188,7 +3076,7 @@ mod tests {
     fn mouse_attached_scroll_up_in_preview() {
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
-        app.mode = Mode::Attached;
+        app.mode = Mode::Compose;
         app.sidebar_area.set(Rect::new(0, 0, 24, 20));
         app.preview_area.set(Rect::new(24, 0, 56, 20));
 
@@ -2199,14 +3087,14 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
         assert_eq!(app.preview.scroll_offset, 3);
-        assert_eq!(app.mode, Mode::Attached, "should stay attached");
+        assert_eq!(app.mode, Mode::Compose, "should stay attached");
     }
 
     #[test]
     fn mouse_attached_scroll_down_in_preview() {
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
-        app.mode = Mode::Attached;
+        app.mode = Mode::Compose;
         app.sidebar_area.set(Rect::new(0, 0, 24, 20));
         app.preview_area.set(Rect::new(24, 0, 56, 20));
         app.preview.scroll_offset = 6;
@@ -2813,86 +3701,86 @@ mod tests {
 
     // ── Browse mode key handler ─────────────────────────────────────
 
-    #[test]
-    fn browse_key_q_sets_quit() {
+    #[tokio::test]
+    async fn browse_key_q_sets_quit() {
         let mut app = test_app();
-        app.handle_browse_key(KeyCode::Char('q'));
+        app.handle_browse_key(make_key(KeyCode::Char('q'))).await;
         assert!(app.should_quit);
     }
 
-    #[test]
-    fn browse_key_j_selects_next() {
+    #[tokio::test]
+    async fn browse_key_j_selects_next() {
         let sessions = vec![
             make_session("a", AgentType::Claude),
             make_session("b", AgentType::Claude),
         ];
         let mut app = test_app_with_sessions(sessions);
-        app.handle_browse_key(KeyCode::Char('j'));
+        app.handle_browse_key(make_key(KeyCode::Char('j'))).await;
         assert_eq!(app.selected, 1);
     }
 
-    #[test]
-    fn browse_key_down_selects_next() {
+    #[tokio::test]
+    async fn browse_key_down_selects_next() {
         let sessions = vec![
             make_session("a", AgentType::Claude),
             make_session("b", AgentType::Claude),
         ];
         let mut app = test_app_with_sessions(sessions);
-        app.handle_browse_key(KeyCode::Down);
+        app.handle_browse_key(make_key(KeyCode::Down)).await;
         assert_eq!(app.selected, 1);
     }
 
-    #[test]
-    fn browse_key_k_selects_prev() {
+    #[tokio::test]
+    async fn browse_key_k_selects_prev() {
         let sessions = vec![
             make_session("a", AgentType::Claude),
             make_session("b", AgentType::Claude),
         ];
         let mut app = test_app_with_sessions(sessions);
         app.selected = 1;
-        app.handle_browse_key(KeyCode::Char('k'));
+        app.handle_browse_key(make_key(KeyCode::Char('k'))).await;
         assert_eq!(app.selected, 0);
     }
 
-    #[test]
-    fn browse_key_up_selects_prev() {
+    #[tokio::test]
+    async fn browse_key_up_selects_prev() {
         let sessions = vec![
             make_session("a", AgentType::Claude),
             make_session("b", AgentType::Claude),
         ];
         let mut app = test_app_with_sessions(sessions);
         app.selected = 1;
-        app.handle_browse_key(KeyCode::Up);
+        app.handle_browse_key(make_key(KeyCode::Up)).await;
         assert_eq!(app.selected, 0);
     }
 
-    #[test]
-    fn browse_key_enter_attaches() {
+    #[tokio::test]
+    async fn browse_key_enter_attaches() {
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
-        app.handle_browse_key(KeyCode::Enter);
-        assert_eq!(app.mode, Mode::Attached);
+        app.handle_browse_key(make_key(KeyCode::Enter)).await;
+        assert_eq!(app.mode, Mode::Compose);
     }
 
-    #[test]
-    fn browse_key_n_starts_new_session() {
+    #[tokio::test]
+    async fn browse_key_n_starts_new_session() {
         let mut app = test_app();
-        app.handle_browse_key(KeyCode::Char('n'));
+        app.handle_browse_key(make_key(KeyCode::Char('n'))).await;
         assert_eq!(app.mode, Mode::NewSessionAgent);
     }
 
-    #[test]
-    fn browse_key_d_requests_delete() {
+    #[tokio::test]
+    async fn browse_key_d_requests_delete() {
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
-        app.handle_browse_key(KeyCode::Char('d'));
+        app.handle_browse_key(make_key(KeyCode::Char('d'))).await;
         assert_eq!(app.mode, Mode::ConfirmDelete);
     }
 
-    #[test]
-    fn browse_key_unknown_is_noop() {
+    #[tokio::test]
+    async fn browse_key_unknown_is_noop() {
         let mut app = test_app();
-        app.handle_browse_key(KeyCode::Char('x'));
+        app.handle_browse_key(make_key(KeyCode::Char('x'))).await;
         assert_eq!(app.mode, Mode::Browse);
         assert!(!app.should_quit);
     }
@@ -2903,71 +3791,109 @@ mod tests {
     async fn attached_key_esc_detaches() {
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
-        app.mode = Mode::Attached;
-        app.handle_attached_key(make_key(KeyCode::Esc)).await;
+        app.mode = Mode::Compose;
+        app.handle_compose_key(make_key(KeyCode::Esc)).await;
         assert_eq!(app.mode, Mode::Browse);
     }
 
     #[tokio::test]
-    async fn attached_key_sends_to_tmux() {
-        use std::sync::{Arc, Mutex};
-
-        let sent_keys = Arc::new(Mutex::new(Vec::new()));
-        let mut manager = MockSessionManager::new();
-        manager.sent_keys = sent_keys.clone();
-
+    async fn compose_key_inserts_into_buffer() {
         let mut app = App::new_with_manager(
             "testid".to_string(),
             "/tmp/test".to_string(),
-            Box::new(manager),
+            Box::new(MockSessionManager::new()),
         );
         app.sessions = vec![make_session("worker", AgentType::Claude)];
-        app.mode = Mode::Attached;
+        app.mode = Mode::Compose;
 
-        // Send 'a' key
-        app.handle_attached_key(make_key(KeyCode::Char('a'))).await;
+        // Send 'a' key — should insert into compose buffer
+        app.handle_compose_key(make_key(KeyCode::Char('a'))).await;
 
-        let keys = sent_keys.lock().unwrap();
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0].0, "hydra-testid-worker");
-        assert_eq!(keys[0].1, "a");
+        assert_eq!(app.compose.text(), "a");
+        assert_eq!(app.mode, Mode::Compose);
     }
 
     #[tokio::test]
-    async fn attached_key_ctrl_c_sends_ctrl_key() {
-        use std::sync::{Arc, Mutex};
-
-        let sent_keys = Arc::new(Mutex::new(Vec::new()));
-        let mut manager = MockSessionManager::new();
-        manager.sent_keys = sent_keys.clone();
-
+    async fn compose_key_ctrl_c_exits_compose() {
         let mut app = App::new_with_manager(
             "testid".to_string(),
             "/tmp/test".to_string(),
-            Box::new(manager),
+            Box::new(MockSessionManager::new()),
         );
         app.sessions = vec![make_session("worker", AgentType::Claude)];
-        app.mode = Mode::Attached;
+        app.mode = Mode::Compose;
 
-        // Send Ctrl+C
-        app.handle_attached_key(make_key_with_mods(
+        // Send Ctrl+C — should exit compose mode
+        app.handle_compose_key(make_key_with_mods(
             KeyCode::Char('c'),
             KeyModifiers::CONTROL,
         ))
         .await;
 
+        assert_eq!(app.mode, Mode::Browse);
+    }
+
+    #[tokio::test]
+    async fn compose_enter_sends_message_and_exits() {
+        let manager = MockSessionManager::new();
+        let sent_keys = manager.sent_keys.clone();
+        let sent_literals = manager.sent_literals.clone();
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(manager),
+        );
+        app.sessions = vec![make_session("worker", AgentType::Claude)];
+        app.mode = Mode::Compose;
+        app.compose.lines = vec!["hello world".to_string()];
+        app.compose.cursor_row = 0;
+        app.compose.cursor_col = "hello world".chars().count();
+
+        app.handle_compose_key(make_key(KeyCode::Enter)).await;
+
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(app.compose.text(), "");
+        let literals = sent_literals.lock().unwrap();
+        assert_eq!(literals.len(), 1);
+        assert_eq!(literals[0].0, "hydra-testid-worker");
+        assert_eq!(literals[0].1, "hello world");
+        drop(literals);
         let keys = sent_keys.lock().unwrap();
         assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0].1, "C-c");
+        assert_eq!(keys[0].0, "hydra-testid-worker");
+        assert_eq!(keys[0].1, "Enter");
+    }
+
+    #[tokio::test]
+    async fn compose_enter_send_failure_keeps_compose_and_sets_status() {
+        let manager = MockSessionManager::new().with_send_text_enter_error("send failed");
+        let mut app = App::new_with_manager(
+            "testid".to_string(),
+            "/tmp/test".to_string(),
+            Box::new(manager),
+        );
+        app.sessions = vec![make_session("worker", AgentType::Claude)];
+        app.mode = Mode::Compose;
+        app.compose.lines = vec!["hello world".to_string()];
+        app.compose.cursor_row = 0;
+        app.compose.cursor_col = "hello world".chars().count();
+
+        app.handle_compose_key(make_key(KeyCode::Enter)).await;
+
+        assert_eq!(app.mode, Mode::Compose);
+        assert_eq!(app.compose.text(), "hello world");
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(msg.contains("Failed to send message"));
+        assert!(msg.contains("send failed"));
     }
 
     #[tokio::test]
     async fn attached_key_no_session_is_noop() {
         let mut app = test_app();
-        app.mode = Mode::Attached;
+        app.mode = Mode::Compose;
         // No sessions, should not panic
-        app.handle_attached_key(make_key(KeyCode::Char('a'))).await;
-        assert_eq!(app.mode, Mode::Attached);
+        app.handle_compose_key(make_key(KeyCode::Char('a'))).await;
+        assert_eq!(app.mode, Mode::Compose);
     }
 
     // ── Agent select mode key handler ───────────────────────────────
@@ -3071,7 +3997,7 @@ mod tests {
     async fn handle_key_dispatches_attached_mode() {
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
-        app.mode = Mode::Attached;
+        app.mode = Mode::Compose;
         app.handle_key(make_key(KeyCode::Esc)).await;
         assert_eq!(app.mode, Mode::Browse);
     }
@@ -3121,10 +4047,10 @@ mod tests {
             Box::new(manager),
         );
         app.sessions = vec![make_session("worker", AgentType::Claude)];
-        app.mode = Mode::Attached;
+        app.mode = Mode::Compose;
 
         // Send a key that doesn't map to tmux (e.g., CapsLock)
-        app.handle_attached_key(make_key(KeyCode::CapsLock)).await;
+        app.handle_compose_key(make_key(KeyCode::CapsLock)).await;
 
         let keys = sent_keys.lock().unwrap();
         assert!(keys.is_empty(), "unmappable key should not send anything");
@@ -3158,7 +4084,7 @@ mod tests {
     fn mouse_attached_scroll_outside_preview_is_noop() {
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
-        app.mode = Mode::Attached;
+        app.mode = Mode::Compose;
         app.sidebar_area.set(Rect::new(0, 0, 24, 20));
         app.preview_area.set(Rect::new(24, 0, 56, 20));
 
@@ -3173,7 +4099,7 @@ mod tests {
             app.preview.scroll_offset, 0,
             "scroll outside preview should be noop"
         );
-        assert_eq!(app.mode, Mode::Attached);
+        assert_eq!(app.mode, Mode::Compose);
     }
 
     #[test]
@@ -3201,12 +4127,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_messages_runs_on_50th_tick() {
+    async fn refresh_messages_runs_on_40th_tick() {
         let mut app = test_app();
-        // Start at tick 49 so the next call (tick 50) triggers the inner loop
-        app.bg.message_tick = 49;
+        // Start at tick 39 so the next call (tick 40) triggers the inner loop
+        app.bg.message_tick = 39;
         app.refresh_messages();
-        assert_eq!(app.bg.message_tick, 50);
+        assert_eq!(app.bg.message_tick, 40);
         // No panic and no sessions to process — this just covers the tick check
     }
 
@@ -3223,6 +4149,9 @@ mod tests {
             session_stats: std::collections::HashMap::new(),
             global_stats: crate::logs::GlobalStats::default(),
             diff_files: vec![],
+            conversations: std::collections::HashMap::new(),
+            conversation_offsets: std::collections::HashMap::new(),
+            conversation_replace: std::collections::HashSet::new(),
         };
         result
             .last_messages
@@ -3287,10 +4216,10 @@ mod tests {
         let (_tx, rx) = tokio::sync::oneshot::channel::<MessageRefreshResult>();
         app.bg.bg_refresh_rx = Some(rx);
 
-        // Set tick to 19 so next call would normally trigger a new bg task
-        app.bg.message_tick = 19;
+        // Set tick to 39 so next call would normally trigger a new bg task
+        app.bg.message_tick = 39;
         app.refresh_messages();
-        assert_eq!(app.bg.message_tick, 20);
+        assert_eq!(app.bg.message_tick, 40);
         // bg_refresh_rx should still be set (the pending one, not a new one)
         assert!(
             app.bg.bg_refresh_rx.is_some(),
@@ -3311,7 +4240,7 @@ mod tests {
     fn mouse_attached_click_inside_preview_stays_attached() {
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
-        app.mode = Mode::Attached;
+        app.mode = Mode::Compose;
         app.sidebar_area.set(Rect::new(0, 0, 24, 20));
         app.preview_area.set(Rect::new(24, 0, 56, 20));
 
@@ -3324,7 +4253,7 @@ mod tests {
         });
         assert_eq!(
             app.mode,
-            Mode::Attached,
+            Mode::Compose,
             "clicking inside preview should stay attached"
         );
     }
@@ -3333,7 +4262,7 @@ mod tests {
     fn mouse_attached_click_does_not_forward_to_tmux() {
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
-        app.mode = Mode::Attached;
+        app.mode = Mode::Compose;
         app.sidebar_area.set(Rect::new(0, 0, 24, 20));
         app.preview_area.set(Rect::new(24, 0, 56, 20));
 
@@ -3348,14 +4277,14 @@ mod tests {
             app.pending_literal_keys.is_none(),
             "should not forward mouse clicks to agents"
         );
-        assert_eq!(app.mode, Mode::Attached);
+        assert_eq!(app.mode, Mode::Compose);
     }
 
     #[test]
     fn mouse_attached_click_resets_scroll_offset() {
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
-        app.mode = Mode::Attached;
+        app.mode = Mode::Compose;
         app.sidebar_area.set(Rect::new(0, 0, 24, 20));
         app.preview_area.set(Rect::new(24, 0, 56, 20));
         app.preview.scroll_offset = 10;
@@ -3377,7 +4306,7 @@ mod tests {
     fn mouse_attached_other_event_is_noop() {
         let sessions = vec![make_session("a", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
-        app.mode = Mode::Attached;
+        app.mode = Mode::Compose;
         app.sidebar_area.set(Rect::new(0, 0, 24, 20));
         app.preview_area.set(Rect::new(24, 0, 56, 20));
 
@@ -3388,7 +4317,7 @@ mod tests {
             row: 5,
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
-        assert_eq!(app.mode, Mode::Attached);
+        assert_eq!(app.mode, Mode::Compose);
     }
 
     // ── Resilience: selected resets to 0 when all sessions deleted ──
@@ -4191,7 +5120,7 @@ mod tests {
     fn mouse_right_click_outside_preview_detaches() {
         let sessions = vec![make_session("s1", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
-        app.mode = Mode::Attached;
+        app.mode = Mode::Compose;
 
         app.sidebar_area.set(Rect::new(0, 0, 30, 24));
         app.preview_area.set(Rect::new(30, 0, 50, 24));
@@ -4215,7 +5144,7 @@ mod tests {
     fn mouse_left_click_outside_preview_detaches() {
         let sessions = vec![make_session("s1", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
-        app.mode = Mode::Attached;
+        app.mode = Mode::Compose;
 
         app.sidebar_area.set(Rect::new(0, 0, 30, 24));
         app.preview_area.set(Rect::new(30, 0, 50, 24));
@@ -4239,7 +5168,7 @@ mod tests {
     fn mouse_left_click_inside_preview_does_not_forward() {
         let sessions = vec![make_session("s1", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
-        app.mode = Mode::Attached;
+        app.mode = Mode::Compose;
 
         app.sidebar_area.set(Rect::new(0, 0, 30, 24));
         app.preview_area.set(Rect::new(30, 0, 50, 24));
@@ -4253,7 +5182,7 @@ mod tests {
         app.handle_mouse(mouse);
         assert_eq!(
             app.mode,
-            Mode::Attached,
+            Mode::Compose,
             "left-click inside preview stays attached"
         );
         assert!(
@@ -4270,7 +5199,7 @@ mod tests {
     fn mouse_right_click_inside_preview_stays_attached() {
         let sessions = vec![make_session("s1", AgentType::Claude)];
         let mut app = test_app_with_sessions(sessions);
-        app.mode = Mode::Attached;
+        app.mode = Mode::Compose;
 
         app.sidebar_area.set(Rect::new(0, 0, 30, 24));
         app.preview_area.set(Rect::new(30, 0, 50, 24));
@@ -4285,7 +5214,7 @@ mod tests {
         app.handle_mouse(mouse);
         assert_eq!(
             app.mode,
-            Mode::Attached,
+            Mode::Compose,
             "right-click inside preview stays attached"
         );
     }
@@ -4422,13 +5351,13 @@ mod tests {
 
     // ── Browse key 'c' toggles mouse_captured ──
 
-    #[test]
-    fn browse_key_c_toggles_mouse_capture() {
+    #[tokio::test]
+    async fn browse_key_c_toggles_mouse_capture() {
         let mut app = test_app();
         assert!(app.mouse_captured, "default should be true");
-        app.handle_browse_key(KeyCode::Char('c'));
+        app.handle_browse_key(make_key(KeyCode::Char('c'))).await;
         assert!(!app.mouse_captured, "first 'c' should disable capture");
-        app.handle_browse_key(KeyCode::Char('c'));
+        app.handle_browse_key(make_key(KeyCode::Char('c'))).await;
         assert!(app.mouse_captured, "second 'c' should re-enable capture");
     }
 
@@ -5036,7 +5965,10 @@ mod tests {
         // Phase 1: First refresh captures all 3 sessions.
         app.refresh_sessions().await;
         let after_first = capture_count.load(Ordering::SeqCst);
-        assert_eq!(after_first, 3, "first refresh should capture all 3 sessions");
+        assert_eq!(
+            after_first, 3,
+            "first refresh should capture all 3 sessions"
+        );
 
         // Phase 2: Refresh repeatedly with identical content until idle threshold is reached.
         // IDLE_CAPTURE_SKIP_THRESHOLD is 40, so after ~40 refreshes all sessions should
@@ -5100,7 +6032,9 @@ mod tests {
 
         // Manually reset idle ticks to simulate detection of a change
         // (e.g. from background refresh noticing the session is active again).
-        app.status.idle_ticks.insert("hydra-testid-s1".to_string(), 0);
+        app.status
+            .idle_ticks
+            .insert("hydra-testid-s1".to_string(), 0);
 
         // After reset, the next refresh should capture again.
         app.refresh_sessions().await;

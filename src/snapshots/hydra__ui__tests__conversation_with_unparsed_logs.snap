@@ -1,0 +1,13 @@
+---
+source: src/ui.rs
+assertion_line: 1615
+expression: rendered
+---
+USER
+  show me diagnostics
+
+SUBAGENT
+  enqueue (task-1)
+
+UNPARSED JSONL
+  [Malformed JSONL] {"type":"assistant" BROKEN

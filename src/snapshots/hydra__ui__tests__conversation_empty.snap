@@ -1,0 +1,5 @@
+---
+source: src/ui.rs
+expression: rendered
+---
+Waiting for agent output...

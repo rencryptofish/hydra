@@ -48,6 +48,12 @@ pub trait SessionManager: Send + Sync {
     async fn send_keys_literal(&self, _tmux_name: &str, _text: &str) -> Result<()> {
         Ok(())
     }
+    /// Send literal text followed by Enter in a single atomic operation.
+    /// Default impl calls send_keys_literal then send_keys sequentially.
+    async fn send_text_enter(&self, tmux_name: &str, text: &str) -> Result<()> {
+        self.send_keys_literal(tmux_name, text).await?;
+        self.send_keys(tmux_name, "Enter").await
+    }
     async fn capture_pane_scrollback(&self, tmux_name: &str) -> Result<String>;
 
     /// Batch-capture pane content for multiple sessions. Default impl is sequential;
@@ -59,6 +65,18 @@ pub trait SessionManager: Send + Sync {
         }
         results
     }
+
+    /// Batch-check pane status for all sessions in a single tmux call.
+    /// Returns `session_name → (is_dead, pane_activity_epoch)`.
+    /// Default impl returns None (not supported). Implementations that override
+    /// this can provide activity timestamps for efficient status detection.
+    async fn batch_pane_status(&self) -> Option<HashMap<String, (bool, u64)>> {
+        None
+    }
+
+    /// Pre-populate the agent type cache from a known mapping (e.g. from manifest).
+    /// Avoids `tmux show-environment HYDRA_AGENT_TYPE` queries for known sessions.
+    fn prepopulate_agent_cache(&self, _mapping: &HashMap<String, AgentType>) {}
 }
 
 pub struct TmuxSessionManager {
@@ -226,9 +244,56 @@ impl SessionManager for TmuxSessionManager {
         send_keys_literal(tmux_name, text).await
     }
 
+    async fn send_text_enter(&self, tmux_name: &str, text: &str) -> Result<()> {
+        send_text_enter(tmux_name, text).await
+    }
+
     async fn capture_pane_scrollback(&self, tmux_name: &str) -> Result<String> {
         capture_pane_scrollback(tmux_name).await
     }
+
+    async fn batch_pane_status(&self) -> Option<HashMap<String, (bool, u64)>> {
+        batch_pane_status_impl().await
+    }
+
+    fn prepopulate_agent_cache(&self, mapping: &HashMap<String, AgentType>) {
+        let mut cache = self.agent_cache.lock().unwrap();
+        for (tmux_name, agent) in mapping {
+            cache
+                .entry(tmux_name.clone())
+                .or_insert_with(|| agent.clone());
+        }
+    }
+}
+
+/// Batch-query all tmux panes for dead status and activity timestamp.
+/// Returns `session_name → (is_dead, pane_activity_epoch)`.
+async fn batch_pane_status_impl() -> Option<HashMap<String, (bool, u64)>> {
+    let output = run_cmd_timeout(Command::new("tmux").args([
+        "list-panes",
+        "-a",
+        "-F",
+        "#{session_name} #{pane_dead} #{pane_activity}",
+    ]))
+    .await
+    .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut result = HashMap::new();
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.splitn(3, ' ').collect();
+        if parts.len() == 3 {
+            let session_name = parts[0].to_string();
+            let is_dead = parts[1] != "0";
+            let activity = parts[2].parse::<u64>().unwrap_or(0);
+            result.insert(session_name, (is_dead, activity));
+        }
+    }
+    Some(result)
 }
 
 /// Check if the pane in a tmux session has exited (requires remain-on-exit).
@@ -318,8 +383,10 @@ pub async fn create_session(
 
     // Wrap command to unset Claude Code env vars so agents don't detect
     // a nested session when Hydra is launched from within Claude Code.
+    // Use env -u for each known var, plus unset any CLAUDE_CODE_* vars the shell inherited.
     let wrapped_cmd = format!(
-        "unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT; exec {}",
+        "unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS; \
+         unset $(env | grep -o '^CLAUDE_CODE_[^=]*') 2>/dev/null; exec {}",
         cmd
     );
 
@@ -349,13 +416,20 @@ pub async fn create_session(
     ]))
     .await;
 
-    // Remove Claude Code env vars so spawned agents don't think they're nested
-    for var in ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"] {
+    // Unset Claude Code env vars in the session environment.
+    // Must use -u (not -r): -r removes from session table causing fallthrough
+    // to the global environment where the vars still exist. -u actively marks
+    // them as "do not inherit from global" so new panes won't see them.
+    for var in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
+    ] {
         let _ = run_status_timeout(Command::new("tmux").args([
             "set-environment",
             "-t",
             &tmux_name,
-            "-r",
+            "-u",
             var,
         ]))
         .await;
@@ -442,6 +516,30 @@ pub async fn send_keys_literal(tmux_name: &str, text: &str) -> Result<()> {
     tokio::spawn(async move {
         let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
     });
+    Ok(())
+}
+
+/// Send literal text followed by Enter in a single tmux invocation.
+/// Uses `tmux send-keys -l TEXT \; send-keys Enter` so both arrive atomically
+/// (no race between separate fire-and-forget subprocesses).
+async fn send_text_enter(tmux_name: &str, text: &str) -> Result<()> {
+    let status = run_status_timeout(Command::new("tmux").args([
+        "send-keys",
+        "-t",
+        tmux_name,
+        "-l",
+        text,
+        ";",
+        "send-keys",
+        "-t",
+        tmux_name,
+        "Enter",
+    ]))
+    .await
+    .context("Failed to send text+enter to tmux")?;
+    if !status.success() {
+        bail!("tmux send-keys failed for '{tmux_name}'");
+    }
     Ok(())
 }
 
@@ -1152,6 +1250,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn integration_create_session_strips_claude_env_vars() {
+        // Simulate Hydra running inside Claude Code by setting the env vars
+        // that Claude Code uses to detect nested sessions.
+        std::env::set_var("CLAUDECODE", "1");
+        std::env::set_var("CLAUDE_CODE_ENTRYPOINT", "cli");
+        std::env::set_var("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1");
+
+        let tmux_name = create_session(
+            "ffffffff",
+            "itest-envstrip",
+            &AgentType::Claude,
+            "/tmp",
+            Some("sh -c 'env > /tmp/hydra-envstrip-test.txt && sleep 30'"),
+        )
+        .await
+        .unwrap();
+
+        // Wait for the command to write the env file
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let env_content = tokio::fs::read_to_string("/tmp/hydra-envstrip-test.txt")
+            .await
+            .expect("env output file should exist");
+
+        // None of the Claude Code env vars should be present
+        assert!(
+            !env_content.contains("CLAUDECODE="),
+            "CLAUDECODE should be stripped from session env, got:\n{env_content}"
+        );
+        assert!(
+            !env_content.contains("CLAUDE_CODE_ENTRYPOINT="),
+            "CLAUDE_CODE_ENTRYPOINT should be stripped from session env"
+        );
+        assert!(
+            !env_content.contains("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS="),
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS should be stripped from session env"
+        );
+
+        // Clean up
+        cleanup_session(&tmux_name).await;
+        let _ = tokio::fs::remove_file("/tmp/hydra-envstrip-test.txt").await;
+    }
+
+    #[tokio::test]
     async fn integration_create_session_with_command_override() {
         let sess_name = "itest-override";
         // Use a long-running command so the session stays alive for capture
@@ -1429,14 +1571,20 @@ mod tests {
 
         // Set remain-on-exit while the sleep is still running.
         let _ = run_status_timeout(Command::new("tmux").args([
-            "set-option", "-t", &name, "remain-on-exit", "on",
+            "set-option",
+            "-t",
+            &name,
+            "remain-on-exit",
+            "on",
         ]))
         .await;
 
         // Wait for the command to finish exiting.
         tokio::time::sleep(Duration::from_millis(600)).await;
 
-        let dead_set = batch_dead_panes().await.expect("tmux server should be running");
+        let dead_set = batch_dead_panes()
+            .await
+            .expect("tmux server should be running");
         assert!(
             dead_set.contains(&name),
             "exited session should appear in batch dead set: {dead_set:?}"
@@ -1449,13 +1597,24 @@ mod tests {
     async fn integration_batch_dead_panes_live_session_not_dead() {
         let name = test_session_name();
         let status = run_status_timeout(Command::new("tmux").args([
-            "new-session", "-d", "-s", &name, "-x", "80", "-y", "24", "sleep", "30",
+            "new-session",
+            "-d",
+            "-s",
+            &name,
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "sleep",
+            "30",
         ]))
         .await
         .unwrap();
         assert!(status.success());
 
-        let dead_set = batch_dead_panes().await.expect("tmux server should be running");
+        let dead_set = batch_dead_panes()
+            .await
+            .expect("tmux server should be running");
         assert!(
             !dead_set.contains(&name),
             "live session should NOT appear in dead set"
@@ -1473,11 +1632,23 @@ mod tests {
 
         // Create two sessions with different agent types.
         let name1 = mgr
-            .create_session(project_id, "par-a", &AgentType::Claude, "/tmp", Some("sleep 30"))
+            .create_session(
+                project_id,
+                "par-a",
+                &AgentType::Claude,
+                "/tmp",
+                Some("sleep 30"),
+            )
             .await
             .unwrap();
         let name2 = mgr
-            .create_session(project_id, "par-b", &AgentType::Codex, "/tmp", Some("sleep 30"))
+            .create_session(
+                project_id,
+                "par-b",
+                &AgentType::Codex,
+                "/tmp",
+                Some("sleep 30"),
+            )
             .await
             .unwrap();
 

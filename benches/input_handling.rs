@@ -1,42 +1,8 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
-use hydra::app::App;
+use hydra::app::{StateSnapshot, UiApp};
 use hydra::session::{AgentType, Session, SessionStatus};
-use hydra::tmux::SessionManager;
-
-// ── Noop session manager for benchmarks ─────────────────────────────
-
-struct NoopSessionManager;
-
-#[async_trait::async_trait]
-impl SessionManager for NoopSessionManager {
-    async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> {
-        Ok(vec![])
-    }
-    async fn create_session(
-        &self,
-        _: &str,
-        _: &str,
-        _: &AgentType,
-        _: &str,
-        _: Option<&str>,
-    ) -> anyhow::Result<String> {
-        Ok(String::new())
-    }
-    async fn capture_pane(&self, _: &str) -> anyhow::Result<String> {
-        Ok(String::new())
-    }
-    async fn kill_session(&self, _: &str) -> anyhow::Result<()> {
-        Ok(())
-    }
-    async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> {
-        Ok(())
-    }
-    async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> {
-        Ok(String::new())
-    }
-}
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -57,7 +23,7 @@ const NATO: &[&str] = &[
     "uniform", "victor", "whiskey", "xray", "yankee", "zulu",
 ];
 
-fn make_app_with_n_sessions(n: usize) -> App {
+fn make_app_with_n_sessions(n: usize) -> UiApp {
     let sessions: Vec<Session> = (0..n)
         .map(|i| {
             let name = if i < NATO.len() {
@@ -74,11 +40,10 @@ fn make_app_with_n_sessions(n: usize) -> App {
         })
         .collect();
 
-    let mut app = App::new_with_manager(
-        "bench-project".to_string(),
-        "/tmp/bench".to_string(),
-        Box::new(NoopSessionManager),
-    );
+    let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel(1);
+    let (_state_tx, state_rx) = tokio::sync::watch::channel(StateSnapshot::default());
+    let (_preview_tx, preview_rx) = tokio::sync::mpsc::channel(1);
+    let mut app = UiApp::new(state_rx, preview_rx, cmd_tx);
     app.sessions = sessions;
     app
 }
@@ -125,7 +90,7 @@ fn bench_handle_browse_key(c: &mut Criterion) {
             b.iter_batched(
                 || make_app_with_n_sessions(n),
                 |mut app| {
-                    app.handle_browse_key(black_box(KeyCode::Char('j')));
+                    app.select_next();
                     app
                 },
                 criterion::BatchSize::SmallInput,
@@ -140,7 +105,7 @@ fn bench_handle_browse_key(c: &mut Criterion) {
                     app
                 },
                 |mut app| {
-                    app.handle_browse_key(black_box(KeyCode::Char('k')));
+                    app.select_prev();
                     app
                 },
                 criterion::BatchSize::SmallInput,
@@ -203,12 +168,12 @@ fn bench_handle_mouse(c: &mut Criterion) {
         );
     });
 
-    // Preview click (in Attached mode)
-    group.bench_function("preview_click_attached", |b| {
+    // Preview click (in Compose mode)
+    group.bench_function("preview_click_compose", |b| {
         b.iter_batched(
             || {
                 let mut app = make_app_with_n_sessions(3);
-                app.mode = hydra::app::Mode::Attached;
+                app.mode = hydra::app::Mode::Compose;
                 app.sidebar_area.set(Rect::new(0, 0, 20, 24));
                 app.preview_area.set(Rect::new(20, 0, 60, 24));
                 app.preview.scroll_offset = 10;

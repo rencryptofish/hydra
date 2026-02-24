@@ -1,16 +1,18 @@
+use std::collections::VecDeque;
+
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph},
     Frame,
 };
 
-use crate::app::{App, Mode};
-use crate::logs::{format_cost, format_tokens};
+use crate::app::{Mode, UiApp};
+use crate::logs::{format_cost, format_tokens, ConversationEntry};
 use crate::session::{format_duration, AgentType, SessionStatus};
 
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &UiApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
@@ -36,7 +38,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match app.mode {
         Mode::NewSessionAgent => draw_agent_select(frame, app),
         Mode::ConfirmDelete => draw_confirm_delete(frame, app),
-        Mode::Browse | Mode::Attached => {}
+        Mode::Browse | Mode::Compose => {}
     }
 }
 
@@ -48,7 +50,7 @@ fn status_color(status: &SessionStatus) -> Color {
     }
 }
 
-pub fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
+pub fn draw_sidebar(frame: &mut Frame, app: &UiApp, area: Rect) {
     // Show stats if global stats have any tokens
     let has_stats = app.global_stats.tokens_in + app.global_stats.tokens_out > 0;
 
@@ -336,7 +338,7 @@ fn draw_diff_tree(frame: &mut Frame, lines: &[Line], area: Rect) {
     frame.render_widget(paragraph, inner);
 }
 
-pub fn draw_stats(frame: &mut Frame, app: &App, area: Rect) {
+pub fn draw_stats(frame: &mut Frame, app: &UiApp, area: Rect) {
     // Use machine-wide global stats for cost and tokens
     let total_cost = app.global_stats.cost_usd();
     let total_tokens = app.global_stats.tokens_in + app.global_stats.tokens_out;
@@ -374,84 +376,300 @@ pub fn draw_stats(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-pub fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
+pub fn draw_preview(frame: &mut Frame, app: &UiApp, area: Rect) {
     let title = if let Some(session) = app.sessions.get(app.selected) {
         format!(" {} ", session.name)
     } else {
         " Preview ".to_string()
     };
 
-    let mut preview_area = area;
-    let (border_style, border_type, border_title) = if app.mode == Mode::Attached {
-        let active_style = Style::default()
+    if app.mode == Mode::Compose {
+        // Compose mode: split preview area into conversation + compose input
+        let compose_line_count = app.compose.lines.len() as u16;
+        let compose_height = (compose_line_count + 3).min(area.height / 3).max(4); // +2 border +1 hint
+
+        let compose_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(compose_height)])
+            .split(area);
+
+        let conv_area = compose_chunks[0];
+        let input_area = compose_chunks[1];
+
+        // Draw conversation preview (scrolled to bottom)
+        let border_style = Style::default()
             .fg(Color::LightGreen)
             .add_modifier(Modifier::BOLD);
+        let conv_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Thick)
+            .title(title)
+            .border_style(border_style);
 
-        // Use three nested borders in attached mode so the active pane is obvious.
-        if area.width >= 7 && area.height >= 7 {
-            let attached_title = if let Some(session) = app.sessions.get(app.selected) {
-                format!(" {} [ATTACHED] ", session.name)
-            } else {
-                " Preview [ATTACHED] ".to_string()
-            };
+        let conv_inner_height = conv_area.height.saturating_sub(2);
+        let total_lines = app.preview.line_count;
+        let max_scroll_offset = total_lines.saturating_sub(conv_inner_height);
+        let capped_offset = app.preview.scroll_offset.min(max_scroll_offset);
+        let scroll_y = max_scroll_offset.saturating_sub(capped_offset);
 
-            frame.render_widget(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Thick)
-                    .title(attached_title)
-                    .border_style(active_style),
-                area,
-            );
-
-            let middle_area = inset_rect(area, 1);
-            frame.render_widget(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
-                    .border_style(active_style),
-                middle_area,
-            );
-
-            preview_area = inset_rect(area, 2);
-            (active_style, BorderType::Plain, String::new())
+        let conv_preview = if let Some(ref text) = app.preview.text {
+            Paragraph::new(text.clone())
+                .block(conv_block)
+                .scroll((scroll_y, 0))
         } else {
-            (active_style, BorderType::Double, title)
-        }
-    } else {
-        (Style::default().fg(Color::Cyan), BorderType::Plain, title)
-    };
+            Paragraph::new(app.preview.content.as_str())
+                .block(conv_block)
+                .scroll((scroll_y, 0))
+        };
+        frame.render_widget(conv_preview, conv_area);
 
-    let inner_height = preview_area.height.saturating_sub(2);
-    let total_lines = app.preview.line_count;
-    let max_scroll_offset = total_lines.saturating_sub(inner_height);
-    let capped_offset = app.preview.scroll_offset.min(max_scroll_offset);
-    let scroll_y = max_scroll_offset.saturating_sub(capped_offset);
+        // Draw compose input area
+        draw_compose_input(frame, app, input_area);
+    } else {
+        // Browse mode: normal preview
+        let border_style = Style::default().fg(Color::Cyan);
+        let inner_height = area.height.saturating_sub(2);
+        let total_lines = app.preview.line_count;
+        let max_scroll_offset = total_lines.saturating_sub(inner_height);
+        let capped_offset = app.preview.scroll_offset.min(max_scroll_offset);
+        let scroll_y = max_scroll_offset.saturating_sub(capped_offset);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(border_style);
+
+        let preview = if let Some(ref text) = app.preview.text {
+            Paragraph::new(text.clone())
+                .block(block)
+                .scroll((scroll_y, 0))
+        } else {
+            Paragraph::new(app.preview.content.as_str())
+                .block(block)
+                .scroll((scroll_y, 0))
+        };
+
+        frame.render_widget(preview, area);
+    }
+}
+
+fn draw_compose_input(frame: &mut Frame, app: &UiApp, area: Rect) {
+    let compose_style = Style::default()
+        .fg(Color::LightGreen)
+        .add_modifier(Modifier::BOLD);
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(border_type)
-        .title(border_title)
-        .border_style(border_style);
+        .border_type(BorderType::Double)
+        .title(" Compose ")
+        .border_style(compose_style);
 
-    let preview = if let Some(ref text) = app.preview.text {
-        Paragraph::new(text.clone())
-            .block(block)
-            .scroll((scroll_y, 0))
-    } else {
-        Paragraph::new(app.preview.content.as_str())
-            .block(block)
-            .scroll((scroll_y, 0))
-    };
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    frame.render_widget(preview, preview_area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // Reserve last row for hint
+    let text_height = inner.height.saturating_sub(1);
+    let text_area = Rect::new(inner.x, inner.y, inner.width, text_height);
+    let hint_area = Rect::new(inner.x, inner.y + text_height, inner.width, 1);
+
+    // Render compose text
+    let compose_lines: Vec<Line> = app
+        .compose
+        .lines
+        .iter()
+        .map(|l| Line::from(l.as_str().to_string()))
+        .collect();
+    let paragraph = Paragraph::new(compose_lines);
+    frame.render_widget(paragraph, text_area);
+
+    // Render hint
+    let hint = Line::from(Span::styled(
+        "Enter: send | Esc: cancel",
+        Style::default().add_modifier(Modifier::DIM),
+    ));
+    frame.render_widget(Paragraph::new(hint), hint_area);
+
+    // Set cursor position
+    let cursor_x = inner.x + app.compose.cursor_col as u16;
+    let cursor_y = inner.y + app.compose.cursor_row as u16;
+    if cursor_x < inner.x + inner.width && cursor_y < inner.y + text_height {
+        frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+    }
 }
 
-fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
+fn push_component_title(lines: &mut Vec<Line<'static>>, title: &str, style: Style) {
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(title.to_string(), style)));
+}
+
+fn push_component_body(lines: &mut Vec<Line<'static>>, text: &str, style: Style) {
+    for line in text.lines() {
+        lines.push(Line::from(Span::styled(format!("  {line}"), style)));
+    }
+}
+
+fn push_tool_result_component(
+    lines: &mut Vec<Line<'static>>,
+    filenames: &[String],
+    summary: Option<&str>,
+    style: Style,
+) {
+    push_component_title(lines, "TOOL RESULT", style);
+    let preview_count = filenames.len().min(4);
+    for file in filenames.iter().take(preview_count) {
+        lines.push(Line::from(Span::styled(format!("  - {file}"), style)));
+    }
+    if filenames.len() > preview_count {
+        lines.push(Line::from(Span::styled(
+            format!("  ... +{} more", filenames.len() - preview_count),
+            style.add_modifier(Modifier::DIM),
+        )));
+    }
+    if let Some(summary) = summary {
+        for line in summary.lines().take(3) {
+            lines.push(Line::from(Span::styled(format!("  > {line}"), style)));
+        }
+    }
+}
+
+fn push_unparsed_component(
+    lines: &mut Vec<Line<'static>>,
+    reason: &str,
+    raw: &str,
+    reason_style: Style,
+    raw_style: Style,
+) {
+    lines.push(Line::from(vec![
+        Span::styled(format!("  [{reason}] "), reason_style),
+        Span::styled(raw.to_string(), raw_style),
+    ]));
+}
+
+/// Render conversation entries into styled `Text` for the preview pane.
+pub fn render_conversation(entries: &VecDeque<ConversationEntry>) -> ratatui::text::Text<'static> {
+    if entries.is_empty() {
+        return ratatui::text::Text::from(Line::from(Span::styled(
+            "Waiting for agent output...",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
+
+    let user_title = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let assistant_title = Style::default()
+        .fg(Color::LightGreen)
+        .add_modifier(Modifier::BOLD);
+    let tool_title = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let queue_title = Style::default()
+        .fg(Color::Magenta)
+        .add_modifier(Modifier::BOLD);
+    let progress_title = Style::default()
+        .fg(Color::LightBlue)
+        .add_modifier(Modifier::BOLD);
+    let system_title = Style::default()
+        .fg(Color::LightMagenta)
+        .add_modifier(Modifier::BOLD);
+    let snapshot_title = Style::default()
+        .fg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD);
+    let body = Style::default();
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let warn = Style::default().fg(Color::Magenta);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut unparsed_lines: Vec<Line<'static>> = Vec::new();
+
+    for entry in entries {
+        match entry {
+            ConversationEntry::UserMessage { text } => {
+                push_component_title(&mut lines, "USER", user_title);
+                push_component_body(&mut lines, text, body);
+            }
+            ConversationEntry::AssistantText { text } => {
+                push_component_title(&mut lines, "ASSISTANT", assistant_title);
+                push_component_body(&mut lines, text, body);
+            }
+            ConversationEntry::ToolUse { tool_name, details } => {
+                push_component_title(&mut lines, "TOOL", tool_title);
+                lines.push(Line::from(Span::styled(format!("  {tool_name}"), dim)));
+                if let Some(details) = details {
+                    lines.push(Line::from(Span::styled(format!("  {details}"), dim)));
+                }
+            }
+            ConversationEntry::ToolResult { filenames, summary } => {
+                push_tool_result_component(&mut lines, filenames, summary.as_deref(), dim);
+            }
+            ConversationEntry::QueueOperation { operation, task_id } => {
+                push_component_title(&mut lines, "SUBAGENT", queue_title);
+                let text = match task_id {
+                    Some(task_id) => format!("  {operation} ({task_id})"),
+                    None => format!("  {operation}"),
+                };
+                lines.push(Line::from(Span::styled(text, dim)));
+            }
+            ConversationEntry::Progress { kind, detail } => {
+                push_component_title(&mut lines, &format!("PROGRESS ({kind})"), progress_title);
+                lines.push(Line::from(Span::styled(format!("  {detail}"), dim)));
+            }
+            ConversationEntry::SystemEvent { subtype, detail } => {
+                push_component_title(&mut lines, &format!("SYSTEM ({subtype})"), system_title);
+                lines.push(Line::from(Span::styled(format!("  {detail}"), dim)));
+            }
+            ConversationEntry::FileHistorySnapshot {
+                tracked_files,
+                files,
+                is_update,
+            } => {
+                push_component_title(&mut lines, "FILE SNAPSHOT", snapshot_title);
+                let kind = if *is_update { "update" } else { "new" };
+                lines.push(Line::from(Span::styled(
+                    format!("  {kind}: {tracked_files} tracked file(s)"),
+                    dim,
+                )));
+                for file in files {
+                    lines.push(Line::from(Span::styled(format!("  - {file}"), dim)));
+                }
+                if *tracked_files > files.len() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  ... +{} more", tracked_files - files.len()),
+                        dim,
+                    )));
+                }
+            }
+            ConversationEntry::Unparsed { reason, raw } => {
+                push_unparsed_component(&mut unparsed_lines, reason, raw, warn, dim);
+            }
+        }
+    }
+
+    if !unparsed_lines.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            "UNPARSED JSONL",
+            warn.add_modifier(Modifier::BOLD),
+        )));
+        lines.extend(unparsed_lines);
+    }
+
+    ratatui::text::Text::from(lines)
+}
+
+fn draw_help_bar(frame: &mut Frame, app: &UiApp, area: Rect) {
     let help_text = match app.mode {
         Mode::Browse if !app.mouse_captured => "SELECT TEXT TO COPY  |  c: exit copy mode",
         Mode::Browse => "j/k: navigate  Enter: attach  n: new  d: delete  c: copy  q: quit",
-        Mode::Attached => "Esc: detach  (keys forwarded to session)",
+        Mode::Compose => "Enter: send  Esc: cancel",
         Mode::NewSessionAgent => "j/k: select agent  Enter: confirm  Esc: cancel",
         Mode::ConfirmDelete => "y: confirm delete  Esc: cancel",
     };
@@ -479,6 +697,7 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, width.min(area.width), height.min(area.height))
 }
 
+#[cfg(test)]
 fn inset_rect(area: Rect, margin: u16) -> Rect {
     let double = margin.saturating_mul(2);
     Rect::new(
@@ -489,7 +708,7 @@ fn inset_rect(area: Rect, margin: u16) -> Rect {
     )
 }
 
-fn draw_agent_select(frame: &mut Frame, app: &App) {
+fn draw_agent_select(frame: &mut Frame, app: &UiApp) {
     let agents = AgentType::all();
     let height = agents.len() as u16 + 2;
     let area = centered_rect(30, height, frame.area());
@@ -525,7 +744,7 @@ fn draw_agent_select(frame: &mut Frame, app: &App) {
     frame.render_widget(list, area);
 }
 
-fn draw_confirm_delete(frame: &mut Frame, app: &App) {
+fn draw_confirm_delete(frame: &mut Frame, app: &UiApp) {
     let area = centered_rect(40, 5, frame.area());
     frame.render_widget(Clear, area);
 
@@ -549,47 +768,11 @@ fn draw_confirm_delete(frame: &mut Frame, app: &App) {
 mod tests {
     use ratatui::{backend::TestBackend, layout::Rect, Terminal};
 
-    use crate::app::{App, Mode};
+    use crate::app::{Mode, UiApp};
     use crate::session::{AgentType, Session, SessionStatus};
-    use crate::tmux::SessionManager;
 
-    struct NoopSessionManager;
-
-    #[async_trait::async_trait]
-    impl SessionManager for NoopSessionManager {
-        async fn list_sessions(&self, _: &str) -> anyhow::Result<Vec<Session>> {
-            Ok(vec![])
-        }
-        async fn create_session(
-            &self,
-            _: &str,
-            _: &str,
-            _: &AgentType,
-            _: &str,
-            _: Option<&str>,
-        ) -> anyhow::Result<String> {
-            Ok(String::new())
-        }
-        async fn capture_pane(&self, _: &str) -> anyhow::Result<String> {
-            Ok(String::new())
-        }
-        async fn kill_session(&self, _: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn send_keys(&self, _: &str, _: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn capture_pane_scrollback(&self, _: &str) -> anyhow::Result<String> {
-            Ok(String::new())
-        }
-    }
-
-    fn make_app() -> App {
-        App::new_with_manager(
-            "testproj".to_string(),
-            "/tmp/test".to_string(),
-            Box::new(NoopSessionManager),
-        )
+    fn make_app() -> UiApp {
+        UiApp::new_test()
     }
 
     fn make_session(name: &str, agent: AgentType) -> Session {
@@ -689,14 +872,14 @@ mod tests {
     }
 
     #[test]
-    fn attached_mode() {
+    fn compose_mode() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
         let mut app = make_app();
         app.sessions = vec![make_session("active-session", AgentType::Claude)];
         app.selected = 0;
-        app.mode = Mode::Attached;
+        app.mode = Mode::Compose;
         app.preview
             .set_text("$ claude\nHello, how can I help?".to_string());
 
@@ -1294,5 +1477,181 @@ mod tests {
         assert_eq!(inset.height, 0);
         assert_eq!(inset.x, 20); // saturating_add
         assert_eq!(inset.y, 20);
+    }
+
+    // ── render_conversation tests ───────────────────────────────────
+
+    #[test]
+    fn conversation_empty() {
+        let entries = std::collections::VecDeque::new();
+        let text = super::render_conversation(&entries);
+        let rendered: String = text
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn conversation_basic() {
+        use crate::logs::ConversationEntry;
+        let mut entries = std::collections::VecDeque::new();
+        entries.push_back(ConversationEntry::UserMessage {
+            text: "Fix the bug".to_string(),
+        });
+        entries.push_back(ConversationEntry::AssistantText {
+            text: "I'll fix that for you.".to_string(),
+        });
+        entries.push_back(ConversationEntry::ToolUse {
+            tool_name: "Edit".to_string(),
+            details: Some("id=t1 | file=src/main.rs".to_string()),
+        });
+        entries.push_back(ConversationEntry::ToolResult {
+            filenames: vec!["src/main.rs".to_string()],
+            summary: Some("updated file successfully".to_string()),
+        });
+        entries.push_back(ConversationEntry::AssistantText {
+            text: "Done! The bug is fixed.".to_string(),
+        });
+        let text = super::render_conversation(&entries);
+        let rendered: String = text
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn conversation_tool_heavy() {
+        use crate::logs::ConversationEntry;
+        let mut entries = std::collections::VecDeque::new();
+        entries.push_back(ConversationEntry::UserMessage {
+            text: "Refactor the module".to_string(),
+        });
+        entries.push_back(ConversationEntry::AssistantText {
+            text: "Let me read the files first.".to_string(),
+        });
+        entries.push_back(ConversationEntry::ToolUse {
+            tool_name: "Read".to_string(),
+            details: Some("path=src/app.rs".to_string()),
+        });
+        entries.push_back(ConversationEntry::ToolResult {
+            filenames: vec!["src/app.rs".to_string()],
+            summary: None,
+        });
+        entries.push_back(ConversationEntry::ToolUse {
+            tool_name: "Read".to_string(),
+            details: Some("path=src/ui.rs".to_string()),
+        });
+        entries.push_back(ConversationEntry::ToolResult {
+            filenames: vec!["src/ui.rs".to_string()],
+            summary: None,
+        });
+        entries.push_back(ConversationEntry::ToolUse {
+            tool_name: "Edit".to_string(),
+            details: Some("id=t3 | file=src/app.rs".to_string()),
+        });
+        entries.push_back(ConversationEntry::ToolResult {
+            filenames: vec!["src/app.rs".to_string(), "src/ui.rs".to_string()],
+            summary: Some("2 files modified".to_string()),
+        });
+        entries.push_back(ConversationEntry::AssistantText {
+            text: "Refactoring complete.".to_string(),
+        });
+        let text = super::render_conversation(&entries);
+        let rendered: String = text
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn conversation_with_unparsed_logs() {
+        use crate::logs::ConversationEntry;
+        let mut entries = std::collections::VecDeque::new();
+        entries.push_back(ConversationEntry::UserMessage {
+            text: "show me diagnostics".to_string(),
+        });
+        entries.push_back(ConversationEntry::Unparsed {
+            reason: "Malformed JSONL".to_string(),
+            raw: "{\"type\":\"assistant\" BROKEN".to_string(),
+        });
+        entries.push_back(ConversationEntry::QueueOperation {
+            operation: "enqueue".to_string(),
+            task_id: Some("task-1".to_string()),
+        });
+        let text = super::render_conversation(&entries);
+        let rendered: String = text
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn conversation_with_progress_system_and_snapshot() {
+        use crate::logs::ConversationEntry;
+        let mut entries = std::collections::VecDeque::new();
+        entries.push_back(ConversationEntry::Progress {
+            kind: "waiting_for_task".to_string(),
+            detail: "Run integration suite (local_bash)".to_string(),
+        });
+        entries.push_back(ConversationEntry::SystemEvent {
+            subtype: "api_error".to_string(),
+            detail: "API error | attempt 2/10 | retry in 536ms".to_string(),
+        });
+        entries.push_back(ConversationEntry::FileHistorySnapshot {
+            tracked_files: 4,
+            files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            is_update: true,
+        });
+
+        let text = super::render_conversation(&entries);
+        let rendered: String = text
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("PROGRESS (waiting_for_task)"));
+        assert!(rendered.contains("SYSTEM (api_error)"));
+        assert!(rendered.contains("FILE SNAPSHOT"));
+        assert!(rendered.contains("update: 4 tracked file(s)"));
+        assert!(rendered.contains("... +2 more"));
     }
 }

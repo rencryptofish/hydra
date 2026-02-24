@@ -367,14 +367,23 @@ pub struct GlobalStats {
     pub codex_tokens_in: u64,
     pub codex_tokens_out: u64,
     pub codex_tokens_cache_read: u64,
+    pub gemini_tokens_in: u64,
+    pub gemini_tokens_out: u64,
+    pub gemini_tokens_cached: u64,
     /// Per-file read offsets for incremental Claude log reading.
     file_offsets: HashMap<PathBuf, u64>,
     /// Per-file incremental state for Codex token_count parsing.
     codex_file_states: HashMap<PathBuf, CodexFileState>,
+    /// Per-file sizes for Gemini session change detection.
+    gemini_file_sizes: HashMap<PathBuf, u64>,
+    /// Per-file token totals for Gemini (to compute deltas on re-parse).
+    gemini_file_tokens: HashMap<PathBuf, (u64, u64, u64)>,
     /// Cached file list to avoid recursive scans on every refresh.
     known_claude_files: Vec<PathBuf>,
     /// Cached file list to avoid recursive scans on every refresh.
     known_codex_files: Vec<PathBuf>,
+    /// Cached file list for Gemini session JSON files.
+    known_gemini_files: Vec<PathBuf>,
     /// Unix timestamp of last recursive file discovery.
     last_file_discovery_ts: i64,
     /// Date string (YYYY-MM-DD) these stats are for; reset when date changes.
@@ -392,7 +401,10 @@ impl GlobalStats {
             || self.claude_tokens_cache_write > 0
             || self.codex_tokens_in > 0
             || self.codex_tokens_out > 0
-            || self.codex_tokens_cache_read > 0;
+            || self.codex_tokens_cache_read > 0
+            || self.gemini_tokens_in > 0
+            || self.gemini_tokens_out > 0
+            || self.gemini_tokens_cached > 0;
 
         // Backward compatibility for tests/older state that only set aggregate fields.
         if !has_breakdown {
@@ -422,6 +434,15 @@ impl GlobalStats {
         let codex_cache_read =
             self.codex_tokens_cache_read as f64 * CODEX_CACHE_READ_USD_PER_MTOK / 1_000_000.0;
 
+        let gemini_uncached_input = self
+            .gemini_tokens_in
+            .saturating_sub(self.gemini_tokens_cached);
+        let gemini_input = gemini_uncached_input as f64 * GEMINI_INPUT_USD_PER_MTOK / 1_000_000.0;
+        let gemini_output =
+            self.gemini_tokens_out as f64 * GEMINI_OUTPUT_USD_PER_MTOK / 1_000_000.0;
+        let gemini_cache_read =
+            self.gemini_tokens_cached as f64 * GEMINI_CACHE_READ_USD_PER_MTOK / 1_000_000.0;
+
         claude_input
             + claude_output
             + claude_cache_read
@@ -429,6 +450,9 @@ impl GlobalStats {
             + codex_input
             + codex_output
             + codex_cache_read
+            + gemini_input
+            + gemini_output
+            + gemini_cache_read
     }
 }
 
@@ -451,10 +475,16 @@ pub fn update_global_stats(stats: &mut GlobalStats) {
         stats.codex_tokens_in = 0;
         stats.codex_tokens_out = 0;
         stats.codex_tokens_cache_read = 0;
+        stats.gemini_tokens_in = 0;
+        stats.gemini_tokens_out = 0;
+        stats.gemini_tokens_cached = 0;
         stats.file_offsets.clear();
         stats.codex_file_states.clear();
+        stats.gemini_file_sizes.clear();
+        stats.gemini_file_tokens.clear();
         stats.known_claude_files.clear();
         stats.known_codex_files.clear();
+        stats.known_gemini_files.clear();
         stats.last_file_discovery_ts = 0;
         stats.date = today.clone();
     }
@@ -468,8 +498,12 @@ fn update_global_stats_inner(
     today: &str,
     base_dir: Option<&std::path::Path>,
 ) {
-    let (claude_projects_dir, codex_sessions_dir) = match base_dir {
-        Some(dir) => (dir.to_path_buf(), dir.join(".codex").join("sessions")),
+    let (claude_projects_dir, codex_sessions_dir, gemini_tmp_dir) = match base_dir {
+        Some(dir) => (
+            dir.to_path_buf(),
+            dir.join(".codex").join("sessions"),
+            dir.join(".gemini").join("tmp"),
+        ),
         None => {
             let home = match std::env::var("HOME") {
                 Ok(h) => h,
@@ -478,6 +512,7 @@ fn update_global_stats_inner(
             (
                 PathBuf::from(&home).join(".claude").join("projects"),
                 PathBuf::from(&home).join(".codex").join("sessions"),
+                PathBuf::from(&home).join(".gemini").join("tmp"),
             )
         }
     };
@@ -505,6 +540,18 @@ fn update_global_stats_inner(
             .codex_file_states
             .retain(|p, _| codex_file_set.contains(p));
 
+        let mut gemini_files = Vec::new();
+        collect_gemini_session_files(&gemini_tmp_dir, &mut gemini_files);
+        stats.known_gemini_files = gemini_files;
+
+        let gemini_file_set: HashSet<PathBuf> = stats.known_gemini_files.iter().cloned().collect();
+        stats
+            .gemini_file_sizes
+            .retain(|p, _| gemini_file_set.contains(p));
+        stats
+            .gemini_file_tokens
+            .retain(|p, _| gemini_file_set.contains(p));
+
         stats.last_file_discovery_ts = now_ts;
     }
 
@@ -520,6 +567,12 @@ fn update_global_stats_inner(
     for i in 0..stats.known_codex_files.len() {
         let path = stats.known_codex_files[i].clone();
         process_codex_global_file(&path, stats, today);
+    }
+
+    // Process Gemini session files.
+    for i in 0..stats.known_gemini_files.len() {
+        let path = stats.known_gemini_files[i].clone();
+        process_gemini_global_file(&path, stats, today);
     }
 }
 
@@ -953,6 +1006,1345 @@ pub fn extract_assistant_message_text(v: &serde_json::Value) -> Option<String> {
     } else {
         Some(parts.join(" "))
     }
+}
+
+// ── Conversation entries for structured preview ─────────────────────
+
+/// A single entry in a Claude Code conversation, parsed from JSONL logs.
+#[derive(Debug, Clone)]
+pub enum ConversationEntry {
+    UserMessage {
+        text: String,
+    },
+    AssistantText {
+        text: String,
+    },
+    ToolUse {
+        tool_name: String,
+        details: Option<String>,
+    },
+    ToolResult {
+        filenames: Vec<String>,
+        summary: Option<String>,
+    },
+    QueueOperation {
+        operation: String,
+        task_id: Option<String>,
+    },
+    Progress {
+        kind: String,
+        detail: String,
+    },
+    SystemEvent {
+        subtype: String,
+        detail: String,
+    },
+    FileHistorySnapshot {
+        tracked_files: usize,
+        files: Vec<String>,
+        is_update: bool,
+    },
+    Unparsed {
+        reason: String,
+        raw: String,
+    },
+}
+
+fn summarize_jsonl_line(line: &str, max_chars: usize) -> String {
+    let compact = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        compact
+    } else {
+        let mut out: String = compact.chars().take(max_chars).collect();
+        out.push_str("...");
+        out
+    }
+}
+
+fn extract_text_parts(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::String(s) => vec![s.clone()],
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .flat_map(extract_text_parts)
+            .collect::<Vec<String>>(),
+        serde_json::Value::Object(map) => {
+            if let Some(text) = map.get("text").and_then(|t| t.as_str()) {
+                return vec![text.to_string()];
+            }
+            if let Some(content) = map.get("content") {
+                return extract_text_parts(content);
+            }
+            vec![]
+        }
+        _ => vec![],
+    }
+}
+
+fn extract_text(value: &serde_json::Value) -> Option<String> {
+    let parts: Vec<String> = extract_text_parts(value)
+        .into_iter()
+        .filter_map(|p| {
+            let trimmed = p.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .collect();
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+fn summarize_tool_input(input: &serde_json::Value) -> Option<String> {
+    if let Some(text) = extract_text(input) {
+        return Some(summarize_jsonl_line(&text, 120));
+    }
+
+    let obj = input.as_object()?;
+    if obj.is_empty() {
+        return None;
+    }
+
+    let mut details: Vec<String> = Vec::new();
+    let important_fields = [
+        ("file_path", "file"),
+        ("path", "path"),
+        ("old_path", "old"),
+        ("new_path", "new"),
+        ("command", "cmd"),
+        ("query", "query"),
+        ("pattern", "pattern"),
+        ("url", "url"),
+    ];
+
+    for (key, label) in important_fields {
+        if let Some(v) = obj.get(key) {
+            if let Some(text) = extract_text(v) {
+                details.push(format!("{label}={}", summarize_jsonl_line(&text, 80)));
+            }
+        }
+    }
+
+    if details.is_empty() {
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let shown: Vec<&str> = keys.into_iter().take(5).collect();
+        details.push(format!("args={}", shown.join(", ")));
+    }
+
+    Some(details.join(" | "))
+}
+
+fn summarize_tool_use_details(item: &serde_json::Value) -> Option<String> {
+    let mut details: Vec<String> = Vec::new();
+
+    if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+        details.push(format!("id={id}"));
+    }
+
+    if let Some(input) = item.get("input") {
+        if let Some(summary) = summarize_tool_input(input) {
+            details.push(summary);
+        }
+    }
+
+    if details.is_empty() {
+        None
+    } else {
+        Some(details.join(" | "))
+    }
+}
+
+fn extract_tag_value(content: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = content.find(&open)? + open.len();
+    let end = content[start..].find(&close)? + start;
+    let inner = content[start..end].trim();
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner.to_string())
+    }
+}
+
+fn summarize_progress_entry(value: &serde_json::Value) -> Option<(String, String)> {
+    let data = value.get("data")?;
+    let kind = data.get("type").and_then(|t| t.as_str())?.to_string();
+
+    let detail = match kind.as_str() {
+        "waiting_for_task" => {
+            let desc = data
+                .get("taskDescription")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if desc.is_empty() {
+                return None;
+            }
+            let task_type = data
+                .get("taskType")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty());
+            match task_type {
+                Some(task_type) => format!("{desc} ({task_type})"),
+                None => desc.to_string(),
+            }
+        }
+        "search_results_received" => {
+            let query = data
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let result_count = data.get("resultCount").and_then(|v| v.as_u64());
+            match (result_count, query.is_empty()) {
+                (Some(count), false) => format!("{count} results for {query}"),
+                (Some(count), true) => format!("{count} results"),
+                (None, false) => query.to_string(),
+                (None, true) => return None,
+            }
+        }
+        "query_update" => data
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        "mcp_progress" => {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(status) = data.get("status").and_then(|v| v.as_str()) {
+                parts.push(status.to_string());
+            }
+            if let Some(server) = data.get("serverName").and_then(|v| v.as_str()) {
+                parts.push(format!("server={server}"));
+            }
+            if let Some(tool) = data.get("toolName").and_then(|v| v.as_str()) {
+                parts.push(format!("tool={tool}"));
+            }
+            if let Some(ms) = data.get("elapsedTimeMs").and_then(|v| v.as_f64()) {
+                parts.push(format!("{}ms", ms.round() as u64));
+            }
+            if parts.is_empty() {
+                return None;
+            }
+            parts.join(" | ")
+        }
+        "bash_progress" => {
+            let output = data
+                .get("output")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let elapsed = data.get("elapsedTimeSeconds").and_then(|v| v.as_u64());
+            let total_lines = data.get("totalLines").and_then(|v| v.as_u64()).unwrap_or(0);
+            if output.is_empty() && total_lines == 0 {
+                return None;
+            }
+            let mut parts: Vec<String> = Vec::new();
+            if !output.is_empty() {
+                parts.push(summarize_jsonl_line(output, 120));
+            }
+            if let Some(elapsed) = elapsed {
+                parts.push(format!("{elapsed}s"));
+            }
+            if total_lines > 0 {
+                parts.push(format!("{total_lines} lines"));
+            }
+            if parts.is_empty() {
+                return None;
+            }
+            parts.join(" | ")
+        }
+        // High-volume noise with little user-facing value in the transcript.
+        "hook_progress" | "agent_progress" => return None,
+        _ => extract_text(data).unwrap_or_default(),
+    };
+
+    let detail = detail.trim();
+    if detail.is_empty() {
+        None
+    } else {
+        Some((kind, summarize_jsonl_line(detail, 180)))
+    }
+}
+
+fn summarize_system_entry(value: &serde_json::Value) -> Option<(String, String)> {
+    let subtype = value
+        .get("subtype")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let detail = match subtype.as_str() {
+        // Very frequent and already represented by task timers in the UI.
+        "turn_duration" => return None,
+        "compact_boundary" => "Context compacted".to_string(),
+        "microcompact_boundary" => "Micro-compaction boundary".to_string(),
+        "api_error" => {
+            let mut parts: Vec<String> = vec!["API error".to_string()];
+            let retry_attempt = value.get("retryAttempt").and_then(|v| v.as_u64());
+            let max_retries = value.get("maxRetries").and_then(|v| v.as_u64());
+            if let (Some(attempt), Some(max)) = (retry_attempt, max_retries) {
+                parts.push(format!("attempt {attempt}/{max}"));
+            } else if let Some(attempt) = retry_attempt {
+                parts.push(format!("attempt {attempt}"));
+            }
+            if let Some(ms) = value.get("retryInMs").and_then(|v| v.as_f64()) {
+                parts.push(format!("retry in {}ms", ms.round() as u64));
+            }
+            if let Some(text) = value
+                .get("error")
+                .and_then(extract_text)
+                .or_else(|| value.get("message").and_then(extract_text))
+            {
+                if !text.trim().is_empty() {
+                    parts.push(summarize_jsonl_line(&text, 120));
+                }
+            }
+            parts.join(" | ")
+        }
+        "local_command" => {
+            let content = value
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let command = extract_tag_value(content, "command-name");
+            let message = extract_tag_value(content, "command-message");
+            let stdout = extract_tag_value(content, "local-command-stdout");
+            let stderr = extract_tag_value(content, "local-command-stderr");
+
+            match (stderr, stdout, command, message) {
+                (Some(stderr), _, _, _) => {
+                    format!("stderr: {}", summarize_jsonl_line(&stderr, 140))
+                }
+                (_, Some(stdout), _, _) => {
+                    format!("stdout: {}", summarize_jsonl_line(&stdout, 140))
+                }
+                (_, _, Some(cmd), Some(msg)) => {
+                    format!("{cmd}: {}", summarize_jsonl_line(&msg, 120))
+                }
+                (_, _, Some(cmd), None) => cmd,
+                (_, _, None, Some(msg)) => summarize_jsonl_line(&msg, 140),
+                _ if !content.is_empty() => summarize_jsonl_line(content, 140),
+                _ => return None,
+            }
+        }
+        "stop_hook_summary" => {
+            let hook_count = value.get("hookCount").and_then(|v| v.as_u64());
+            let hook_errors = value
+                .get("hookErrors")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.len())
+                .unwrap_or(0);
+            let prevented = value
+                .get("preventedContinuation")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let stop_reason = value
+                .get("stopReason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let has_output = value
+                .get("hasOutput")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            if hook_errors == 0 && !prevented && stop_reason.is_empty() && !has_output {
+                return None;
+            }
+
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(count) = hook_count {
+                parts.push(format!("hooks={count}"));
+            }
+            if hook_errors > 0 {
+                parts.push(format!("errors={hook_errors}"));
+            }
+            if prevented {
+                parts.push("prevented continuation".to_string());
+            }
+            if !stop_reason.is_empty() {
+                parts.push(format!("reason={}", summarize_jsonl_line(stop_reason, 80)));
+            }
+            if has_output {
+                parts.push("has output".to_string());
+            }
+            if parts.is_empty() {
+                return None;
+            }
+            parts.join(" | ")
+        }
+        _ => value
+            .get("content")
+            .and_then(extract_text)
+            .or_else(|| value.get("message").and_then(extract_text))
+            .or_else(|| {
+                value
+                    .get("level")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "event".to_string()),
+    };
+
+    let detail = detail.trim();
+    if detail.is_empty() {
+        None
+    } else {
+        Some((subtype, summarize_jsonl_line(detail, 180)))
+    }
+}
+
+fn summarize_file_history_snapshot(
+    value: &serde_json::Value,
+) -> Option<(usize, Vec<String>, bool)> {
+    let is_update = value
+        .get("isSnapshotUpdate")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let tracked = value
+        .get("snapshot")
+        .and_then(|s| s.get("trackedFileBackups"))
+        .and_then(|v| v.as_object())?;
+
+    let tracked_files = tracked.len();
+    if tracked_files == 0 && !is_update {
+        return None;
+    }
+
+    let mut files: Vec<String> = tracked.keys().cloned().collect();
+    files.sort();
+    files.truncate(3);
+    Some((tracked_files, files, is_update))
+}
+
+fn extract_tool_result_parts(value: &serde_json::Value) -> (Vec<String>, Option<String>) {
+    let filenames = value
+        .get("filenames")
+        .and_then(|f| f.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+
+    let summary_fields = [
+        "content", "output", "message", "text", "error", "stderr", "stdout",
+    ];
+    let mut summary: Option<String> = None;
+    for field in summary_fields {
+        if let Some(v) = value.get(field) {
+            if let Some(text) = extract_text(v) {
+                summary = Some(summarize_jsonl_line(&text, 180));
+                break;
+            }
+        }
+    }
+
+    if summary.is_none() {
+        if let Some(ok) = value.get("success").and_then(|v| v.as_bool()) {
+            summary = Some(if ok {
+                "status=success".to_string()
+            } else {
+                "status=failure".to_string()
+            });
+        }
+    }
+
+    (filenames, summary)
+}
+
+/// Parse conversation entries from a Claude JSONL log file.
+/// Reads incrementally from `read_offset`; returns new entries + updated offset.
+pub fn parse_conversation_entries(
+    path: &std::path::Path,
+    read_offset: u64,
+) -> (Vec<ConversationEntry>, u64) {
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return (vec![], read_offset),
+    };
+    let file_len = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return (vec![], read_offset),
+    };
+
+    if file_len <= read_offset {
+        return (vec![], read_offset);
+    }
+
+    if read_offset > 0 && file.seek(SeekFrom::Start(read_offset)).is_err() {
+        return (vec![], read_offset);
+    }
+
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return (vec![], read_offset);
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut entries = Vec::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let value = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(v) => v,
+            Err(_) => {
+                entries.push(ConversationEntry::Unparsed {
+                    reason: "Malformed JSONL".to_string(),
+                    raw: summarize_jsonl_line(line, 220),
+                });
+                continue;
+            }
+        };
+
+        let mut parsed = false;
+        let mut handled = false;
+
+        // Tool results can appear without a top-level `type`.
+        if let Some(tool_result) = value.get("toolUseResult") {
+            handled = true;
+            let (filenames, summary) = extract_tool_result_parts(tool_result);
+            if !filenames.is_empty() || summary.is_some() {
+                entries.push(ConversationEntry::ToolResult { filenames, summary });
+                parsed = true;
+            }
+        }
+
+        match value.get("type").and_then(|t| t.as_str()) {
+            Some("assistant") => {
+                handled = true;
+                if let Some(content) = value
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                {
+                    for item in content {
+                        match item.get("type").and_then(|t| t.as_str()) {
+                            Some("text") | Some("thinking") | Some("reasoning") => {
+                                if let Some(text) = item.get("text").and_then(extract_text) {
+                                    entries.push(ConversationEntry::AssistantText { text });
+                                    parsed = true;
+                                }
+                            }
+                            Some("tool_use") => {
+                                if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                                    entries.push(ConversationEntry::ToolUse {
+                                        tool_name: name.to_string(),
+                                        details: summarize_tool_use_details(item),
+                                    });
+                                    parsed = true;
+                                }
+                            }
+                            Some("tool_result") => {
+                                let (filenames, summary) = extract_tool_result_parts(item);
+                                if !filenames.is_empty() || summary.is_some() {
+                                    entries
+                                        .push(ConversationEntry::ToolResult { filenames, summary });
+                                    parsed = true;
+                                }
+                            }
+                            _ => {
+                                // Some logs include text entries without explicit `type`.
+                                if let Some(text) = item.get("text").and_then(extract_text) {
+                                    entries.push(ConversationEntry::AssistantText { text });
+                                    parsed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Some("user") => {
+                handled = true;
+                if let Some(content) = value.get("message").and_then(|m| m.get("content")) {
+                    if let Some(text) = extract_text(content) {
+                        entries.push(ConversationEntry::UserMessage { text });
+                        parsed = true;
+                    }
+                }
+            }
+            Some("queue-operation") => {
+                handled = true;
+                let operation = value
+                    .get("operation")
+                    .and_then(|o| o.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let task_id = value
+                    .get("taskId")
+                    .or_else(|| value.get("task_id"))
+                    .or_else(|| value.get("id"))
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string);
+                entries.push(ConversationEntry::QueueOperation { operation, task_id });
+                parsed = true;
+            }
+            Some("progress") => {
+                handled = true;
+                if let Some((kind, detail)) = summarize_progress_entry(&value) {
+                    entries.push(ConversationEntry::Progress { kind, detail });
+                    parsed = true;
+                }
+            }
+            Some("system") => {
+                handled = true;
+                if let Some((subtype, detail)) = summarize_system_entry(&value) {
+                    entries.push(ConversationEntry::SystemEvent { subtype, detail });
+                    parsed = true;
+                }
+            }
+            Some("file-history-snapshot") => {
+                handled = true;
+                if let Some((tracked_files, files, is_update)) =
+                    summarize_file_history_snapshot(&value)
+                {
+                    entries.push(ConversationEntry::FileHistorySnapshot {
+                        tracked_files,
+                        files,
+                        is_update,
+                    });
+                    parsed = true;
+                }
+            }
+            Some(_) | None => {}
+        }
+
+        if !parsed && !handled {
+            let reason = match value.get("type").and_then(|t| t.as_str()) {
+                Some(kind) => format!("Unhandled entry type: {kind}"),
+                None => "Unhandled entry (missing type)".to_string(),
+            };
+            entries.push(ConversationEntry::Unparsed {
+                reason,
+                raw: summarize_jsonl_line(line, 220),
+            });
+        }
+    }
+
+    (entries, file_len)
+}
+
+/// Build the JSONL log file path for a Claude Code session.
+pub fn session_jsonl_path(cwd: &str, uuid: &str) -> std::path::PathBuf {
+    let escaped = escape_project_path(cwd);
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(&home)
+        .join(".claude")
+        .join("projects")
+        .join(&escaped)
+        .join(format!("{uuid}.jsonl"))
+}
+
+// ── Codex conversation support ──────────────────────────────────────
+
+/// Parse lsof output to find a `.codex/sessions/` JSONL path.
+pub fn parse_codex_rollout_from_lsof(output: &str) -> Option<PathBuf> {
+    for line in output.lines() {
+        if let Some(idx) = line.find(".codex/sessions/") {
+            // Walk backwards from `.codex/` to find the start of the absolute path.
+            // lsof separates columns by whitespace, so find the last whitespace before idx.
+            let before = &line[..idx];
+            let path_start = before
+                .rfind(char::is_whitespace)
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let rest = &line[path_start..];
+            // Find the end of the path (whitespace or end of line)
+            let path_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+            let candidate = &rest[..path_end];
+            if candidate.ends_with(".jsonl") {
+                return Some(PathBuf::from(candidate));
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the Codex rollout JSONL path for a tmux session.
+/// Walks the process tree and checks lsof for open `.codex/sessions/` files.
+pub async fn resolve_codex_rollout_path(tmux_name: &str) -> Option<PathBuf> {
+    let pid = get_pane_pid(tmux_name).await?;
+    let all_pids = collect_descendant_pids(pid).await;
+
+    if all_pids.is_empty() {
+        return None;
+    }
+
+    let pid_list = all_pids
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let output = run_cmd_timeout(Command::new("lsof").args(["-p", &pid_list]))
+        .await
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_codex_rollout_from_lsof(&stdout)
+}
+
+/// Parse conversation entries from a Codex JSONL log file.
+/// Reads incrementally from `read_offset`; returns new entries + updated offset.
+pub fn parse_codex_conversation_entries(
+    path: &std::path::Path,
+    read_offset: u64,
+) -> (Vec<ConversationEntry>, u64) {
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return (vec![], read_offset),
+    };
+    let file_len = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return (vec![], read_offset),
+    };
+
+    if file_len <= read_offset {
+        return (vec![], read_offset);
+    }
+
+    if read_offset > 0 && file.seek(SeekFrom::Start(read_offset)).is_err() {
+        return (vec![], read_offset);
+    }
+
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return (vec![], read_offset);
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut entries = Vec::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Fast-path string checks before JSON parsing
+        if line.contains("\"user_message\"") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(msg) = v
+                    .get("payload")
+                    .and_then(|p| p.get("message"))
+                    .and_then(|m| m.as_str())
+                {
+                    if !msg.trim().is_empty() {
+                        entries.push(ConversationEntry::UserMessage {
+                            text: msg.to_string(),
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+
+        if line.contains("\"agent_message\"") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(msg) = v
+                    .get("payload")
+                    .and_then(|p| p.get("message"))
+                    .and_then(|m| m.as_str())
+                {
+                    if !msg.trim().is_empty() {
+                        entries.push(ConversationEntry::AssistantText {
+                            text: msg.to_string(),
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+
+        if line.contains("\"function_call\"") && !line.contains("\"function_call_output\"") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(payload) = v.get("payload") {
+                    if let Some(name) = payload.get("name").and_then(|n| n.as_str()) {
+                        let details = payload
+                            .get("arguments")
+                            .and_then(extract_text)
+                            .map(|s| summarize_jsonl_line(&s, 120));
+                        entries.push(ConversationEntry::ToolUse {
+                            tool_name: name.to_string(),
+                            details,
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Skip all other line types (session_meta, turn_context, reasoning,
+        // token_count, task_started, task_complete, function_call_output)
+    }
+
+    (entries, file_len)
+}
+
+// ── Gemini conversation support ──────────────────────────────────────
+
+// Gemini 2.5 Pro pricing (USD per million tokens) — free tier uses $0,
+// but Vertex AI / paid tier uses these rates.
+const GEMINI_INPUT_USD_PER_MTOK: f64 = 1.25;
+const GEMINI_OUTPUT_USD_PER_MTOK: f64 = 10.0;
+const GEMINI_CACHE_READ_USD_PER_MTOK: f64 = 0.3125;
+
+/// Parse lsof output to find a `.gemini/tmp/` session JSON path.
+pub fn parse_gemini_session_from_lsof(output: &str) -> Option<PathBuf> {
+    for line in output.lines() {
+        if let Some(idx) = line.find(".gemini/tmp/") {
+            let before = &line[..idx];
+            let path_start = before
+                .rfind(char::is_whitespace)
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let rest = &line[path_start..];
+            let path_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+            let candidate = &rest[..path_end];
+            if candidate.ends_with(".json") && candidate.contains("/chats/session-") {
+                return Some(PathBuf::from(candidate));
+            }
+        }
+    }
+    None
+}
+
+/// Find the Gemini chats directory for the given CWD.
+/// Reads ~/.gemini/projects.json to map cwd → project name, then looks
+/// in ~/.gemini/tmp/<project>/chats/.
+fn gemini_chats_dir(cwd: &str) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let projects_path = PathBuf::from(&home).join(".gemini").join("projects.json");
+    let data = std::fs::read_to_string(&projects_path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let projects = v.get("projects")?.as_object()?;
+    let project_name = projects.get(cwd)?.as_str()?;
+    let chats = PathBuf::from(&home)
+        .join(".gemini")
+        .join("tmp")
+        .join(project_name)
+        .join("chats");
+    if chats.is_dir() {
+        Some(chats)
+    } else {
+        None
+    }
+}
+
+/// Find the most recently modified Gemini session file in the chats dir.
+fn find_latest_gemini_session(chats_dir: &std::path::Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(chats_dir).ok()?;
+    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let fname = path.file_name()?.to_str()?;
+        if !fname.starts_with("session-") {
+            continue;
+        }
+        if let Ok(meta) = path.metadata() {
+            if let Ok(modified) = meta.modified() {
+                if best.as_ref().is_none_or(|(_, t)| modified > *t) {
+                    best = Some((path, modified));
+                }
+            }
+        }
+    }
+    best.map(|(p, _)| p)
+}
+
+/// Resolve the Gemini session JSON file path for a tmux session.
+/// First tries lsof to find an open session file, then falls back to
+/// the most recently modified session file in the project's chats dir.
+pub async fn resolve_gemini_session_path(tmux_name: &str, cwd: &str) -> Option<String> {
+    let pid = get_pane_pid(tmux_name).await?;
+    let all_pids = collect_descendant_pids(pid).await;
+
+    if !all_pids.is_empty() {
+        let pid_list = all_pids
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        if let Ok(output) = run_cmd_timeout(Command::new("lsof").args(["-p", &pid_list])).await {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(path) = parse_gemini_session_from_lsof(&stdout) {
+                return Some(path.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    // Fallback: find the most recently modified session file
+    let chats_dir = gemini_chats_dir(cwd)?;
+    let path = find_latest_gemini_session(&chats_dir)?;
+    Some(path.to_string_lossy().to_string())
+}
+
+/// Parse a Gemini session JSON file and return conversation entries + stats + last message.
+/// Since Gemini uses monolithic JSON (not JSONL), the entire file must be re-parsed.
+/// Returns (entries, last_assistant_message, stats_update).
+pub fn parse_gemini_session(
+    path: &std::path::Path,
+) -> (Vec<ConversationEntry>, Option<String>, GeminiStatsUpdate) {
+    let (entries, _, last_message, stats) = parse_gemini_session_entries(path, 0);
+    (entries, last_message, stats)
+}
+
+/// Parse new conversation entries from a Gemini session JSON file.
+/// `message_offset` is the previously-seen message index (not byte offset).
+/// Returns (new_entries, new_message_offset, last_assistant_message, stats_update).
+pub fn parse_gemini_session_entries(
+    path: &std::path::Path,
+    message_offset: u64,
+) -> (
+    Vec<ConversationEntry>,
+    u64,
+    Option<String>,
+    GeminiStatsUpdate,
+) {
+    let data = match std::fs::read_to_string(path) {
+        Ok(d) => d,
+        Err(_) => return (vec![], message_offset, None, GeminiStatsUpdate::default()),
+    };
+    let v: serde_json::Value = match serde_json::from_str(&data) {
+        Ok(v) => v,
+        Err(_) => return (vec![], message_offset, None, GeminiStatsUpdate::default()),
+    };
+    parse_gemini_session_value(&v, message_offset as usize)
+}
+
+/// Stats extracted from a Gemini session file.
+#[derive(Debug, Default)]
+pub struct GeminiStatsUpdate {
+    pub turns: u32,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub tokens_cached: u64,
+    pub edits: u16,
+    pub bash_cmds: u16,
+    pub files: Vec<String>,
+    pub last_user_ts: Option<String>,
+    pub last_assistant_ts: Option<String>,
+}
+
+fn summarize_gemini_tool_use_details(tool_call: &serde_json::Value) -> Option<String> {
+    let mut details: Vec<String> = Vec::new();
+
+    if let Some(id) = tool_call.get("id").and_then(|v| v.as_str()) {
+        details.push(format!("id={id}"));
+    }
+
+    if let Some(args) = tool_call.get("args") {
+        if let Some(summary) = summarize_tool_input(args) {
+            details.push(summary);
+        }
+    }
+
+    if details.is_empty() {
+        None
+    } else {
+        Some(details.join(" | "))
+    }
+}
+
+fn extract_gemini_tool_paths(args: Option<&serde_json::Value>) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let Some(args) = args else {
+        return paths;
+    };
+
+    for key in ["file_path", "path", "old_path", "new_path"] {
+        if let Some(v) = args.get(key) {
+            if let Some(text) = extract_text(v) {
+                for raw in text.lines() {
+                    let p = raw.trim();
+                    if !p.is_empty() && seen.insert(p.to_string()) {
+                        paths.push(p.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    paths
+}
+
+fn extract_gemini_tool_result_parts(
+    tool_call: &serde_json::Value,
+) -> (Vec<String>, Option<String>) {
+    let filenames = extract_gemini_tool_paths(tool_call.get("args"));
+
+    let mut summary = tool_call
+        .get("resultDisplay")
+        .and_then(extract_text)
+        .map(|s| summarize_jsonl_line(&s, 180));
+
+    if summary.is_none() {
+        if let Some(results) = tool_call.get("result").and_then(|r| r.as_array()) {
+            for result in results {
+                if let Some(function_response) = result.get("functionResponse") {
+                    if let Some(response) = function_response.get("response") {
+                        let (_, s) = extract_tool_result_parts(response);
+                        if s.is_some() {
+                            summary = s;
+                            break;
+                        }
+                    }
+                }
+                let (_, s) = extract_tool_result_parts(result);
+                if s.is_some() {
+                    summary = s;
+                    break;
+                }
+            }
+        }
+    }
+
+    if summary.is_none() {
+        summary = tool_call
+            .get("status")
+            .and_then(|s| s.as_str())
+            .map(|s| format!("status={s}"));
+    }
+
+    (filenames, summary)
+}
+
+fn parse_gemini_session_value(
+    v: &serde_json::Value,
+    message_offset: usize,
+) -> (
+    Vec<ConversationEntry>,
+    u64,
+    Option<String>,
+    GeminiStatsUpdate,
+) {
+    let mut entries = Vec::new();
+    let mut last_message: Option<String> = None;
+    let mut stats = GeminiStatsUpdate::default();
+
+    let messages = match v.get("messages").and_then(|m| m.as_array()) {
+        Some(m) => m,
+        None => return (entries, message_offset as u64, last_message, stats),
+    };
+
+    let new_offset = messages.len() as u64;
+    let start_idx = if message_offset > messages.len() {
+        // Session file can roll over to a new conversation; when the message
+        // count shrinks, restart from the beginning instead of dropping entries.
+        0
+    } else {
+        message_offset
+    };
+
+    for (idx, msg) in messages.iter().enumerate() {
+        let emit_entry = idx >= start_idx;
+        let msg_type = match msg.get("type").and_then(|t| t.as_str()) {
+            Some(t) => t,
+            None => {
+                if emit_entry {
+                    entries.push(ConversationEntry::Unparsed {
+                        reason: "Unhandled Gemini entry (missing type)".to_string(),
+                        raw: summarize_jsonl_line(&msg.to_string(), 220),
+                    });
+                }
+                continue;
+            }
+        };
+        let timestamp = msg.get("timestamp").and_then(|t| t.as_str());
+
+        match msg_type {
+            "user" => {
+                if let Some(ts) = timestamp {
+                    stats.last_user_ts = Some(ts.to_string());
+                }
+                // content is either a string or an array of {text: "..."}
+                let text = extract_gemini_message_text(msg);
+                if let Some(text) = text {
+                    if emit_entry && !text.trim().is_empty() {
+                        entries.push(ConversationEntry::UserMessage { text });
+                    }
+                }
+            }
+            "gemini" => {
+                if let Some(ts) = timestamp {
+                    stats.last_assistant_ts = Some(ts.to_string());
+                }
+                // Extract token usage
+                if let Some(tokens) = msg.get("tokens") {
+                    stats.turns += 1;
+                    stats.tokens_in += tokens.get("input").and_then(|t| t.as_u64()).unwrap_or(0);
+                    stats.tokens_out += tokens.get("output").and_then(|t| t.as_u64()).unwrap_or(0);
+                    stats.tokens_cached +=
+                        tokens.get("cached").and_then(|t| t.as_u64()).unwrap_or(0);
+                }
+
+                // Process tool calls
+                if let Some(tool_calls) = msg.get("toolCalls").and_then(|t| t.as_array()) {
+                    for tc in tool_calls {
+                        let name = tc.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+                        let paths = extract_gemini_tool_paths(tc.get("args"));
+                        // Track edits and bash commands
+                        match name {
+                            "write_file" | "edit_file" | "replace_in_file" => {
+                                stats.edits += 1;
+                                for path in &paths {
+                                    stats.files.push(path.to_string());
+                                }
+                            }
+                            "run_shell_command" | "shell" => {
+                                stats.bash_cmds += 1;
+                            }
+                            "read_file" => {
+                                for path in &paths {
+                                    stats.files.push(path.to_string());
+                                }
+                            }
+                            _ => {}
+                        }
+
+                        if emit_entry {
+                            entries.push(ConversationEntry::ToolUse {
+                                tool_name: name.to_string(),
+                                details: summarize_gemini_tool_use_details(tc),
+                            });
+
+                            let (filenames, summary) = extract_gemini_tool_result_parts(tc);
+                            if !filenames.is_empty() || summary.is_some() {
+                                entries.push(ConversationEntry::ToolResult { filenames, summary });
+                            }
+                        }
+                    }
+                }
+
+                // Extract assistant text content
+                let text = extract_gemini_content_text(msg);
+                if let Some(ref text) = text {
+                    if !text.trim().is_empty() {
+                        last_message = Some(text.clone());
+                        if emit_entry {
+                            entries.push(ConversationEntry::AssistantText { text: text.clone() });
+                        }
+                    }
+                }
+            }
+            "info" | "warning" | "error" => {
+                if emit_entry {
+                    let prefix = msg_type.to_uppercase();
+                    if let Some(content) = msg.get("content").and_then(extract_text) {
+                        let text = format!("[{prefix}] {}", content.trim());
+                        if !text.trim().is_empty() {
+                            entries.push(ConversationEntry::AssistantText { text });
+                        }
+                    } else {
+                        entries.push(ConversationEntry::Unparsed {
+                            reason: format!("Unhandled Gemini {msg_type} entry"),
+                            raw: summarize_jsonl_line(&msg.to_string(), 220),
+                        });
+                    }
+                }
+            }
+            _ => {
+                if emit_entry {
+                    entries.push(ConversationEntry::Unparsed {
+                        reason: format!("Unhandled Gemini message type: {msg_type}"),
+                        raw: summarize_jsonl_line(&msg.to_string(), 220),
+                    });
+                }
+            }
+        }
+    }
+
+    (entries, new_offset, last_message, stats)
+}
+
+/// Extract user message text from Gemini's content field.
+/// Content can be a string or an array of {text: "..."} objects.
+fn extract_gemini_message_text(msg: &serde_json::Value) -> Option<String> {
+    let content = msg.get("content")?;
+    if let Some(s) = content.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(arr) = content.as_array() {
+        let parts: Vec<&str> = arr
+            .iter()
+            .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+            .collect();
+        if !parts.is_empty() {
+            return Some(parts.join(" "));
+        }
+    }
+    None
+}
+
+/// Extract gemini response text content (content field on gemini messages).
+fn extract_gemini_content_text(msg: &serde_json::Value) -> Option<String> {
+    let content = msg.get("content")?;
+    if let Some(s) = content.as_str() {
+        if !s.is_empty() {
+            return Some(s.to_string());
+        }
+    }
+    // content can also be array format
+    if let Some(arr) = content.as_array() {
+        let parts: Vec<&str> = arr
+            .iter()
+            .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+            .collect();
+        if !parts.is_empty() {
+            return Some(parts.join(" "));
+        }
+    }
+    None
+}
+
+/// Apply a GeminiStatsUpdate to a SessionStats struct.
+/// Since Gemini uses monolithic JSON, we replace stats rather than incrementing.
+pub fn apply_gemini_stats(stats: &mut SessionStats, update: &GeminiStatsUpdate) {
+    stats.turns = update.turns;
+    stats.tokens_in = update.tokens_in;
+    stats.tokens_out = update.tokens_out;
+    stats.tokens_cache_read = update.tokens_cached;
+    stats.tokens_cache_write = 0; // Gemini doesn't distinguish cache write
+    stats.edits = update.edits;
+    stats.bash_cmds = update.bash_cmds;
+    stats.last_user_ts = update.last_user_ts.clone();
+    stats.last_assistant_ts = update.last_assistant_ts.clone();
+    stats.active_subagents = 0;
+    stats.files.clear();
+    stats.recent_files.clear();
+    for f in &update.files {
+        stats.touch_file(f.clone());
+    }
+}
+
+/// Collect all Gemini session JSON files under `<tmp_dir>/*/chats/`.
+fn collect_gemini_session_files(tmp_dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(tmp_dir) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let chats_dir = entry.path().join("chats");
+        if !chats_dir.is_dir() {
+            continue;
+        }
+        if let Ok(chat_entries) = std::fs::read_dir(&chats_dir) {
+            for chat_entry in chat_entries.flatten() {
+                let path = chat_entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                    if let Some(fname) = path.file_name().and_then(|f| f.to_str()) {
+                        if fname.starts_with("session-") {
+                            out.push(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn add_gemini_usage(
+    stats: &mut GlobalStats,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+) {
+    stats.tokens_in += input_tokens;
+    stats.tokens_out += output_tokens;
+    stats.tokens_cache_read += cached_tokens;
+
+    stats.gemini_tokens_in += input_tokens;
+    stats.gemini_tokens_out += output_tokens;
+    stats.gemini_tokens_cached += cached_tokens;
+}
+
+/// Process a single Gemini session JSON file for global stats.
+/// Since Gemini rewrites the entire file, we re-parse fully but track
+/// the file size to skip unchanged files.
+fn process_gemini_global_file(path: &PathBuf, stats: &mut GlobalStats, today: &str) {
+    let file_len = match std::fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(_) => return,
+    };
+
+    let offset = stats.gemini_file_sizes.get(path).copied().unwrap_or(0);
+    if file_len == offset {
+        return; // File hasn't changed
+    }
+
+    // Re-parse the entire file (monolithic JSON)
+    let data = match std::fs::read_to_string(path) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let v: serde_json::Value = match serde_json::from_str(&data) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let messages = match v.get("messages").and_then(|m| m.as_array()) {
+        Some(m) => m,
+        None => return,
+    };
+
+    // Sum tokens from all gemini messages that have today's date
+    let mut total_input = 0u64;
+    let mut total_output = 0u64;
+    let mut total_cached = 0u64;
+
+    for msg in messages {
+        if msg.get("type").and_then(|t| t.as_str()) != Some("gemini") {
+            continue;
+        }
+        // Check if the message is from today
+        let is_today = msg
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .is_some_and(|ts| ts.starts_with(today));
+        if !is_today {
+            continue;
+        }
+        if let Some(tokens) = msg.get("tokens") {
+            total_input += tokens.get("input").and_then(|t| t.as_u64()).unwrap_or(0);
+            total_output += tokens.get("output").and_then(|t| t.as_u64()).unwrap_or(0);
+            total_cached += tokens.get("cached").and_then(|t| t.as_u64()).unwrap_or(0);
+        }
+    }
+
+    // Subtract previous contribution from this file, then add new
+    if let Some(&(prev_in, prev_out, prev_cached)) = stats.gemini_file_tokens.get(path) {
+        stats.tokens_in -= prev_in;
+        stats.tokens_out -= prev_out;
+        stats.tokens_cache_read -= prev_cached;
+        stats.gemini_tokens_in -= prev_in;
+        stats.gemini_tokens_out -= prev_out;
+        stats.gemini_tokens_cached -= prev_cached;
+    }
+
+    add_gemini_usage(stats, total_input, total_output, total_cached);
+    stats
+        .gemini_file_tokens
+        .insert(path.clone(), (total_input, total_output, total_cached));
+    stats.gemini_file_sizes.insert(path.clone(), file_len);
 }
 
 /// Read the last assistant message from a Claude JSONL log file.
@@ -3570,5 +4962,861 @@ mod tests {
                 prop_assert_eq!(stats.tokens_out, 50 * n as u64);
             }
         }
+    }
+
+    // ── parse_conversation_entries tests ─────────────────────────────
+
+    #[test]
+    fn conversation_entries_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let (entries, offset) = parse_conversation_entries(&path, 0);
+        assert!(entries.is_empty());
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn conversation_entries_user_and_assistant() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let content = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2025-01-01T00:00:00Z",
+                "message": {"role": "user", "content": "do something"}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2025-01-01T00:00:01Z",
+                "message": {
+                    "content": [{"type": "text", "text": "I'll help you"}],
+                    "usage": {"input_tokens": 100, "output_tokens": 50}
+                }
+            }),
+        );
+        std::fs::write(&path, &content).unwrap();
+        let (entries, offset) = parse_conversation_entries(&path, 0);
+        assert_eq!(entries.len(), 2);
+        assert!(
+            matches!(&entries[0], ConversationEntry::UserMessage { text } if text == "do something")
+        );
+        assert!(
+            matches!(&entries[1], ConversationEntry::AssistantText { text } if text == "I'll help you")
+        );
+        assert_eq!(offset, content.len() as u64);
+    }
+
+    #[test]
+    fn conversation_entries_user_content_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user_array.jsonl");
+        let content = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "user",
+                "message": {
+                    "content": [
+                        {"text": "line one"},
+                        {"text": "line two"}
+                    ]
+                }
+            }),
+        );
+        std::fs::write(&path, &content).unwrap();
+        let (entries, _) = parse_conversation_entries(&path, 0);
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            &entries[0],
+            ConversationEntry::UserMessage { text } if text == "line one\nline two"
+        ));
+    }
+
+    #[test]
+    fn conversation_entries_tool_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let content = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2025-01-01T00:00:01Z",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "Let me edit that file"},
+                        {"type": "tool_use", "name": "Edit", "id": "123", "input": {}}
+                    ],
+                    "usage": {"input_tokens": 100, "output_tokens": 50}
+                }
+            }),
+        );
+        std::fs::write(&path, &content).unwrap();
+        let (entries, _) = parse_conversation_entries(&path, 0);
+        assert_eq!(entries.len(), 2);
+        assert!(
+            matches!(&entries[0], ConversationEntry::AssistantText { text } if text == "Let me edit that file")
+        );
+        assert!(
+            matches!(&entries[1], ConversationEntry::ToolUse { tool_name, details } if tool_name == "Edit" && details.is_some())
+        );
+    }
+
+    #[test]
+    fn conversation_entries_tool_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let content = format!(
+            "{}\n",
+            serde_json::json!({
+                "toolUseResult": {
+                    "filenames": ["src/app.rs", "src/ui.rs"]
+                }
+            }),
+        );
+        std::fs::write(&path, &content).unwrap();
+        let (entries, _) = parse_conversation_entries(&path, 0);
+        assert_eq!(entries.len(), 1);
+        assert!(
+            matches!(&entries[0], ConversationEntry::ToolResult { filenames, summary } if filenames.len() == 2 && summary.is_none())
+        );
+    }
+
+    #[test]
+    fn conversation_entries_incremental() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let line1 = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2025-01-01T00:00:00Z",
+                "message": {"role": "user", "content": "first"}
+            })
+        );
+        std::fs::write(&path, &line1).unwrap();
+        let (entries, offset) = parse_conversation_entries(&path, 0);
+        assert_eq!(entries.len(), 1);
+
+        // Append more content
+        let line2 = format!(
+            "{}",
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2025-01-01T00:00:01Z",
+                "message": {"role": "user", "content": "second"}
+            })
+        );
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "{}", line2).unwrap();
+        drop(file);
+
+        let (entries2, offset2) = parse_conversation_entries(&path, offset);
+        assert_eq!(entries2.len(), 1);
+        assert!(
+            matches!(&entries2[0], ConversationEntry::UserMessage { text } if text == "second")
+        );
+        assert!(offset2 > offset);
+    }
+
+    #[test]
+    fn conversation_entries_malformed_line_captured_as_unparsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.jsonl");
+        std::fs::write(&path, "{\"type\":\"assistant\" BROKEN\n").unwrap();
+
+        let (entries, _) = parse_conversation_entries(&path, 0);
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            &entries[0],
+            ConversationEntry::Unparsed { reason, .. } if reason == "Malformed JSONL"
+        ));
+    }
+
+    #[test]
+    fn conversation_entries_queue_operation_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.jsonl");
+        let content = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "queue-operation",
+                "operation": "enqueue",
+                "id": "q1"
+            }),
+        );
+        std::fs::write(&path, &content).unwrap();
+
+        let (entries, _) = parse_conversation_entries(&path, 0);
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            &entries[0],
+            ConversationEntry::QueueOperation { operation, task_id }
+                if operation == "enqueue" && task_id.as_deref() == Some("q1")
+        ));
+    }
+
+    #[test]
+    fn conversation_entries_progress_waiting_for_task_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.jsonl");
+        let content = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "progress",
+                "data": {
+                    "type": "waiting_for_task",
+                    "taskDescription": "Run integration suite",
+                    "taskType": "local_bash"
+                }
+            }),
+        );
+        std::fs::write(&path, &content).unwrap();
+
+        let (entries, _) = parse_conversation_entries(&path, 0);
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            &entries[0],
+            ConversationEntry::Progress { kind, detail }
+                if kind == "waiting_for_task" && detail.contains("Run integration suite")
+        ));
+    }
+
+    #[test]
+    fn conversation_entries_system_api_error_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("system_api_error.jsonl");
+        let content = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "system",
+                "subtype": "api_error",
+                "retryAttempt": 2,
+                "maxRetries": 10,
+                "retryInMs": 536.45
+            }),
+        );
+        std::fs::write(&path, &content).unwrap();
+
+        let (entries, _) = parse_conversation_entries(&path, 0);
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            &entries[0],
+            ConversationEntry::SystemEvent { subtype, detail }
+                if subtype == "api_error"
+                    && detail.contains("attempt 2/10")
+                    && detail.contains("retry in 536ms")
+        ));
+    }
+
+    #[test]
+    fn conversation_entries_file_history_snapshot_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.jsonl");
+        let content = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "file-history-snapshot",
+                "isSnapshotUpdate": true,
+                "snapshot": {
+                    "trackedFileBackups": {
+                        "src/a.rs": {"version": 1},
+                        "src/b.rs": {"version": 1}
+                    }
+                }
+            }),
+        );
+        std::fs::write(&path, &content).unwrap();
+
+        let (entries, _) = parse_conversation_entries(&path, 0);
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            &entries[0],
+            ConversationEntry::FileHistorySnapshot {
+                tracked_files,
+                files,
+                is_update
+            } if *tracked_files == 2 && *is_update && files.len() == 2
+        ));
+    }
+
+    #[test]
+    fn conversation_entries_file_history_snapshot_empty_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot_empty.jsonl");
+        let content = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "file-history-snapshot",
+                "isSnapshotUpdate": false,
+                "snapshot": {
+                    "trackedFileBackups": {}
+                }
+            }),
+        );
+        std::fs::write(&path, &content).unwrap();
+
+        let (entries, _) = parse_conversation_entries(&path, 0);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn conversation_entries_unknown_type_captured_as_unparsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unknown.jsonl");
+        let content = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "mystery-event",
+                "message": "maintenance"
+            }),
+        );
+        std::fs::write(&path, &content).unwrap();
+
+        let (entries, _) = parse_conversation_entries(&path, 0);
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            &entries[0],
+            ConversationEntry::Unparsed { reason, .. }
+                if reason == "Unhandled entry type: mystery-event"
+        ));
+    }
+
+    #[test]
+    fn conversation_entries_tool_result_content_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool_result_summary.jsonl");
+        let content = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "user",
+                "toolUseResult": {
+                    "content": "command completed with warnings"
+                }
+            }),
+        );
+        std::fs::write(&path, &content).unwrap();
+        let (entries, _) = parse_conversation_entries(&path, 0);
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            &entries[0],
+            ConversationEntry::ToolResult { filenames, summary }
+                if filenames.is_empty()
+                    && summary.as_deref() == Some("command completed with warnings")
+        ));
+    }
+
+    #[test]
+    fn conversation_entries_nonexistent_file() {
+        let (entries, offset) =
+            parse_conversation_entries(std::path::Path::new("/nonexistent/file.jsonl"), 0);
+        assert!(entries.is_empty());
+        assert_eq!(offset, 0);
+    }
+
+    // ── parse_codex_rollout_from_lsof tests ─────────────────────────
+
+    #[test]
+    fn parse_codex_rollout_finds_jsonl_path() {
+        let output = "codex  12345  user  3r   REG  1,20  456  /Users/test/.codex/sessions/2026/02/24/rollout-1234567890-abcd1234.jsonl\n\
+                       codex  12345  user  cwd  DIR  1,20  640  /Users/test";
+        let result = parse_codex_rollout_from_lsof(output);
+        assert_eq!(
+            result,
+            Some(PathBuf::from(
+                "/Users/test/.codex/sessions/2026/02/24/rollout-1234567890-abcd1234.jsonl"
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_codex_rollout_no_match() {
+        let output = "codex  12345  user  cwd  DIR  1,20  640  /Users/test\n\
+                       codex  12345  user  txt  REG  1,20  123  /usr/bin/codex";
+        assert_eq!(parse_codex_rollout_from_lsof(output), None);
+    }
+
+    #[test]
+    fn parse_codex_rollout_ignores_non_jsonl() {
+        let output = "codex  12345  user  3r   REG  1,20  456  /Users/test/.codex/sessions/2026/02/24/some-file.txt";
+        assert_eq!(parse_codex_rollout_from_lsof(output), None);
+    }
+
+    #[test]
+    fn parse_codex_rollout_empty() {
+        assert_eq!(parse_codex_rollout_from_lsof(""), None);
+    }
+
+    // ── parse_codex_conversation_entries tests ──────────────────────
+
+    #[test]
+    fn codex_conversation_user_message() {
+        let path = write_tmp_jsonl(
+            "codex_user",
+            &[r#"{"type":"event_msg","payload":{"type":"user_message","message":"fix the bug"}}"#],
+        );
+        let (entries, offset) = parse_codex_conversation_entries(&path, 0);
+        assert_eq!(entries.len(), 1);
+        assert!(
+            matches!(&entries[0], ConversationEntry::UserMessage { text } if text == "fix the bug")
+        );
+        assert!(offset > 0);
+    }
+
+    #[test]
+    fn codex_conversation_agent_message() {
+        let path = write_tmp_jsonl(
+            "codex_agent",
+            &[r#"{"type":"event_msg","payload":{"type":"agent_message","message":"I fixed it."}}"#],
+        );
+        let (entries, _) = parse_codex_conversation_entries(&path, 0);
+        assert_eq!(entries.len(), 1);
+        assert!(
+            matches!(&entries[0], ConversationEntry::AssistantText { text } if text == "I fixed it.")
+        );
+    }
+
+    #[test]
+    fn codex_conversation_function_call() {
+        let path = write_tmp_jsonl(
+            "codex_tool",
+            &[
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"ls\"}"}}"#,
+            ],
+        );
+        let (entries, _) = parse_codex_conversation_entries(&path, 0);
+        assert_eq!(entries.len(), 1);
+        assert!(
+            matches!(&entries[0], ConversationEntry::ToolUse { tool_name, details } if tool_name == "exec_command" && details.is_some())
+        );
+    }
+
+    #[test]
+    fn codex_conversation_skips_function_call_output() {
+        let path = write_tmp_jsonl(
+            "codex_skip_output",
+            &[
+                r#"{"type":"response_item","payload":{"type":"function_call_output","output":"some output"}}"#,
+            ],
+        );
+        let (entries, _) = parse_codex_conversation_entries(&path, 0);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn codex_conversation_skips_token_count() {
+        let path = write_tmp_jsonl(
+            "codex_skip_tokens",
+            &[
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100}}}}"#,
+            ],
+        );
+        let (entries, _) = parse_codex_conversation_entries(&path, 0);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn codex_conversation_mixed() {
+        let path = write_tmp_jsonl(
+            "codex_mixed",
+            &[
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{}}}"#,
+                r#"{"type":"event_msg","payload":{"type":"agent_message","message":"hi there"}}"#,
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{}"}}"#,
+                r#"{"type":"response_item","payload":{"type":"function_call_output","output":"ok"}}"#,
+            ],
+        );
+        let (entries, _) = parse_codex_conversation_entries(&path, 0);
+        assert_eq!(entries.len(), 3);
+        assert!(matches!(&entries[0], ConversationEntry::UserMessage { text } if text == "hello"));
+        assert!(
+            matches!(&entries[1], ConversationEntry::AssistantText { text } if text == "hi there")
+        );
+        assert!(
+            matches!(&entries[2], ConversationEntry::ToolUse { tool_name, details } if tool_name == "exec_command" && details.is_some())
+        );
+    }
+
+    #[test]
+    fn codex_conversation_incremental() {
+        let path = write_tmp_jsonl(
+            "codex_incr",
+            &[
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"first"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"agent_message","message":"reply"}}"#,
+            ],
+        );
+        let (entries, offset) = parse_codex_conversation_entries(&path, 0);
+        assert_eq!(entries.len(), 2);
+        assert!(offset > 0);
+
+        // No new data → empty
+        let (entries2, offset2) = parse_codex_conversation_entries(&path, offset);
+        assert!(entries2.is_empty());
+        assert_eq!(offset2, offset);
+    }
+
+    #[test]
+    fn codex_conversation_nonexistent_file() {
+        let (entries, offset) =
+            parse_codex_conversation_entries(std::path::Path::new("/nonexistent/codex.jsonl"), 0);
+        assert!(entries.is_empty());
+        assert_eq!(offset, 0);
+    }
+
+    // ── parse_gemini_session_entries tests ─────────────────────────
+
+    #[test]
+    fn gemini_session_entries_parse_tool_use_and_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let content = serde_json::json!({
+            "sessionId": "test-session",
+            "messages": [
+                {
+                    "type": "user",
+                    "timestamp": "2026-02-24T16:25:37.510Z",
+                    "content": [{"text": "read this file"}]
+                },
+                {
+                    "type": "gemini",
+                    "timestamp": "2026-02-24T16:25:44.454Z",
+                    "content": "Done.",
+                    "toolCalls": [{
+                        "id": "read_file_1",
+                        "name": "read_file",
+                        "args": {"file_path": "src/session.rs"},
+                        "status": "success",
+                        "result": [{
+                            "functionResponse": {
+                                "response": {"output": "file contents..."}
+                            }
+                        }]
+                    }],
+                    "tokens": {"input": 10, "output": 5, "cached": 2}
+                }
+            ]
+        });
+        std::fs::write(&path, content.to_string()).unwrap();
+
+        let (entries, offset, last_msg, stats) = parse_gemini_session_entries(&path, 0);
+        assert_eq!(offset, 2);
+        assert_eq!(last_msg.as_deref(), Some("Done."));
+        assert_eq!(stats.turns, 1);
+        assert_eq!(stats.tokens_in, 10);
+        assert_eq!(stats.tokens_out, 5);
+        assert_eq!(stats.tokens_cached, 2);
+        assert_eq!(entries.len(), 4);
+        assert!(
+            matches!(&entries[0], ConversationEntry::UserMessage { text } if text == "read this file")
+        );
+        assert!(matches!(
+            &entries[1],
+            ConversationEntry::ToolUse { tool_name, details }
+                if tool_name == "read_file" && details.is_some()
+        ));
+        assert!(matches!(
+            &entries[2],
+            ConversationEntry::ToolResult { filenames, summary }
+                if filenames == &vec!["src/session.rs".to_string()] && summary.is_some()
+        ));
+        assert!(
+            matches!(&entries[3], ConversationEntry::AssistantText { text } if text == "Done.")
+        );
+    }
+
+    #[test]
+    fn gemini_session_entries_incremental_and_rollover() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let first = serde_json::json!({
+            "messages": [
+                {"type": "user", "content": [{"text": "one"}]},
+                {"type": "gemini", "content": "reply one", "tokens": {"input": 1, "output": 1, "cached": 0}}
+            ]
+        });
+        std::fs::write(&path, first.to_string()).unwrap();
+        let (_, offset1, _, _) = parse_gemini_session_entries(&path, 0);
+        assert_eq!(offset1, 2);
+
+        let second = serde_json::json!({
+            "messages": [
+                {"type": "user", "content": [{"text": "one"}]},
+                {"type": "gemini", "content": "reply one", "tokens": {"input": 1, "output": 1, "cached": 0}},
+                {"type": "user", "content": [{"text": "two"}]}
+            ]
+        });
+        std::fs::write(&path, second.to_string()).unwrap();
+        let (new_entries, offset2, _, _) = parse_gemini_session_entries(&path, offset1);
+        assert_eq!(offset2, 3);
+        assert_eq!(new_entries.len(), 1);
+        assert!(
+            matches!(&new_entries[0], ConversationEntry::UserMessage { text } if text == "two")
+        );
+
+        // Session rollover: file shrinks, parser should restart from beginning.
+        let rollover = serde_json::json!({
+            "messages": [
+                {"type": "user", "content": [{"text": "fresh start"}]}
+            ]
+        });
+        std::fs::write(&path, rollover.to_string()).unwrap();
+        let (rolled_entries, offset3, _, _) = parse_gemini_session_entries(&path, offset2);
+        assert_eq!(offset3, 1);
+        assert_eq!(rolled_entries.len(), 1);
+        assert!(matches!(
+            &rolled_entries[0],
+            ConversationEntry::UserMessage { text } if text == "fresh start"
+        ));
+    }
+
+    #[test]
+    fn gemini_session_entries_unknown_type_unparsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let content = serde_json::json!({
+            "messages": [
+                {"type": "mystery", "content": "??"}
+            ]
+        });
+        std::fs::write(&path, content.to_string()).unwrap();
+
+        let (entries, _, _, _) = parse_gemini_session_entries(&path, 0);
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            &entries[0],
+            ConversationEntry::Unparsed { reason, .. }
+                if reason == "Unhandled Gemini message type: mystery"
+        ));
+    }
+
+    #[test]
+    fn apply_gemini_stats_replaces_file_tracking() {
+        let mut stats = SessionStats::default();
+        stats.touch_file("old.rs".to_string());
+        stats.active_subagents = 5;
+
+        let update = GeminiStatsUpdate {
+            turns: 2,
+            tokens_in: 20,
+            tokens_out: 10,
+            tokens_cached: 3,
+            edits: 1,
+            bash_cmds: 2,
+            files: vec!["new_a.rs".to_string(), "new_b.rs".to_string()],
+            last_user_ts: Some("2026-02-24T16:00:00Z".to_string()),
+            last_assistant_ts: Some("2026-02-24T16:01:00Z".to_string()),
+        };
+        apply_gemini_stats(&mut stats, &update);
+
+        assert_eq!(stats.turns, 2);
+        assert_eq!(stats.tokens_in, 20);
+        assert_eq!(stats.tokens_out, 10);
+        assert_eq!(stats.tokens_cache_read, 3);
+        assert_eq!(stats.edits, 1);
+        assert_eq!(stats.bash_cmds, 2);
+        assert_eq!(stats.active_subagents, 0);
+        assert_eq!(stats.files.len(), 2);
+        assert!(stats.files.contains("new_a.rs"));
+        assert!(stats.files.contains("new_b.rs"));
+        assert!(!stats.files.contains("old.rs"));
+    }
+
+    // ── Gemini parsing tests ────────────────────────────────────────
+
+    #[test]
+    fn parse_gemini_session_basic() {
+        let json = r#"{
+            "sessionId": "abc-123",
+            "messages": [
+                {
+                    "type": "user",
+                    "timestamp": "2026-02-24T10:00:00Z",
+                    "content": [{"text": "Hello"}]
+                },
+                {
+                    "type": "gemini",
+                    "timestamp": "2026-02-24T10:00:05Z",
+                    "content": "Hi there!",
+                    "tokens": {"input": 100, "output": 50, "cached": 30, "thoughts": 10, "total": 160}
+                }
+            ]
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        let (entries, _, last_msg, stats) = parse_gemini_session_value(&v, 0);
+
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(&entries[0], ConversationEntry::UserMessage { text } if text == "Hello"));
+        assert!(
+            matches!(&entries[1], ConversationEntry::AssistantText { text } if text == "Hi there!")
+        );
+        assert_eq!(last_msg, Some("Hi there!".to_string()));
+        assert_eq!(stats.turns, 1);
+        assert_eq!(stats.tokens_in, 100);
+        assert_eq!(stats.tokens_out, 50);
+        assert_eq!(stats.tokens_cached, 30);
+    }
+
+    #[test]
+    fn parse_gemini_session_with_tool_calls() {
+        let json = r#"{
+            "sessionId": "abc-123",
+            "messages": [
+                {
+                    "type": "user",
+                    "timestamp": "2026-02-24T10:00:00Z",
+                    "content": [{"text": "Read my file"}]
+                },
+                {
+                    "type": "gemini",
+                    "timestamp": "2026-02-24T10:00:05Z",
+                    "content": "",
+                    "toolCalls": [
+                        {
+                            "name": "read_file",
+                            "args": {"file_path": "src/main.rs"},
+                            "status": "success"
+                        },
+                        {
+                            "name": "write_file",
+                            "args": {"file_path": "src/new.rs", "content": "fn main() {}"},
+                            "status": "success"
+                        }
+                    ],
+                    "tokens": {"input": 200, "output": 80, "cached": 0, "thoughts": 0, "total": 280}
+                }
+            ]
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        let (entries, _, _, stats) = parse_gemini_session_value(&v, 0);
+
+        // user + (tool_use + tool_result) x 2 (no assistant text since content is empty)
+        assert_eq!(entries.len(), 5);
+        assert!(
+            matches!(&entries[1], ConversationEntry::ToolUse { tool_name, .. } if tool_name == "read_file")
+        );
+        assert!(matches!(&entries[2], ConversationEntry::ToolResult { .. }));
+        assert!(
+            matches!(&entries[3], ConversationEntry::ToolUse { tool_name, .. } if tool_name == "write_file")
+        );
+        assert!(matches!(&entries[4], ConversationEntry::ToolResult { .. }));
+        assert_eq!(stats.edits, 1); // write_file counts as edit
+        assert_eq!(stats.files.len(), 2);
+        assert!(stats.files.contains(&"src/main.rs".to_string()));
+        assert!(stats.files.contains(&"src/new.rs".to_string()));
+    }
+
+    #[test]
+    fn parse_gemini_session_empty_messages() {
+        let json = r#"{"sessionId": "abc", "messages": []}"#;
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        let (entries, _, last_msg, stats) = parse_gemini_session_value(&v, 0);
+        assert!(entries.is_empty());
+        assert!(last_msg.is_none());
+        assert_eq!(stats.turns, 0);
+    }
+
+    #[test]
+    fn parse_gemini_session_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        std::fs::write(&path, "not valid json").unwrap();
+        let (entries, last_msg, _) = parse_gemini_session(&path);
+        assert!(entries.is_empty());
+        assert!(last_msg.is_none());
+    }
+
+    #[test]
+    fn parse_gemini_lsof_finds_session_json() {
+        let output = "node    12345 user   25r    REG  1,18  50000 /Users/test/.gemini/tmp/hydra/chats/session-2026-02-24T16-25-abc123.json\n";
+        let result = parse_gemini_session_from_lsof(output);
+        assert!(result.is_some());
+        let path = result.unwrap();
+        assert!(path
+            .to_str()
+            .unwrap()
+            .contains("session-2026-02-24T16-25-abc123.json"));
+    }
+
+    #[test]
+    fn parse_gemini_lsof_ignores_non_session() {
+        let output = "node    12345 user   25r    REG  1,18  50000 /Users/test/.gemini/tmp/hydra/logs.json\n";
+        let result = parse_gemini_session_from_lsof(output);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn apply_gemini_stats_replaces_values() {
+        let mut stats = SessionStats::default();
+        stats.turns = 5;
+        stats.tokens_in = 1000;
+
+        let update = GeminiStatsUpdate {
+            turns: 10,
+            tokens_in: 2000,
+            tokens_out: 500,
+            tokens_cached: 100,
+            edits: 3,
+            bash_cmds: 1,
+            files: vec!["a.rs".to_string()],
+            last_user_ts: Some("2026-02-24T10:00:00Z".to_string()),
+            last_assistant_ts: Some("2026-02-24T10:00:05Z".to_string()),
+        };
+
+        apply_gemini_stats(&mut stats, &update);
+        assert_eq!(stats.turns, 10);
+        assert_eq!(stats.tokens_in, 2000);
+        assert_eq!(stats.tokens_out, 500);
+        assert_eq!(stats.tokens_cache_read, 100);
+        assert_eq!(stats.edits, 3);
+        assert_eq!(stats.bash_cmds, 1);
+        assert!(stats.files.contains("a.rs"));
+    }
+
+    #[test]
+    fn gemini_global_stats_from_session_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("myproject").join("chats");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let session_json = r#"{
+            "sessionId": "abc-123",
+            "messages": [
+                {
+                    "type": "gemini",
+                    "timestamp": "2026-02-24T10:00:05Z",
+                    "content": "Hello!",
+                    "tokens": {"input": 500, "output": 100, "cached": 50}
+                }
+            ]
+        }"#;
+        std::fs::write(
+            project_dir.join("session-2026-02-24T10-00-abc12345.json"),
+            session_json,
+        )
+        .unwrap();
+
+        let mut stats = GlobalStats::default();
+        stats.date = "2026-02-24".to_string();
+        // Manually discover files
+        let mut gemini_files = Vec::new();
+        collect_gemini_session_files(dir.path(), &mut gemini_files);
+        stats.known_gemini_files = gemini_files;
+
+        for i in 0..stats.known_gemini_files.len() {
+            let path = stats.known_gemini_files[i].clone();
+            process_gemini_global_file(&path, &mut stats, "2026-02-24");
+        }
+
+        assert_eq!(stats.gemini_tokens_in, 500);
+        assert_eq!(stats.gemini_tokens_out, 100);
+        assert_eq!(stats.gemini_tokens_cached, 50);
+        assert_eq!(stats.tokens_in, 500);
+        assert_eq!(stats.tokens_out, 100);
     }
 }

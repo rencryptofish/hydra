@@ -111,6 +111,7 @@ impl SessionRecord {
             "codex" => {
                 "codex -c check_for_update_on_startup=false --yolo resume --last".to_string()
             }
+            "gemini" => "gemini --yolo --resume".to_string(),
             _ => self.agent_type.clone(),
         }
     }
@@ -127,6 +128,7 @@ impl SessionRecord {
                 }
             }
             "codex" => "codex -c check_for_update_on_startup=false --yolo".to_string(),
+            "gemini" => "gemini --yolo".to_string(),
             _ => self.agent_type.clone(),
         }
     }
@@ -359,6 +361,37 @@ mod tests {
         let record = SessionRecord::for_new_session("bravo", &AgentType::Codex, "/tmp");
         assert_eq!(record.agent_type, "codex");
         assert!(record.agent_session_id.is_none());
+    }
+
+    #[test]
+    fn for_new_session_gemini_no_uuid() {
+        let record = SessionRecord::for_new_session("charlie", &AgentType::Gemini, "/tmp");
+        assert_eq!(record.agent_type, "gemini");
+        assert!(record.agent_session_id.is_none());
+    }
+
+    #[test]
+    fn resume_command_gemini() {
+        let record = SessionRecord {
+            name: "charlie".to_string(),
+            agent_type: "gemini".to_string(),
+            agent_session_id: None,
+            cwd: "/tmp/test".to_string(),
+            failed_attempts: 0,
+        };
+        assert_eq!(record.resume_command(), "gemini --yolo --resume");
+    }
+
+    #[test]
+    fn create_command_gemini() {
+        let record = SessionRecord {
+            name: "charlie".to_string(),
+            agent_type: "gemini".to_string(),
+            agent_session_id: None,
+            cwd: "/tmp/test".to_string(),
+            failed_attempts: 0,
+        };
+        assert_eq!(record.create_command(), "gemini --yolo");
     }
 
     #[test]

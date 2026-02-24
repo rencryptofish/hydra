@@ -10,7 +10,10 @@ use ratatui::Terminal;
 use std::io;
 use std::time::Duration;
 
-use hydra::app::{App, Mode};
+use std::sync::Arc;
+
+use hydra::app::{Mode, StateSnapshot, UiApp};
+use hydra::backend::Backend;
 use hydra::event::{Event, EventHandler};
 use hydra::session::{self, project_id, AgentType};
 use hydra::tmux::SessionManager;
@@ -18,7 +21,6 @@ use hydra::tmux_control::{ControlModeSessionManager, TmuxControlConnection};
 use hydra::{manifest, tmux, ui};
 
 const EVENT_TICK_RATE: Duration = Duration::from_millis(50);
-const SESSION_REFRESH_INTERVAL_TICKS: u8 = 4;
 
 const GITHUB_REPO_URL: &str = "https://github.com/rencryptofish/hydra.git";
 
@@ -33,7 +35,7 @@ struct Cli {
 enum Commands {
     /// Create a new agent session
     New {
-        /// Agent type (claude, codex)
+        /// Agent type (claude, codex, gemini)
         agent: String,
         /// Session name
         name: String,
@@ -121,33 +123,50 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let term_backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(term_backend)?;
 
     // Try control mode first, fall back to subprocess-per-command.
     // Drop impl on TmuxControlConnection handles cleanup of the control session.
-    let manager: Box<dyn SessionManager> = match TmuxControlConnection::connect().await {
-        Ok(conn) => Box::new(ControlModeSessionManager::new(conn)),
-        Err(_) => Box::new(tmux::TmuxSessionManager::new()),
-    };
+    let (manager, control_conn): (Box<dyn SessionManager>, Option<Arc<TmuxControlConnection>>) =
+        match TmuxControlConnection::connect().await {
+            Ok(conn) => {
+                let arc = Arc::new(conn);
+                (
+                    Box::new(ControlModeSessionManager::new(Arc::clone(&arc))),
+                    Some(arc),
+                )
+            }
+            Err(_) => (Box::new(tmux::TmuxSessionManager::new()), None),
+        };
 
-    let mut app = App::new_with_manager(project_id, cwd, manager);
-    app.revive_sessions().await;
-    app.refresh_sessions().await;
-    app.refresh_preview().await;
+    // Set up channels between Backend and UiApp
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
+    let (state_tx, state_rx) = tokio::sync::watch::channel(StateSnapshot::default());
+    let (preview_tx, preview_rx) = tokio::sync::mpsc::channel(16);
 
+    let manifest_dir = manifest::default_base_dir();
+    let backend = Backend::new(
+        manager,
+        project_id,
+        cwd,
+        manifest_dir,
+        state_tx,
+        preview_tx,
+        control_conn,
+    );
+
+    // Spawn the backend actor task
+    tokio::spawn(backend.run(cmd_rx));
+
+    let mut app = UiApp::new(state_rx, preview_rx, cmd_tx);
     let mut events = EventHandler::new(EVENT_TICK_RATE);
     let mut prev_mouse_captured = true;
-    let mut session_refresh_tick = 0u8;
-    // Track when a keystroke last triggered a preview capture, so the tick
-    // handler can skip redundant refresh_preview in Attached mode.
-    let mut last_key_refresh = std::time::Instant::now() - Duration::from_secs(1);
 
     // Draw initial frame before entering event loop
     terminal.draw(|frame| ui::draw(frame, &app))?;
 
-    // Main loop: process events first, then draw — eliminates 0-250ms
-    // input→display latency from the old draw-then-wait pattern.
+    // Main loop: no .await calls — UI never blocks on I/O.
     loop {
         if app.should_quit {
             break;
@@ -156,39 +175,22 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
         match events.next().await {
             Some(Event::Key(key)) => {
                 if key.kind == KeyEventKind::Press {
-                    let was_attached = app.mode == Mode::Attached;
-                    app.handle_key(key).await;
-                    if was_attached && app.mode == Mode::Attached {
-                        // Force a live pane capture on typed input so attached-mode
-                        // echo feels immediate rather than waiting for the tick.
-                        app.refresh_preview_live().await;
-                        last_key_refresh = std::time::Instant::now();
-                    } else if !was_attached {
+                    app.handle_key(key);
+                    // In Compose mode, no preview refresh needed — user is typing.
+                    // In Browse mode, refresh preview from cache for instant feedback.
+                    if app.mode != Mode::Compose {
                         app.refresh_preview_from_cache();
                     }
                 }
             }
             Some(Event::Mouse(mouse)) => {
-                let should_refresh_preview = !matches!(mouse.kind, MouseEventKind::Moved);
-                app.handle_mouse(mouse);
-                app.flush_pending_keys().await;
-                if should_refresh_preview {
-                    app.refresh_preview().await;
+                if !matches!(mouse.kind, MouseEventKind::Moved) {
+                    app.handle_mouse(mouse);
                 }
             }
             Some(Event::Tick) => {
-                session_refresh_tick = session_refresh_tick.wrapping_add(1);
-                if session_refresh_tick.is_multiple_of(SESSION_REFRESH_INTERVAL_TICKS) {
-                    app.refresh_sessions().await;
-                    // In Attached mode, skip preview refresh if a keystroke just
-                    // triggered one — avoids redundant tmux capture subprocess.
-                    let key_just_refreshed = app.mode == Mode::Attached
-                        && last_key_refresh.elapsed() < Duration::from_millis(200);
-                    if !key_just_refreshed {
-                        app.refresh_preview().await;
-                    }
-                }
-                app.refresh_messages();
+                // Poll for backend state updates (non-blocking)
+                app.poll_state();
             }
             Some(Event::Resize) => {}
             None => break,

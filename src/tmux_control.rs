@@ -5,13 +5,54 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
 
 use crate::session::{parse_session_name, AgentType, Session, SessionStatus};
 use crate::tmux::SessionManager;
 
 /// Timeout for control mode command responses.
 const CMD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Broadcast channel capacity for tmux notifications.
+const NOTIFICATION_CHANNEL_CAPACITY: usize = 256;
+
+// ── Notification types ─────────────────────────────────────────────
+
+/// Async notifications from tmux control mode.
+#[derive(Debug, Clone)]
+pub enum TmuxNotification {
+    /// `%output %<pane_id> <data>` — pane produced output.
+    PaneOutput { pane_id: String, data: String },
+    /// `%pane-exited %<pane_id>` — pane process exited (tmux 3.2+).
+    PaneExited { pane_id: String },
+    /// `%session-changed $<id> <name>` — active session changed.
+    SessionChanged { name: String },
+}
+
+/// Parse a tmux control mode notification line into a `TmuxNotification`.
+/// Returns `None` for unrecognized or irrelevant notifications.
+pub fn parse_notification(line: &str) -> Option<TmuxNotification> {
+    if let Some(rest) = line.strip_prefix("%output ") {
+        // Format: %output %<pane_id> <octal-encoded-data>
+        let (pane_id, data) = rest.split_once(' ')?;
+        let pane_id = pane_id.to_string();
+        let data = decode_octal_escapes(data);
+        return Some(TmuxNotification::PaneOutput { pane_id, data });
+    }
+    if let Some(rest) = line.strip_prefix("%pane-exited ") {
+        // Format: %pane-exited %<pane_id>
+        let pane_id = rest.trim().to_string();
+        return Some(TmuxNotification::PaneExited { pane_id });
+    }
+    if let Some(rest) = line.strip_prefix("%session-changed ") {
+        // Format: %session-changed $<id> <name>
+        let name = rest.split_once(' ').map(|(_, n)| n).unwrap_or(rest);
+        return Some(TmuxNotification::SessionChanged {
+            name: name.to_string(),
+        });
+    }
+    None
+}
 
 // ── Protocol types ──────────────────────────────────────────────────
 
@@ -97,17 +138,19 @@ pub fn decode_octal_escapes(input: &str) -> String {
 }
 
 /// Quote a string for use as a tmux control mode argument.
-/// Wraps in double quotes and escapes `\` and `"` inside.
+/// Wraps in single quotes and escapes `'` as `'\''` to prevent tmux
+/// expanding `$VARS` and `#{formats}` inside message text.
 fn quote_tmux_arg(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
+    out.push('\'');
     for c in s.chars() {
-        if c == '\\' || c == '"' {
-            out.push('\\');
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
         }
-        out.push(c);
     }
-    out.push('"');
+    out.push('\'');
     out
 }
 
@@ -137,6 +180,10 @@ pub struct TmuxControlConnection {
     _child: Child,
     /// Handle to the reader task.
     _reader_handle: tokio::task::JoinHandle<()>,
+    /// Broadcast sender for tmux notifications (%output, %pane-exited, etc.).
+    notif_tx: broadcast::Sender<TmuxNotification>,
+    /// Pane ID → tmux session name mapping, updated during list_sessions.
+    pane_sessions: Arc<Mutex<HashMap<String, String>>>,
 }
 
 /// Bundled together under one lock so writes to stdin and pushes to the
@@ -166,15 +213,20 @@ impl TmuxControlConnection {
         let connected = Arc::new(AtomicBool::new(true));
         let pending: Arc<Mutex<VecDeque<PendingCommand>>> = Arc::new(Mutex::new(VecDeque::new()));
 
+        let (notif_tx, _) = broadcast::channel(NOTIFICATION_CHANNEL_CAPACITY);
+        let reader_notif_tx = notif_tx.clone();
+
         let reader_connected = connected.clone();
         let reader_pending = pending.clone();
 
         let reader_handle = tokio::spawn(async move {
-            Self::reader_loop(stdout, reader_pending, reader_connected).await;
+            Self::reader_loop(stdout, reader_pending, reader_connected, reader_notif_tx).await;
         });
 
         // Give tmux a moment to initialize and emit startup notifications
         tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let pane_sessions = Arc::new(Mutex::new(HashMap::new()));
 
         let conn = Self {
             stdin: tokio::sync::Mutex::new(SenderState { stdin, pending }),
@@ -182,6 +234,8 @@ impl TmuxControlConnection {
             ctrl_session_name,
             _child: child,
             _reader_handle: reader_handle,
+            notif_tx,
+            pane_sessions,
         };
 
         // Quick health check — verifies the pipe is working end-to-end
@@ -208,6 +262,7 @@ impl TmuxControlConnection {
         stdout: tokio::process::ChildStdout,
         pending: Arc<Mutex<VecDeque<PendingCommand>>>,
         connected: Arc<AtomicBool>,
+        notif_tx: broadcast::Sender<TmuxNotification>,
     ) {
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
@@ -253,8 +308,11 @@ impl TmuxControlConnection {
                                 });
                             }
                         }
-                        ControlLine::Notification(_) => {
-                            // Notifications are ignored in Phase 1
+                        ControlLine::Notification(ref raw) => {
+                            if let Some(notif) = parse_notification(raw) {
+                                // Best-effort: ignore send errors (no receivers yet).
+                                let _ = notif_tx.send(notif);
+                            }
                         }
                     }
                 }
@@ -346,6 +404,28 @@ impl TmuxControlConnection {
             .output()
             .await;
     }
+
+    /// Subscribe to tmux notifications (%output, %pane-exited, etc.).
+    pub fn subscribe(&self) -> broadcast::Receiver<TmuxNotification> {
+        self.notif_tx.subscribe()
+    }
+
+    /// Look up the tmux session name for a pane ID.
+    pub fn pane_session_name(&self, pane_id: &str) -> Option<String> {
+        self.pane_sessions.lock().unwrap().get(pane_id).cloned()
+    }
+
+    /// Update the pane-to-session mapping from `list-panes -a` output.
+    pub fn update_pane_sessions(&self, pane_data: &str) {
+        let mut map = self.pane_sessions.lock().unwrap();
+        map.clear();
+        for line in pane_data.lines() {
+            // Format: %<pane_id> <session_name>
+            if let Some((pane_id, session_name)) = line.split_once(' ') {
+                map.insert(pane_id.to_string(), session_name.to_string());
+            }
+        }
+    }
 }
 
 impl Drop for TmuxControlConnection {
@@ -367,9 +447,9 @@ pub struct ControlModeSessionManager {
 }
 
 impl ControlModeSessionManager {
-    pub fn new(conn: TmuxControlConnection) -> Self {
+    pub fn new(conn: Arc<TmuxControlConnection>) -> Self {
         Self {
-            conn: Arc::new(conn),
+            conn,
             agent_cache: Mutex::new(HashMap::new()),
         }
     }
@@ -489,6 +569,17 @@ impl SessionManager for ControlModeSessionManager {
             });
         }
 
+        // Update pane-to-session mapping for notification routing.
+        if let Ok(pane_resp) = self
+            .conn
+            .send_command("list-panes -a -F '#{pane_id} #{session_name}'")
+            .await
+        {
+            if pane_resp.success {
+                self.conn.update_pane_sessions(&pane_resp.output);
+            }
+        }
+
         Ok(sessions)
     }
 
@@ -503,10 +594,21 @@ impl SessionManager for ControlModeSessionManager {
         let tmux_name = crate::session::tmux_session_name(project_id, name);
         let cmd = command_override.unwrap_or(agent.command());
 
+        // Wrap command to unset Claude Code env vars that leak from the tmux
+        // global environment (tmux captures the parent process env on startup).
+        let wrapped_cmd = format!(
+            "unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS; \
+             unset $(env | grep -o '^CLAUDE_CODE_[^=]*') 2>/dev/null; exec {}",
+            cmd
+        );
+        let quoted_cmd = quote_tmux_arg(&wrapped_cmd);
+
         // Create the session
         let resp = self
             .conn
-            .send_command(&format!("new-session -d -s {tmux_name} -c {cwd} {cmd}"))
+            .send_command(&format!(
+                "new-session -d -s {tmux_name} -c {cwd} {quoted_cmd}"
+            ))
             .await
             .context("Failed to create tmux session")?;
 
@@ -519,6 +621,19 @@ impl SessionManager for ControlModeSessionManager {
             .conn
             .send_command(&format!("set-option -t {tmux_name} remain-on-exit on"))
             .await;
+
+        // Unset Claude Code env vars in session environment (-u blocks
+        // inheritance from the global table where these vars still exist).
+        for var in [
+            "CLAUDECODE",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
+        ] {
+            let _ = self
+                .conn
+                .send_command(&format!("set-environment -t {tmux_name} -u {var}"))
+                .await;
+        }
 
         // Set agent type env var
         let agent_str = agent.to_string().to_lowercase();
@@ -598,9 +713,10 @@ impl SessionManager for ControlModeSessionManager {
     }
 
     async fn send_keys(&self, tmux_name: &str, key: &str) -> Result<()> {
-        let quoted = quote_tmux_arg(key);
+        // Key names (Enter, Escape, Space, etc.) must NOT be quoted —
+        // quoting makes tmux treat them as literal text.
         self.conn
-            .send_command_fire_and_forget(&format!("send-keys -t {tmux_name} {quoted}"))
+            .send_command_fire_and_forget(&format!("send-keys -t {tmux_name} {key}"))
             .await;
         Ok(())
     }
@@ -611,6 +727,70 @@ impl SessionManager for ControlModeSessionManager {
             .send_command_fire_and_forget(&format!("send-keys -t {tmux_name} -l {quoted}"))
             .await;
         Ok(())
+    }
+
+    async fn send_text_enter(&self, tmux_name: &str, text: &str) -> Result<()> {
+        let quoted = quote_tmux_arg(text);
+        // Send literal text, then Enter. Both are awaited so we can surface
+        // failures instead of silently dropping user messages.
+        let resp = self
+            .conn
+            .send_command(&format!("send-keys -t {tmux_name} -l {quoted}"))
+            .await
+            .context("Failed to send literal text to tmux")?;
+        if !resp.success {
+            bail!(
+                "tmux send-keys -l failed for '{tmux_name}': {}",
+                resp.output
+            );
+        }
+
+        let resp = self
+            .conn
+            .send_command(&format!("send-keys -t {tmux_name} Enter"))
+            .await
+            .context("Failed to send Enter to tmux")?;
+        if !resp.success {
+            bail!(
+                "tmux send-keys Enter failed for '{tmux_name}': {}",
+                resp.output
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn batch_pane_status(&self) -> Option<std::collections::HashMap<String, (bool, u64)>> {
+        let resp = self
+            .conn
+            .send_command("list-panes -a -F '#{session_name} #{pane_dead} #{pane_activity}'")
+            .await
+            .ok()?;
+
+        if !resp.success {
+            return None;
+        }
+
+        let mut result = std::collections::HashMap::new();
+        for line in resp.output.lines() {
+            let parts: Vec<&str> = line.splitn(3, ' ').collect();
+            if parts.len() == 3 {
+                let session_name = parts[0].to_string();
+                let is_dead = parts[1] != "0";
+                let activity = parts[2].parse::<u64>().unwrap_or(0);
+                result.insert(session_name, (is_dead, activity));
+            }
+        }
+        Some(result)
+    }
+
+    fn prepopulate_agent_cache(&self, mapping: &std::collections::HashMap<String, AgentType>) {
+        let mut cache = self.agent_cache.lock().unwrap();
+        for (tmux_name, agent) in mapping {
+            cache
+                .entry(tmux_name.clone())
+                .or_insert_with(|| agent.clone());
+        }
     }
 }
 
@@ -703,27 +883,37 @@ mod tests {
 
     #[test]
     fn quote_simple_text() {
-        assert_eq!(quote_tmux_arg("hello"), "\"hello\"");
+        assert_eq!(quote_tmux_arg("hello"), "'hello'");
     }
 
     #[test]
     fn quote_text_with_spaces() {
-        assert_eq!(quote_tmux_arg("hello world"), "\"hello world\"");
+        assert_eq!(quote_tmux_arg("hello world"), "'hello world'");
     }
 
     #[test]
     fn quote_text_with_backslash() {
-        assert_eq!(quote_tmux_arg("a\\b"), "\"a\\\\b\"");
+        assert_eq!(quote_tmux_arg("a\\b"), "'a\\b'");
     }
 
     #[test]
     fn quote_text_with_double_quote() {
-        assert_eq!(quote_tmux_arg("say \"hi\""), "\"say \\\"hi\\\"\"");
+        assert_eq!(quote_tmux_arg("say \"hi\""), "'say \"hi\"'");
+    }
+
+    #[test]
+    fn quote_text_with_single_quote() {
+        assert_eq!(quote_tmux_arg("it's fine"), "'it'\\''s fine'");
+    }
+
+    #[test]
+    fn quote_text_with_dollar_not_expanded() {
+        assert_eq!(quote_tmux_arg("echo $HOME"), "'echo $HOME'");
     }
 
     #[test]
     fn quote_empty_string() {
-        assert_eq!(quote_tmux_arg(""), "\"\"");
+        assert_eq!(quote_tmux_arg(""), "''");
     }
 
     // ── parse_control_line ──────────────────────────────────────────
@@ -791,6 +981,124 @@ mod tests {
         assert_eq!(parse_control_line("%begin 0 0 0"), ControlLine::Begin);
     }
 
+    // ── parse_notification ────────────────────────────────────────
+
+    #[test]
+    fn parse_notification_output() {
+        let notif = super::parse_notification("%output %5 hello\\012world");
+        match notif {
+            Some(TmuxNotification::PaneOutput { pane_id, data }) => {
+                assert_eq!(pane_id, "%5");
+                assert_eq!(data, "hello\nworld");
+            }
+            other => panic!("expected PaneOutput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_notification_output_plain_text() {
+        let notif = super::parse_notification("%output %12 some text");
+        match notif {
+            Some(TmuxNotification::PaneOutput { pane_id, data }) => {
+                assert_eq!(pane_id, "%12");
+                assert_eq!(data, "some text");
+            }
+            other => panic!("expected PaneOutput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_notification_pane_exited() {
+        let notif = super::parse_notification("%pane-exited %5");
+        match notif {
+            Some(TmuxNotification::PaneExited { pane_id }) => {
+                assert_eq!(pane_id, "%5");
+            }
+            other => panic!("expected PaneExited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_notification_session_changed() {
+        let notif = super::parse_notification("%session-changed $1 mysession");
+        match notif {
+            Some(TmuxNotification::SessionChanged { name }) => {
+                assert_eq!(name, "mysession");
+            }
+            other => panic!("expected SessionChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_notification_session_changed_no_id() {
+        // Edge case: no space after prefix
+        let notif = super::parse_notification("%session-changed myname");
+        match notif {
+            Some(TmuxNotification::SessionChanged { name }) => {
+                assert_eq!(name, "myname");
+            }
+            other => panic!("expected SessionChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_notification_unknown() {
+        assert!(super::parse_notification("%window-renamed 1 newname").is_none());
+    }
+
+    #[test]
+    fn parse_notification_empty() {
+        assert!(super::parse_notification("").is_none());
+    }
+
+    #[test]
+    fn parse_notification_begin_not_matched() {
+        // %begin is not a notification we handle
+        assert!(super::parse_notification("%begin 123 456 1").is_none());
+    }
+
+    // ── pane session mapping ──────────────────────────────────────
+
+    #[test]
+    fn update_pane_sessions_basic() {
+        let (tx, _) = broadcast::channel(16);
+        let conn = TmuxControlConnectionForTest::new(tx);
+        conn.update_pane_sessions("%5 my-session\n%12 other-session");
+        assert_eq!(conn.pane_session_name("%5"), Some("my-session".to_string()));
+        assert_eq!(
+            conn.pane_session_name("%12"),
+            Some("other-session".to_string())
+        );
+        assert_eq!(conn.pane_session_name("%99"), None);
+    }
+
+    /// Minimal struct to test pane session mapping without a full connection.
+    struct TmuxControlConnectionForTest {
+        pane_sessions: Arc<Mutex<HashMap<String, String>>>,
+    }
+
+    impl TmuxControlConnectionForTest {
+        fn new(_notif_tx: broadcast::Sender<TmuxNotification>) -> Self {
+            Self {
+                pane_sessions: Arc::new(Mutex::new(HashMap::new())),
+            }
+        }
+
+        fn update_pane_sessions(&self, pane_data: &str) {
+            let mut map = self.pane_sessions.lock().unwrap();
+            map.clear();
+            for line in pane_data.lines() {
+                if let Some((pane_id, session_name)) = line.split_once(' ') {
+                    map.insert(pane_id.to_string(), session_name.to_string());
+                }
+            }
+        }
+
+        fn pane_session_name(&self, pane_id: &str) -> Option<String> {
+            self.pane_sessions.lock().unwrap().get(pane_id).cloned()
+        }
+    }
+
     // ── proptest ────────────────────────────────────────────────────
 
     mod proptests {
@@ -814,6 +1122,11 @@ mod tests {
             ) {
                 let result = decode_octal_escapes(&input);
                 prop_assert_eq!(result, input);
+            }
+
+            #[test]
+            fn parse_notification_never_panics(input in ".*") {
+                let _ = super::super::parse_notification(&input);
             }
         }
     }
