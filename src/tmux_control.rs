@@ -744,6 +744,25 @@ impl SessionManager for ControlModeSessionManager {
     async fn send_text_enter(&self, tmux_name: &str, text: &str) -> Result<()> {
         // Send literal text, then Enter. Both are awaited so we can surface
         // failures instead of silently dropping user messages.
+        //
+        // Multi-line text is wrapped in bracketed paste sequences so the
+        // receiving TUI treats embedded newlines as content, not submit.
+        let is_multiline = text.contains('\n');
+
+        if is_multiline {
+            let resp = self
+                .conn
+                .send_command(&send_keys_literal_command(tmux_name, "\x1b[200~"))
+                .await
+                .context("Failed to send paste-start to tmux")?;
+            if !resp.success {
+                bail!(
+                    "tmux send-keys paste-start failed for '{tmux_name}': {}",
+                    resp.output
+                );
+            }
+        }
+
         let resp = self
             .conn
             .send_command(&send_keys_literal_command(tmux_name, text))
@@ -754,6 +773,20 @@ impl SessionManager for ControlModeSessionManager {
                 "tmux send-keys -l failed for '{tmux_name}': {}",
                 resp.output
             );
+        }
+
+        if is_multiline {
+            let resp = self
+                .conn
+                .send_command(&send_keys_literal_command(tmux_name, "\x1b[201~"))
+                .await
+                .context("Failed to send paste-end to tmux")?;
+            if !resp.success {
+                bail!(
+                    "tmux send-keys paste-end failed for '{tmux_name}': {}",
+                    resp.output
+                );
+            }
         }
 
         tokio::time::sleep(COMPOSE_SUBMIT_ENTER_DELAY).await;

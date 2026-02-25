@@ -485,13 +485,41 @@ pub async fn send_keys_literal(tmux_name: &str, text: &str) -> Result<()> {
 /// Send literal text then Enter as two synchronous tmux calls.
 /// Using two awaited subprocesses preserves ordering and ensures Enter is
 /// interpreted as a key (not literal text).
+///
+/// Multi-line text is wrapped in bracketed paste sequences so that the
+/// receiving TUI application (Claude Code, Codex, Gemini) treats embedded
+/// newlines as content rather than submit triggers.
 pub async fn send_text_enter(tmux_name: &str, text: &str) -> Result<()> {
+    let is_multiline = text.contains('\n');
+
+    if is_multiline {
+        // Send bracketed paste start marker
+        let start_args = send_keys_literal_args(tmux_name, "\x1b[200~");
+        let status = run_status_timeout(Command::new("tmux").args(&start_args))
+            .await
+            .context("Failed to send paste-start to tmux")?;
+        if !status.success() {
+            bail!("tmux send-keys paste-start failed for '{tmux_name}'");
+        }
+    }
+
     let literal_args = send_keys_literal_args(tmux_name, text);
     let status = run_status_timeout(Command::new("tmux").args(&literal_args))
         .await
         .context("Failed to send literal text to tmux")?;
     if !status.success() {
         bail!("tmux send-keys -l failed for '{tmux_name}'");
+    }
+
+    if is_multiline {
+        // Send bracketed paste end marker
+        let end_args = send_keys_literal_args(tmux_name, "\x1b[201~");
+        let status = run_status_timeout(Command::new("tmux").args(&end_args))
+            .await
+            .context("Failed to send paste-end to tmux")?;
+        if !status.success() {
+            bail!("tmux send-keys paste-end failed for '{tmux_name}'");
+        }
     }
 
     tokio::time::sleep(COMPOSE_SUBMIT_ENTER_DELAY).await;
