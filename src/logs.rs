@@ -3562,7 +3562,7 @@ mod tests {
     #[test]
     fn global_stats_cost_calculation_with_codex_breakdown() {
         let stats = GlobalStats {
-            codex_tokens_in: 1_000_000,  // includes 200k cached
+            codex_tokens_in: 1_000_000, // includes 200k cached
             codex_tokens_out: 100_000,
             codex_tokens_cache_read: 200_000,
             ..Default::default()
@@ -3578,7 +3578,7 @@ mod tests {
     #[test]
     fn global_stats_codex_cost_ignores_cache_tokens() {
         let stats = GlobalStats {
-            codex_tokens_in: 100,   // all cached
+            codex_tokens_in: 100, // all cached
             codex_tokens_out: 0,
             codex_tokens_cache_read: 200,
             ..Default::default()
@@ -3591,7 +3591,7 @@ mod tests {
     #[test]
     fn global_stats_cost_calculation_with_gemini_breakdown() {
         let stats = GlobalStats {
-            gemini_tokens_in: 1_000_000,  // includes 200k cached
+            gemini_tokens_in: 1_000_000, // includes 200k cached
             gemini_tokens_out: 100_000,
             gemini_tokens_cached: 200_000,
             ..Default::default()
@@ -3608,7 +3608,7 @@ mod tests {
     #[test]
     fn global_stats_gemini_cost_ignores_cache_tokens() {
         let stats = GlobalStats {
-            gemini_tokens_in: 100,   // all cached
+            gemini_tokens_in: 100, // all cached
             gemini_tokens_out: 0,
             gemini_tokens_cached: 200,
             ..Default::default()
