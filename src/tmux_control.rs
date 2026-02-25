@@ -745,45 +745,48 @@ impl SessionManager for ControlModeSessionManager {
         // Send literal text, then Enter. Both are awaited so we can surface
         // failures instead of silently dropping user messages.
         //
-        // Multi-line text is wrapped in bracketed paste sequences so the
-        // receiving TUI treats embedded newlines as content, not submit.
-        let is_multiline = text.contains('\n');
+        // Multi-line text uses tmux's native paste mechanism (load-buffer +
+        // paste-buffer -p) which wraps content in bracketed paste sequences.
+        // We can't use send-keys -l for multi-line text in control mode
+        // because newlines in the command text break the line-based protocol.
+        if text.contains('\n') {
+            let tmp =
+                tempfile::NamedTempFile::new().context("Failed to create temp file for paste")?;
+            tokio::fs::write(tmp.path(), text.as_bytes())
+                .await
+                .context("Failed to write paste temp file")?;
 
-        if is_multiline {
+            let path_str = tmp.path().to_string_lossy();
+
             let resp = self
                 .conn
-                .send_command(&send_keys_literal_command(tmux_name, "\x1b[200~"))
+                .send_command(&format!("load-buffer {path_str}"))
                 .await
-                .context("Failed to send paste-start to tmux")?;
+                .context("Failed to load tmux buffer")?;
+            if !resp.success {
+                bail!("tmux load-buffer failed for '{tmux_name}': {}", resp.output);
+            }
+
+            let resp = self
+                .conn
+                .send_command(&format!("paste-buffer -t {tmux_name} -p -d"))
+                .await
+                .context("Failed to paste tmux buffer")?;
             if !resp.success {
                 bail!(
-                    "tmux send-keys paste-start failed for '{tmux_name}': {}",
+                    "tmux paste-buffer failed for '{tmux_name}': {}",
                     resp.output
                 );
             }
-        }
-
-        let resp = self
-            .conn
-            .send_command(&send_keys_literal_command(tmux_name, text))
-            .await
-            .context("Failed to send literal text to tmux")?;
-        if !resp.success {
-            bail!(
-                "tmux send-keys -l failed for '{tmux_name}': {}",
-                resp.output
-            );
-        }
-
-        if is_multiline {
+        } else {
             let resp = self
                 .conn
-                .send_command(&send_keys_literal_command(tmux_name, "\x1b[201~"))
+                .send_command(&send_keys_literal_command(tmux_name, text))
                 .await
-                .context("Failed to send paste-end to tmux")?;
+                .context("Failed to send literal text to tmux")?;
             if !resp.success {
                 bail!(
-                    "tmux send-keys paste-end failed for '{tmux_name}': {}",
+                    "tmux send-keys -l failed for '{tmux_name}': {}",
                     resp.output
                 );
             }

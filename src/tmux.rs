@@ -486,39 +486,20 @@ pub async fn send_keys_literal(tmux_name: &str, text: &str) -> Result<()> {
 /// Using two awaited subprocesses preserves ordering and ensures Enter is
 /// interpreted as a key (not literal text).
 ///
-/// Multi-line text is wrapped in bracketed paste sequences so that the
-/// receiving TUI application (Claude Code, Codex, Gemini) treats embedded
-/// newlines as content rather than submit triggers.
+/// Multi-line text uses tmux's native paste mechanism (`load-buffer` +
+/// `paste-buffer -p`) which wraps content in bracketed paste sequences.
+/// This tells the receiving TUI to treat embedded newlines as content
+/// rather than submit triggers.
 pub async fn send_text_enter(tmux_name: &str, text: &str) -> Result<()> {
-    let is_multiline = text.contains('\n');
-
-    if is_multiline {
-        // Send bracketed paste start marker
-        let start_args = send_keys_literal_args(tmux_name, "\x1b[200~");
-        let status = run_status_timeout(Command::new("tmux").args(&start_args))
+    if text.contains('\n') {
+        send_multiline_paste(tmux_name, text).await?;
+    } else {
+        let literal_args = send_keys_literal_args(tmux_name, text);
+        let status = run_status_timeout(Command::new("tmux").args(&literal_args))
             .await
-            .context("Failed to send paste-start to tmux")?;
+            .context("Failed to send literal text to tmux")?;
         if !status.success() {
-            bail!("tmux send-keys paste-start failed for '{tmux_name}'");
-        }
-    }
-
-    let literal_args = send_keys_literal_args(tmux_name, text);
-    let status = run_status_timeout(Command::new("tmux").args(&literal_args))
-        .await
-        .context("Failed to send literal text to tmux")?;
-    if !status.success() {
-        bail!("tmux send-keys -l failed for '{tmux_name}'");
-    }
-
-    if is_multiline {
-        // Send bracketed paste end marker
-        let end_args = send_keys_literal_args(tmux_name, "\x1b[201~");
-        let status = run_status_timeout(Command::new("tmux").args(&end_args))
-            .await
-            .context("Failed to send paste-end to tmux")?;
-        if !status.success() {
-            bail!("tmux send-keys paste-end failed for '{tmux_name}'");
+            bail!("tmux send-keys -l failed for '{tmux_name}'");
         }
     }
 
@@ -530,6 +511,39 @@ pub async fn send_text_enter(tmux_name: &str, text: &str) -> Result<()> {
         .context("Failed to send Enter to tmux")?;
     if !status.success() {
         bail!("tmux send-keys Enter failed for '{tmux_name}'");
+    }
+
+    Ok(())
+}
+
+/// Send multi-line text via tmux's native paste: write to a temp file,
+/// load into a tmux buffer, and paste with `-p` (bracketed paste mode).
+async fn send_multiline_paste(tmux_name: &str, text: &str) -> Result<()> {
+    let tmp = tempfile::NamedTempFile::new().context("Failed to create temp file for paste")?;
+    tokio::fs::write(tmp.path(), text.as_bytes())
+        .await
+        .context("Failed to write paste temp file")?;
+
+    let path_str = tmp.path().to_string_lossy();
+
+    let status = run_status_timeout(Command::new("tmux").args(["load-buffer", &path_str]))
+        .await
+        .context("Failed to load tmux buffer")?;
+    if !status.success() {
+        bail!("tmux load-buffer failed for '{tmux_name}'");
+    }
+
+    let status = run_status_timeout(Command::new("tmux").args([
+        "paste-buffer",
+        "-t",
+        tmux_name,
+        "-p",
+        "-d",
+    ]))
+    .await
+    .context("Failed to paste tmux buffer")?;
+    if !status.success() {
+        bail!("tmux paste-buffer failed for '{tmux_name}'");
     }
 
     Ok(())
@@ -1225,6 +1239,78 @@ mod tests {
         let _ = std::fs::remove_file(&marker_path);
 
         cleanup_session(&name).await;
+    }
+
+    #[tokio::test]
+    async fn integration_send_text_enter_multiline_uses_paste_buffer() {
+        let name = test_session_name();
+        let raw_path = format!("/tmp/hydra_multiline_raw_{}", std::process::id());
+        let _ = std::fs::remove_file(&raw_path);
+
+        // Create a session that enables bracketed paste and captures raw input.
+        // `stty raw -echo` disables line buffering so we get exact bytes.
+        // `printf "\033[?2004h"` enables bracketed paste mode in the pane.
+        let cmd = format!("stty raw -echo; printf '\\033[?2004h'; cat > {raw_path}",);
+        let status = run_status_timeout(Command::new("tmux").args([
+            "new-session",
+            "-d",
+            "-s",
+            &name,
+            "-x",
+            "80",
+            "-y",
+            "24",
+            &cmd,
+        ]))
+        .await
+        .unwrap();
+        assert!(status.success());
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        send_text_enter(&name, "line1\nline2\nline3").await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Send Ctrl-C to terminate cat so the file is flushed.
+        let _ = send_keys(&name, "C-c").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let raw = std::fs::read(&raw_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&raw_path);
+        cleanup_session(&name).await;
+
+        // Verify bracketed paste markers are present.
+        let paste_start = b"\x1b[200~";
+        let paste_end = b"\x1b[201~";
+        assert!(
+            raw.windows(paste_start.len()).any(|w| w == paste_start),
+            "expected paste-start ESC[200~ in raw output: {raw:?}"
+        );
+        assert!(
+            raw.windows(paste_end.len()).any(|w| w == paste_end),
+            "expected paste-end ESC[201~ in raw output: {raw:?}"
+        );
+
+        // Verify all three lines are present between the markers.
+        let start_pos = raw
+            .windows(paste_start.len())
+            .position(|w| w == paste_start)
+            .unwrap();
+        let end_pos = raw
+            .windows(paste_end.len())
+            .position(|w| w == paste_end)
+            .unwrap();
+        let content = &raw[start_pos + paste_start.len()..end_pos];
+        let content_str = String::from_utf8_lossy(content);
+
+        // Newlines arrive as CR (0x0d) in raw terminal mode.
+        assert!(
+            content_str.contains("line1")
+                && content_str.contains("line2")
+                && content_str.contains("line3"),
+            "expected all three lines in paste content: {content_str:?}"
+        );
     }
 
     #[tokio::test]
