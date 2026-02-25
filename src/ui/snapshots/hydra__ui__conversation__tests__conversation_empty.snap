@@ -1,0 +1,6 @@
+---
+source: src/ui/conversation.rs
+assertion_line: 194
+expression: rendered
+---
+Waiting for agent output...

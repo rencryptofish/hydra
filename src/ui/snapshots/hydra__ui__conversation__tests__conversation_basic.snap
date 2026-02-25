@@ -1,0 +1,21 @@
+---
+source: src/ui/conversation.rs
+assertion_line: 229
+expression: rendered
+---
+USER
+  Fix the bug
+
+ASSISTANT
+  I'll fix that for you.
+
+TOOL
+  Edit
+  id=t1 | file=src/main.rs
+
+TOOL RESULT
+  - src/main.rs
+  > updated file successfully
+
+ASSISTANT
+  Done! The bug is fixed.
