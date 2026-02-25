@@ -35,6 +35,7 @@ pub struct Backend {
     preview_runtime: PreviewRuntime,
 
     status_message: Option<String>,
+    status_message_set_at: Option<Instant>,
 
     state_tx: watch::Sender<Arc<StateSnapshot>>,
     preview_tx: mpsc::Sender<PreviewUpdate>,
@@ -62,10 +63,16 @@ impl Backend {
             message_runtime: MessageRuntime::new(),
             preview_runtime: PreviewRuntime::new(),
             status_message: None,
+            status_message_set_at: None,
             state_tx,
             preview_tx,
             control_conn,
         }
+    }
+
+    fn set_status(&mut self, msg: String) {
+        self.status_message = Some(msg);
+        self.status_message_set_at = Some(Instant::now());
     }
 
     /// Run the backend event loop.
@@ -107,6 +114,15 @@ impl Backend {
                 _ = session_tick.tick() => {
                     let prev_sessions = self.sessions.clone();
                     let prev_status_message = self.status_message.clone();
+
+                    // Auto-clear status messages after 4.5s (UI clears at 5s)
+                    if let Some(set_at) = self.status_message_set_at {
+                        if set_at.elapsed() > Duration::from_millis(4500) {
+                            self.status_message = None;
+                            self.status_message_set_at = None;
+                        }
+                    }
+
                     self.refresh_sessions().await;
                     if sessions_changed(&prev_sessions, &self.sessions)
                         || self.status_message != prev_status_message
@@ -189,7 +205,7 @@ impl Backend {
             }
             BackendCommand::SendCompose { tmux_name, text } => {
                 if let Err(e) = self.manager.send_text_enter(&tmux_name, &text).await {
-                    self.status_message = Some(format!("Failed to send message: {e}"));
+                    self.set_status(format!("Failed to send message: {e}"));
                     self.send_snapshot();
                 } else {
                     // In subprocess mode there are no output notifications.
@@ -241,11 +257,11 @@ impl Backend {
                 if let Err(e) = crate::manifest::add_session(&manifest_dir, &pid, record).await {
                     msg.push_str(&format!(" (warning: manifest save failed: {e})"));
                 }
-                self.status_message = Some(msg);
+                self.set_status(msg);
                 self.refresh_sessions().await;
             }
             Err(e) => {
-                self.status_message = Some(format!("Failed to create session: {e}"));
+                self.set_status(format!("Failed to create session: {e}"));
             }
         }
     }
@@ -260,10 +276,10 @@ impl Backend {
                 if let Err(e) = crate::manifest::remove_session(&manifest_dir, &pid, name).await {
                     msg.push_str(&format!(" (warning: manifest update failed: {e})"));
                 }
-                self.status_message = Some(msg);
+                self.set_status(msg);
             }
             Err(e) => {
-                self.status_message = Some(format!("Failed to kill session: {e}"));
+                self.set_status(format!("Failed to kill session: {e}"));
             }
         }
         self.refresh_sessions().await;
@@ -347,7 +363,7 @@ impl Backend {
             } else {
                 format!("Revived {revived}, failed {failed} session(s)")
             };
-            self.status_message = Some(msg);
+            self.set_status(msg);
         }
     }
 
@@ -386,7 +402,7 @@ impl Backend {
             }
             Err(e) => {
                 self.preview_runtime.clear_cache();
-                self.status_message = Some(format!("Error listing sessions: {e}"));
+                self.set_status(format!("Error listing sessions: {e}"));
             }
         }
 
