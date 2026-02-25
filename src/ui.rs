@@ -67,18 +67,15 @@ pub fn draw(frame: &mut Frame, app: &UiApp) {
 
     if !app.mouse_captured {
         let area = frame.area();
-        let copy_mode_area = Rect::new(
-            area.width.saturating_sub(15),
-            0,
-            13,
-            1,
-        );
+        let copy_mode_area = Rect::new(area.width.saturating_sub(15), 0, 13, 1);
         let copy_badge = ratatui::widgets::Paragraph::new(ratatui::text::Span::styled(
             "[ COPY MODE ]",
             ratatui::style::Style::default()
                 .fg(ratatui::style::Color::Black)
                 .bg(ratatui::style::Color::Yellow)
-                .add_modifier(ratatui::style::Modifier::BOLD | ratatui::style::Modifier::SLOW_BLINK),
+                .add_modifier(
+                    ratatui::style::Modifier::BOLD | ratatui::style::Modifier::SLOW_BLINK,
+                ),
         ));
         frame.render_widget(copy_badge, copy_mode_area);
     }

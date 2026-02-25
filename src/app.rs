@@ -293,9 +293,8 @@ impl UiApp {
         }
 
         let active_tmux = self.active_preview_tmux();
-        self.preview_cache.retain(|k, _| {
-            live_keys.contains(k) && Some(k.as_str()) == active_tmux.as_deref()
-        });
+        self.preview_cache
+            .retain(|k, _| live_keys.contains(k) && Some(k.as_str()) == active_tmux.as_deref());
         if self
             .requested_preview
             .as_ref()
@@ -485,12 +484,30 @@ impl UiApp {
             KeyCode::Enter => self.send_compose_message(),
             KeyCode::Backspace => self.compose.backspace(),
             KeyCode::Delete => self.compose.delete_forward(),
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => self.compose.clear_line(),
-            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => self.compose.delete_word_left(),
-            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => self.compose.move_word_left(),
-            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => self.compose.move_word_right(),
-            KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) => self.compose.move_word_left(),
-            KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) => self.compose.move_word_right(),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.compose.clear_line()
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.compose.delete_word_left()
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.compose.move_word_left()
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.compose.move_word_right()
+            }
+            KeyCode::Left
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.compose.move_word_left()
+            }
+            KeyCode::Right
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.compose.move_word_right()
+            }
             KeyCode::Left => self.compose.move_left(),
             KeyCode::Right => self.compose.move_right(),
             KeyCode::Up => {
@@ -1316,7 +1333,10 @@ mod tests {
 
         assert_eq!(app.mode, Mode::Browse);
         // Draft is preserved
-        assert_eq!(app.compose_states.get("hydra-test-alpha").unwrap().text(), "hi");
+        assert_eq!(
+            app.compose_states.get("hydra-test-alpha").unwrap().text(),
+            "hi"
+        );
 
         // Re-entering compose restores the draft
         app.enter_compose();

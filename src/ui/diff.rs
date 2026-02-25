@@ -273,7 +273,9 @@ pub(crate) fn draw_diff_tree(
     let max_offset = total_lines.saturating_sub(max_rows);
     let capped_offset = (app.diff_scroll_offset as usize).min(max_offset);
 
-    let start = total_lines.saturating_sub(max_rows).saturating_sub(capped_offset);
+    let start = total_lines
+        .saturating_sub(max_rows)
+        .saturating_sub(capped_offset);
     let end = (start + max_rows).min(total_lines);
     let visible: Vec<Line> = lines[start..end].to_vec();
 

@@ -230,7 +230,7 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
             let size = terminal.size()?;
             app.terminal_size = (size.width, size.height);
             app.update_diff_tree();
-            
+
             terminal.draw(|frame| ui::draw(frame, &app))?;
             app.needs_redraw = false;
         }
