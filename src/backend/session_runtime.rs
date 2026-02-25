@@ -4,7 +4,7 @@ use std::time::Instant;
 use crate::agent::{provider_for, StatusStrategy};
 use crate::backend::state::{OutputDetector, TaskTimers};
 use crate::logs::SessionStats;
-use crate::session::{Session, SessionStatus};
+use crate::session::{AgentState, ProcessState, Session, VisualStatus};
 
 pub(crate) struct SessionRuntime {
     output_detector: OutputDetector,
@@ -31,7 +31,7 @@ impl SessionRuntime {
     pub(crate) fn apply_statuses(
         &mut self,
         sessions: &mut [Session],
-        prev_statuses: &HashMap<String, SessionStatus>,
+        prev_statuses: &HashMap<String, VisualStatus>,
         session_stats: &HashMap<String, SessionStats>,
         pane_status: Option<&HashMap<String, (bool, u64)>>,
         use_output_events: bool,
@@ -45,8 +45,7 @@ impl SessionRuntime {
                 .unwrap_or(false);
 
             if is_dead {
-                session.status =
-                    self.apply_exited_debounce(&tmux_name, prev_statuses, session_stats);
+                session.process_state = self.apply_exited_debounce(&tmux_name, prev_statuses, session_stats);
                 continue;
             }
 
@@ -56,7 +55,7 @@ impl SessionRuntime {
                 .get(&tmux_name)
                 .and_then(|stats| stats.task_elapsed())
                 .is_some();
-            let recent_output = self.output_detector.status(&tmux_name) == SessionStatus::Running;
+            let recent_output = self.output_detector.has_recent_output(&tmux_name);
             let has_log_stats = session_stats.contains_key(&tmux_name);
             let strategy = provider_for(&session.agent_type).preferred_status_strategy();
 
@@ -75,10 +74,11 @@ impl SessionRuntime {
                 }
             };
 
-            session.status = if running {
-                SessionStatus::Running
+            session.process_state = ProcessState::Alive;
+            session.agent_state = if running {
+                AgentState::Thinking
             } else {
-                SessionStatus::Idle
+                AgentState::Idle
             };
         }
 
@@ -94,9 +94,9 @@ impl SessionRuntime {
     fn apply_exited_debounce(
         &mut self,
         tmux_name: &str,
-        prev_statuses: &HashMap<String, SessionStatus>,
+        prev_statuses: &HashMap<String, VisualStatus>,
         session_stats: &HashMap<String, SessionStats>,
-    ) -> SessionStatus {
+    ) -> ProcessState {
         let has_active_subagents = session_stats
             .get(tmux_name)
             .map(|stats| stats.active_subagents > 0)
@@ -112,13 +112,18 @@ impl SessionRuntime {
         *count = count.saturating_add(1);
 
         if *count < threshold {
-            prev_statuses
+            let prev = prev_statuses
                 .get(tmux_name)
-                .filter(|status| **status != SessionStatus::Exited)
                 .cloned()
-                .unwrap_or(SessionStatus::Idle)
+                .unwrap_or(VisualStatus::Idle);
+            
+            if prev == VisualStatus::Exited {
+                ProcessState::Exited { exit_code: None, reason: None }
+            } else {
+                ProcessState::Alive
+            }
         } else {
-            SessionStatus::Exited
+            ProcessState::Exited { exit_code: None, reason: None }
         }
     }
 }

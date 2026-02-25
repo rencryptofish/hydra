@@ -708,7 +708,7 @@ impl UiApp {
                         let mut target_idx = None;
                         let mut current_group: Option<u8> = None;
                         for (i, session) in self.snapshot.sessions.iter().enumerate() {
-                            let group = session.status.sort_order();
+                            let group = session.sort_order();
                             if current_group != Some(group) {
                                 current_group = Some(group);
                                 if row_offset == cumulative {
@@ -817,7 +817,9 @@ mod tests {
             name: name.to_string(),
             tmux_name: tmux_name.to_string(),
             agent_type,
-            status: crate::session::SessionStatus::Idle,
+            process_state: crate::session::ProcessState::Alive,
+            agent_state: crate::session::AgentState::Idle,
+            last_activity_at: std::time::Instant::now(),
             task_elapsed: None,
             _alive: true,
         }

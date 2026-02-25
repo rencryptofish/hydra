@@ -7,16 +7,17 @@ use ratatui::{
 };
 
 use crate::app::UiApp;
-use crate::session::{format_duration, SessionStatus};
+use crate::session::{format_duration, VisualStatus};
 use crate::ui::diff::{build_diff_tree_lines, draw_diff_tree};
 use crate::ui::stats::draw_stats;
 use crate::ui::truncate_chars;
 
-fn status_color(status: &SessionStatus) -> Color {
+fn status_color(status: &VisualStatus) -> Color {
     match status {
-        SessionStatus::Idle => Color::Green,
-        SessionStatus::Running => Color::Red,
-        SessionStatus::Exited => Color::Yellow,
+        VisualStatus::Idle => Color::Green,
+        VisualStatus::Running(_) => Color::Red,
+        VisualStatus::Exited => Color::Yellow,
+        VisualStatus::Booting => Color::Gray,
     }
 }
 
@@ -73,12 +74,17 @@ pub fn draw_sidebar(frame: &mut Frame, app: &UiApp, area: Rect) {
     let mut current_group: Option<u8> = None;
 
     for (i, session) in app.snapshot.sessions.iter().enumerate() {
-        let group = session.status.sort_order();
+        let group = session.sort_order();
+        let visual_status = session.visual_status();
         if current_group != Some(group) {
             current_group = Some(group);
             // Build header: "── ● Running ──────"
-            let label = format!(" {} ", session.status);
-            let dot_color = status_color(&session.status);
+            let label = match &visual_status {
+                VisualStatus::Idle => " Idle ".to_string(),
+                VisualStatus::Running(_) | VisualStatus::Booting => " Running ".to_string(),
+                VisualStatus::Exited => " Exited ".to_string(),
+            };
+            let dot_color = status_color(&visual_status);
             let dashes_left = "── ";
             let dashes_right_len = inner_width.saturating_sub(dashes_left.len() + 2 + label.len()); // 2 for "● "
             let dashes_right: String = "─".repeat(dashes_right_len);
@@ -105,7 +111,7 @@ pub fn draw_sidebar(frame: &mut Frame, app: &UiApp, area: Rect) {
         };
         let mut spans = vec![
             Span::styled(marker, name_style),
-            Span::styled("● ", Style::default().fg(status_color(&session.status))),
+            Span::styled("● ", Style::default().fg(status_color(&visual_status))),
             Span::styled(
                 format!("{} [{}]", session.name, session.agent_type),
                 name_style,
@@ -169,13 +175,14 @@ pub fn draw_sidebar(frame: &mut Frame, app: &UiApp, area: Rect) {
 
 #[cfg(test)]
 mod tests {
-    use crate::session::SessionStatus;
+
     use ratatui::style::Color;
+    use crate::session::VisualStatus;
 
     #[test]
     fn status_color_maps_correctly() {
-        assert_eq!(super::status_color(&SessionStatus::Idle), Color::Green);
-        assert_eq!(super::status_color(&SessionStatus::Running), Color::Red);
-        assert_eq!(super::status_color(&SessionStatus::Exited), Color::Yellow);
+        assert_eq!(super::status_color(&VisualStatus::Idle), Color::Green);
+        assert_eq!(super::status_color(&VisualStatus::Running("".to_string())), Color::Red);
+        assert_eq!(super::status_color(&VisualStatus::Exited), Color::Yellow);
     }
 }

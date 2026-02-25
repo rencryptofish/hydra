@@ -3,18 +3,26 @@ use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::sync::Arc;
 
 use hydra::app::{StateSnapshot, UiApp};
-use hydra::session::{AgentType, Session, SessionStatus};
+use hydra::session::{AgentType, Session, VisualStatus, ProcessState, AgentState};
 use hydra::ui;
 use ratatui::layout::Rect;
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-fn make_session(name: &str, status: SessionStatus) -> Session {
+fn make_session(name: &str, visual_status: VisualStatus) -> Session {
+    let (process_state, agent_state) = match visual_status {
+        VisualStatus::Idle => (ProcessState::Alive, AgentState::Idle),
+        VisualStatus::Running(_s) => (ProcessState::Alive, AgentState::Thinking),
+        VisualStatus::Exited => (ProcessState::Exited { exit_code: None, reason: None }, AgentState::Idle),
+        VisualStatus::Booting => (ProcessState::Booting, AgentState::Idle),
+    };
     Session {
         name: name.to_string(),
         tmux_name: format!("hydra-bench-{name}"),
         agent_type: AgentType::Claude,
-        status,
+        process_state,
+        agent_state,
+        last_activity_at: std::time::Instant::now(),
         task_elapsed: None,
         _alive: true,
     }
@@ -35,9 +43,9 @@ fn make_app_with_n_sessions(n: usize) -> UiApp {
                 format!("agent-{}", i + 1)
             };
             let status = match i % 3 {
-                0 => SessionStatus::Idle,
-                1 => SessionStatus::Running,
-                _ => SessionStatus::Exited,
+                0 => VisualStatus::Idle,
+                1 => VisualStatus::Running("Thinking".to_string()),
+                _ => VisualStatus::Exited,
             };
             make_session(&name, status)
         })

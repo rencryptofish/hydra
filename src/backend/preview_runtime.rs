@@ -268,7 +268,7 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
 
-    use crate::session::{AgentType, SessionStatus};
+    use crate::session::{AgentType, AgentState, ProcessState, Session};
 
     struct SequenceManager {
         captures: Mutex<VecDeque<String>>,
@@ -337,7 +337,9 @@ mod tests {
             name: "alpha".to_string(),
             tmux_name: tmux_name.to_string(),
             agent_type: AgentType::Codex,
-            status: SessionStatus::Idle,
+            process_state: ProcessState::Alive,
+            agent_state: AgentState::Idle,
+            last_activity_at: std::time::Instant::now(),
             task_elapsed: None,
             _alive: true,
         }

@@ -7,7 +7,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::agent::provider_for;
 use crate::app::{BackendCommand, PreviewUpdate, StateSnapshot};
-use crate::session::{AgentType, Session, SessionStatus};
+use crate::session::{AgentType, Session, VisualStatus, ProcessState, AgentState};
 use crate::tmux::SessionManager;
 use crate::tmux_control::{TmuxControlConnection, TmuxNotification};
 
@@ -152,9 +152,10 @@ impl Backend {
                     let mut changed = false;
                     for session in &mut self.sessions {
                         if session.tmux_name == session_name
-                            && session.status != SessionStatus::Running
+                            && session.visual_status() != VisualStatus::Running("Thinking".to_string())
                         {
-                            session.status = SessionStatus::Running;
+                            session.process_state = ProcessState::Alive;
+                            session.agent_state = AgentState::Thinking;
                             changed = true;
                             break;
                         }
@@ -173,9 +174,9 @@ impl Backend {
                     let mut changed = false;
                     for session in &mut self.sessions {
                         if session.tmux_name == session_name
-                            && session.status != SessionStatus::Exited
+                            && session.process_state != (ProcessState::Exited { exit_code: None, reason: None })
                         {
-                            session.status = SessionStatus::Exited;
+                            session.process_state = ProcessState::Exited { exit_code: None, reason: None };
                             changed = true;
                             break;
                         }
@@ -374,10 +375,10 @@ impl Backend {
         match result {
             Ok(mut sessions) => {
                 let now = Instant::now();
-                let prev_statuses: HashMap<String, SessionStatus> = self
+                let prev_statuses: HashMap<String, VisualStatus> = self
                     .sessions
                     .iter()
-                    .map(|s| (s.tmux_name.clone(), s.status.clone()))
+                    .map(|s| (s.tmux_name.clone(), s.visual_status()))
                     .collect();
 
                 let pane_status = self.manager.batch_pane_status().await;
@@ -392,9 +393,8 @@ impl Backend {
                 );
 
                 sessions.sort_by(|a, b| {
-                    a.status
-                        .sort_order()
-                        .cmp(&b.status.sort_order())
+                    a.sort_order()
+                        .cmp(&b.sort_order())
                         .then(a.name.cmp(&b.name))
                 });
 
@@ -467,7 +467,7 @@ fn sessions_changed(previous: &[Session], current: &[Session]) -> bool {
             old_session.tmux_name != new_session.tmux_name
                 || old_session.name != new_session.name
                 || old_session.agent_type != new_session.agent_type
-                || old_session.status != new_session.status
+                || old_session.visual_status() != new_session.visual_status()
                 || old_session.task_elapsed != new_session.task_elapsed
         })
 }

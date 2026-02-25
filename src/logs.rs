@@ -202,7 +202,14 @@ pub fn update_session_stats_from_path_and_last_message(
     if file.read_to_end(&mut buf).is_err() {
         return None;
     }
-    let text = String::from_utf8_lossy(&buf);
+
+    let last_newline = buf.iter().rposition(|&b| b == b'\n');
+    let (valid_buf, new_offset) = match last_newline {
+        Some(idx) => (&buf[..idx], stats.read_offset + idx as u64 + 1),
+        None => return None, // Wait for a complete line
+    };
+
+    let text = String::from_utf8_lossy(valid_buf);
     let mut last_text: Option<String> = None;
 
     for line in text.lines() {
@@ -318,7 +325,7 @@ pub fn update_session_stats_from_path_and_last_message(
         }
     }
 
-    stats.read_offset = file_len;
+    stats.read_offset = new_offset;
     last_text
 }
 
@@ -1538,7 +1545,14 @@ pub fn parse_conversation_entries(
     if file.read_to_end(&mut buf).is_err() {
         return (vec![], read_offset);
     }
-    let text = String::from_utf8_lossy(&buf);
+
+    let last_newline = buf.iter().rposition(|&b| b == b'\n');
+    let (valid_buf, new_offset) = match last_newline {
+        Some(idx) => (&buf[..idx], read_offset + idx as u64 + 1),
+        None => return (vec![], read_offset),
+    };
+
+    let text = String::from_utf8_lossy(valid_buf);
     let mut entries = Vec::new();
 
     for line in text.lines() {
@@ -1682,7 +1696,7 @@ pub fn parse_conversation_entries(
         }
     }
 
-    (entries, file_len)
+    (entries, new_offset)
 }
 
 /// Build the JSONL log file path for a Claude Code session.
@@ -1772,7 +1786,14 @@ pub fn parse_codex_conversation_entries(
     if file.read_to_end(&mut buf).is_err() {
         return (vec![], read_offset);
     }
-    let text = String::from_utf8_lossy(&buf);
+
+    let last_newline = buf.iter().rposition(|&b| b == b'\n');
+    let (valid_buf, new_offset) = match last_newline {
+        Some(idx) => (&buf[..idx], read_offset + idx as u64 + 1),
+        None => return (vec![], read_offset),
+    };
+
+    let text = String::from_utf8_lossy(valid_buf);
     let mut entries = Vec::new();
 
     for line in text.lines() {
@@ -1838,7 +1859,7 @@ pub fn parse_codex_conversation_entries(
         // token_count, task_started, task_complete, function_call_output)
     }
 
-    (entries, file_len)
+    (entries, new_offset)
 }
 
 // ── Gemini conversation support ──────────────────────────────────────

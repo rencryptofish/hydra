@@ -7,7 +7,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, oneshot};
 
-use crate::session::{parse_session_name, AgentType, Session, SessionStatus};
+use crate::session::{parse_session_name, AgentType, Session};
 use crate::tmux::SessionManager;
 
 /// Timeout for control mode command responses.
@@ -571,16 +571,18 @@ impl SessionManager for ControlModeSessionManager {
         let mut sessions = Vec::with_capacity(parsed.len());
         for (name, tmux_name, agent_type) in parsed {
             let dead = self.is_pane_dead(&tmux_name).await;
-            let status = if dead {
-                SessionStatus::Exited
+            let process_state = if dead {
+                crate::session::ProcessState::Exited { exit_code: None, reason: None }
             } else {
-                SessionStatus::Idle
+                crate::session::ProcessState::Alive
             };
             sessions.push(Session {
                 name,
                 tmux_name,
                 agent_type,
-                status,
+                process_state,
+                agent_state: crate::session::AgentState::Idle,
+                last_activity_at: std::time::Instant::now(),
                 task_elapsed: None,
                 _alive: true,
             });

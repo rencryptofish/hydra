@@ -48,32 +48,32 @@ impl std::str::FromStr for AgentType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum SessionStatus {
-    Running,
+use std::time::Instant;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessState {
+    Booting,
+    Alive,
+    Exited {
+        exit_code: Option<i32>,
+        reason: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentState {
     Idle,
+    Thinking,
+    ExecutingTool(String),
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VisualStatus {
+    Idle,
+    Running(String),
     Exited,
-}
-
-impl SessionStatus {
-    /// Sort priority: Idle (needs input) first, then Running, then Exited.
-    pub fn sort_order(&self) -> u8 {
-        match self {
-            SessionStatus::Idle => 0,
-            SessionStatus::Running => 1,
-            SessionStatus::Exited => 2,
-        }
-    }
-}
-
-impl fmt::Display for SessionStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SessionStatus::Running => write!(f, "Running"),
-            SessionStatus::Idle => write!(f, "Idle"),
-            SessionStatus::Exited => write!(f, "Exited"),
-        }
-    }
+    Booting,
 }
 
 #[derive(Debug, Clone)]
@@ -81,9 +81,41 @@ pub struct Session {
     pub name: String,
     pub tmux_name: String,
     pub agent_type: AgentType,
-    pub status: SessionStatus,
+    pub process_state: ProcessState,
+    pub agent_state: AgentState,
+    pub last_activity_at: Instant,
     pub task_elapsed: Option<Duration>,
     pub _alive: bool,
+}
+
+impl Session {
+    pub fn visual_status(&self) -> VisualStatus {
+        match &self.process_state {
+            ProcessState::Exited { .. } => VisualStatus::Exited,
+            ProcessState::Booting => VisualStatus::Booting,
+            ProcessState::Alive => match &self.agent_state {
+                AgentState::Idle => VisualStatus::Idle,
+                AgentState::Thinking => VisualStatus::Running("Thinking".to_string()),
+                AgentState::ExecutingTool(t) => VisualStatus::Running(format!("Running {}", t)),
+                AgentState::Unknown => {
+                    if self.last_activity_at.elapsed() < Duration::from_secs(5) {
+                        VisualStatus::Running("Running".to_string())
+                    } else {
+                        VisualStatus::Idle
+                    }
+                }
+            }
+        }
+    }
+    
+    pub fn sort_order(&self) -> u8 {
+        match self.visual_status() {
+            VisualStatus::Idle => 0,
+            VisualStatus::Running(_) => 1,
+            VisualStatus::Booting => 1,
+            VisualStatus::Exited => 2,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -507,34 +539,84 @@ mod tests {
 
     #[test]
     fn sort_order_idle_is_lowest() {
-        assert_eq!(SessionStatus::Idle.sort_order(), 0);
+        let session = Session {
+            name: "test".to_string(),
+            tmux_name: "test".to_string(),
+            agent_type: AgentType::Claude,
+            process_state: ProcessState::Alive,
+            agent_state: AgentState::Idle,
+            last_activity_at: std::time::Instant::now(),
+            task_elapsed: None,
+            _alive: true,
+        };
+        assert_eq!(session.sort_order(), 0);
     }
 
     #[test]
     fn sort_order_running_is_middle() {
-        assert_eq!(SessionStatus::Running.sort_order(), 1);
+        let session = Session {
+            name: "test".to_string(),
+            tmux_name: "test".to_string(),
+            agent_type: AgentType::Claude,
+            process_state: ProcessState::Alive,
+            agent_state: AgentState::Thinking,
+            last_activity_at: std::time::Instant::now(),
+            task_elapsed: None,
+            _alive: true,
+        };
+        assert_eq!(session.sort_order(), 1);
     }
 
     #[test]
     fn sort_order_exited_is_highest() {
-        assert_eq!(SessionStatus::Exited.sort_order(), 2);
+        let session = Session {
+            name: "test".to_string(),
+            tmux_name: "test".to_string(),
+            agent_type: AgentType::Claude,
+            process_state: ProcessState::Exited { exit_code: None, reason: None },
+            agent_state: AgentState::Idle,
+            last_activity_at: std::time::Instant::now(),
+            task_elapsed: None,
+            _alive: true,
+        };
+        assert_eq!(session.sort_order(), 2);
     }
 
     #[test]
     fn sort_order_produces_correct_ordering() {
-        let mut statuses = vec![
-            SessionStatus::Exited,
-            SessionStatus::Running,
-            SessionStatus::Idle,
-        ];
+        let s1 = Session {
+            name: "a".to_string(),
+            tmux_name: "a".to_string(),
+            agent_type: AgentType::Claude,
+            process_state: ProcessState::Exited { exit_code: None, reason: None },
+            agent_state: AgentState::Idle,
+            last_activity_at: std::time::Instant::now(),
+            task_elapsed: None,
+            _alive: true,
+        };
+        let s2 = Session {
+            name: "b".to_string(),
+            tmux_name: "b".to_string(),
+            agent_type: AgentType::Claude,
+            process_state: ProcessState::Alive,
+            agent_state: AgentState::Thinking,
+            last_activity_at: std::time::Instant::now(),
+            task_elapsed: None,
+            _alive: true,
+        };
+        let s3 = Session {
+            name: "c".to_string(),
+            tmux_name: "c".to_string(),
+            agent_type: AgentType::Claude,
+            process_state: ProcessState::Alive,
+            agent_state: AgentState::Idle,
+            last_activity_at: std::time::Instant::now(),
+            task_elapsed: None,
+            _alive: true,
+        };
+        let mut statuses = vec![&s1, &s2, &s3];
         statuses.sort_by_key(|s| s.sort_order());
-        assert_eq!(
-            statuses,
-            vec![
-                SessionStatus::Idle,
-                SessionStatus::Running,
-                SessionStatus::Exited,
-            ]
-        );
+        let names: Vec<&str> = statuses.into_iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["c", "b", "a"]);
     }
 }

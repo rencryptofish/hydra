@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::process::Command;
 
-use crate::session::{parse_session_name, AgentType, Session, SessionStatus};
+use crate::session::{parse_session_name, AgentType, Session};
 
 /// Default timeout for subprocess calls (2 seconds).
 const CMD_TIMEOUT: Duration = Duration::from_secs(2);
@@ -187,17 +187,18 @@ impl SessionManager for TmuxSessionManager {
                     .and_then(|m| m.get(&tmux_name))
                     .map(|(is_dead, _)| *is_dead)
                     .unwrap_or(false);
-                let status = if dead {
-                    SessionStatus::Exited
+                let process_state = if dead {
+                    crate::session::ProcessState::Exited { exit_code: None, reason: None }
                 } else {
-                    // Default to Idle; Backend upgrades to Running via output/log activity.
-                    SessionStatus::Idle
+                    crate::session::ProcessState::Alive
                 };
                 Session {
                     name,
                     tmux_name,
                     agent_type: agent.unwrap_or(AgentType::Claude),
-                    status,
+                    process_state,
+                    agent_state: crate::session::AgentState::Idle,
+                    last_activity_at: std::time::Instant::now(),
                     task_elapsed: None,
                     _alive: true,
                 }

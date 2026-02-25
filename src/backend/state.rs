@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use crate::agent::provider_for;
 use crate::logs::{ConversationEntry, GlobalStats, SessionStats};
 use crate::models::DiffFile;
-use crate::session::{AgentType, Session, SessionStatus};
+use crate::session::{AgentType, Session, VisualStatus};
 use crate::system::git::get_git_diff_numstat;
 
 /// Per-session conversation buffer parsed from JSONL logs.
@@ -73,10 +73,10 @@ impl OutputDetector {
     }
 
     /// Get the status of a session based on its output history.
-    pub(crate) fn status(&self, session: &str) -> SessionStatus {
+    pub(crate) fn has_recent_output(&self, session: &str) -> bool {
         match self.last_output.get(session) {
-            Some(t) if t.elapsed() < Self::IDLE_THRESHOLD => SessionStatus::Running,
-            _ => SessionStatus::Idle,
+            Some(t) if t.elapsed() < Self::IDLE_THRESHOLD => true,
+            _ => false,
         }
     }
 
@@ -112,8 +112,8 @@ impl TaskTimers {
 
             let log_elapsed = session_stats.get(&name).and_then(|st| st.task_elapsed());
 
-            match session.status {
-                SessionStatus::Running => {
+            match session.visual_status() {
+                VisualStatus::Running(_) => {
                     self.task_starts.entry(name.clone()).or_insert(now);
                     self.task_last_active.insert(name.clone(), now);
                     session.task_elapsed = log_elapsed.or_else(|| {
@@ -121,7 +121,7 @@ impl TaskTimers {
                         Some(now.duration_since(start))
                     });
                 }
-                SessionStatus::Idle => {
+                VisualStatus::Idle | VisualStatus::Booting => {
                     if log_elapsed.is_some() {
                         session.task_elapsed = log_elapsed;
                     } else if let (Some(&start), Some(&last)) = (
@@ -136,7 +136,7 @@ impl TaskTimers {
                         }
                     }
                 }
-                SessionStatus::Exited => {
+                VisualStatus::Exited => {
                     self.task_starts.remove(&name);
                     self.task_last_active.remove(&name);
                 }
@@ -324,10 +324,19 @@ async fn compute_message_refresh(
         // Read last message, update stats, and parse conversation.
         if let Some(log_id) = log_uuids.get(tmux_name).cloned() {
             uuid_retry_cooldowns.remove(tmux_name);
-            let stats = session_stats.entry(tmux_name.clone()).or_default();
+            let mut stats = session_stats.remove(tmux_name).unwrap_or_default();
             let previous_offset = conversation_offsets.remove(tmux_name).unwrap_or(0);
             let conv_offset = if log_path_changed { 0 } else { previous_offset };
-            let update = provider.update_from_log(&log_id, &cwd, conv_offset, stats);
+            
+            let cwd_clone = cwd.clone();
+            let agent_type_clone = agent_type.clone();
+            let (update, stats) = tokio::task::spawn_blocking(move || {
+                let provider = provider_for(&agent_type_clone);
+                let update = provider.update_from_log(&log_id, &cwd_clone, conv_offset, &mut stats);
+                (update, stats)
+            }).await.unwrap();
+
+            session_stats.insert(tmux_name.clone(), stats);
 
             if let Some(msg) = update.last_message {
                 last_messages.insert(tmux_name.clone(), msg);
@@ -343,7 +352,10 @@ async fn compute_message_refresh(
     }
 
     // Refresh machine-wide stats for today.
-    crate::logs::update_global_stats(&mut global_stats);
+    let mut global_stats = tokio::task::spawn_blocking(move || {
+        crate::logs::update_global_stats(&mut global_stats);
+        global_stats
+    }).await.unwrap();
 
     // Refresh per-file git diff stats.
     let diff_files = get_git_diff_numstat(&cwd).await;

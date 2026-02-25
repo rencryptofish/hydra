@@ -89,7 +89,7 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     use crate::app::{Mode, StateSnapshot, UiApp};
-    use crate::session::{AgentType, Session, SessionStatus};
+    use crate::session::{AgentType, AgentState, ProcessState, Session, VisualStatus};
 
     fn make_app() -> UiApp {
         UiApp::new_test()
@@ -101,15 +101,23 @@ mod tests {
     }
 
     fn make_session(name: &str, agent: AgentType) -> Session {
-        make_session_with_status(name, agent, SessionStatus::Idle)
+        make_session_with_status(name, agent, VisualStatus::Idle)
     }
 
-    fn make_session_with_status(name: &str, agent: AgentType, status: SessionStatus) -> Session {
+    fn make_session_with_status(name: &str, agent: AgentType, visual_status: VisualStatus) -> Session {
+        let (process_state, agent_state) = match visual_status {
+            VisualStatus::Idle => (ProcessState::Alive, AgentState::Idle),
+            VisualStatus::Running(_s) => (ProcessState::Alive, AgentState::Thinking),
+            VisualStatus::Exited => (ProcessState::Exited { exit_code: None, reason: None }, AgentState::Idle),
+            VisualStatus::Booting => (ProcessState::Booting, AgentState::Idle),
+        };
         Session {
             name: name.to_string(),
             tmux_name: format!("hydra-testproj-{name}"),
             agent_type: agent,
-            status,
+            process_state,
+            agent_state,
+            last_activity_at: std::time::Instant::now(),
             task_elapsed: None,
             _alive: true,
         }
@@ -237,9 +245,9 @@ mod tests {
 
         let mut app = make_app();
         snap(&mut app).sessions = vec![
-            make_session_with_status("idle-one", AgentType::Claude, SessionStatus::Idle),
-            make_session_with_status("running-one", AgentType::Codex, SessionStatus::Running),
-            make_session_with_status("exited-one", AgentType::Claude, SessionStatus::Exited),
+            make_session_with_status("idle-one", AgentType::Claude, VisualStatus::Idle),
+            make_session_with_status("running-one", AgentType::Codex, VisualStatus::Running("Thinking".to_string())),
+            make_session_with_status("exited-one", AgentType::Claude, VisualStatus::Exited),
         ];
         app.selected = 1;
         app.preview.set_text("running session output".to_string());
@@ -257,7 +265,7 @@ mod tests {
 
         let mut app = make_app();
         let mut session = make_session("worker-1", AgentType::Claude);
-        session.status = SessionStatus::Running;
+        session.agent_state = AgentState::Thinking;
         session.task_elapsed = Some(std::time::Duration::from_secs(125));
         snap(&mut app).sessions = vec![session];
         app.selected = 0;
