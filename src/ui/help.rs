@@ -14,7 +14,9 @@ pub fn draw_help_bar(frame: &mut Frame, app: &UiApp, area: Rect) {
         Mode::Browse => {
             "j/k: nav  PgUp/Dn: scroll  Enter: compose  n: new  d: del  c: copy  q: quit"
         }
-        Mode::Compose => "Enter: send  Shift+Enter: newline  Esc: cancel",
+        Mode::Compose => {
+            "Enter: send  Shift+Enter: newline  Up/Dn: history  Esc: cancel (draft kept)"
+        }
         Mode::NewSessionAgent => "j/k: select agent  Enter: confirm  Esc: cancel",
         Mode::ConfirmDelete => "y: confirm delete  Esc: cancel",
     };

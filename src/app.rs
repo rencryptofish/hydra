@@ -109,6 +109,7 @@ pub struct UiApp {
     compose_target_missing: bool,
     pending_delete: Option<PendingDelete>,
     pub mouse_captured: bool,
+    pub needs_redraw: bool,
     pub diff_tree_cache: RefCell<(Vec<DiffFile>, usize, Vec<ratatui::text::Line<'static>>)>,
 
     // Preview cache (session → latest PreviewUpdate)
@@ -142,6 +143,7 @@ impl UiApp {
             compose_target_missing: false,
             pending_delete: None,
             mouse_captured: true,
+            needs_redraw: true,
             diff_tree_cache: RefCell::new((Vec::new(), 0, Vec::new())),
             preview_cache: HashMap::new(),
             requested_preview: None,
@@ -177,13 +179,19 @@ impl UiApp {
         if self.state_rx.has_changed().unwrap_or(false) {
             let snapshot = self.state_rx.borrow_and_update().clone();
             self.apply_snapshot(snapshot);
+            self.needs_redraw = true;
         }
 
+        let mut got_preview = false;
         while let Ok(update) = self.preview_rx.try_recv() {
             if self.requested_preview.as_deref() == Some(update.tmux_name.as_str()) {
                 self.requested_preview = None;
             }
             self.preview_cache.insert(update.tmux_name.clone(), update);
+            got_preview = true;
+        }
+        if got_preview {
+            self.needs_redraw = true;
         }
 
         self.refresh_preview_from_cache();
@@ -192,6 +200,7 @@ impl UiApp {
         if let Some(set_at) = self.status_message_set_at {
             if set_at.elapsed() > std::time::Duration::from_secs(5) {
                 self.clear_status();
+                self.needs_redraw = true;
             }
         }
     }
@@ -401,6 +410,7 @@ impl UiApp {
 
     /// Handle a key event. Synchronous — sends BackendCommand for I/O.
     pub fn handle_key(&mut self, key: KeyEvent) {
+        self.needs_redraw = true;
         match self.mode {
             Mode::Browse => self.handle_browse_key(key),
             Mode::Compose => self.handle_compose_key(key),
@@ -413,6 +423,7 @@ impl UiApp {
     pub fn handle_paste(&mut self, text: String) {
         if self.mode == Mode::Compose {
             self.compose.insert_text(&text);
+            self.needs_redraw = true;
         }
     }
 
@@ -462,8 +473,24 @@ impl UiApp {
             KeyCode::Delete => self.compose.delete_forward(),
             KeyCode::Left => self.compose.move_left(),
             KeyCode::Right => self.compose.move_right(),
-            KeyCode::Up => self.compose.move_up(),
-            KeyCode::Down => self.compose.move_down(),
+            KeyCode::Up => {
+                // On the first line, Up navigates history instead of moving cursor.
+                if self.compose.cursor_row == 0 {
+                    self.compose.history_prev();
+                } else {
+                    self.compose.move_up();
+                }
+            }
+            KeyCode::Down => {
+                // On the last line while browsing history, Down navigates forward.
+                if self.compose.cursor_row + 1 >= self.compose.lines.len()
+                    && self.compose.history_index.is_some()
+                {
+                    self.compose.history_next();
+                } else {
+                    self.compose.move_down();
+                }
+            }
             KeyCode::Home => self.compose.move_home(),
             KeyCode::End => self.compose.move_end(),
             KeyCode::PageUp => self.preview.scroll_page_up(),
@@ -501,11 +528,14 @@ impl UiApp {
                     key: "Enter".to_string(),
                 });
             }
+            self.compose.reset();
             self.exit_compose();
             return;
         }
 
+        self.compose.push_history(text.clone());
         self.queue_command(BackendCommand::SendCompose { tmux_name, text });
+        self.compose.reset();
         self.exit_compose();
     }
 
@@ -587,7 +617,7 @@ impl UiApp {
             return;
         }
         if let Some(session) = self.snapshot.sessions.get(self.selected) {
-            self.compose.reset();
+            // Preserve draft across enter/exit cycles — only reset on successful send.
             self.compose_target_tmux = Some(session.tmux_name.clone());
             self.compose_target_name = Some(session.name.clone());
             self.compose_target_missing = false;
@@ -597,7 +627,7 @@ impl UiApp {
 
     pub fn exit_compose(&mut self) {
         self.mode = Mode::Browse;
-        self.compose.reset();
+        // Draft is intentionally NOT cleared — preserved for the next enter_compose().
         self.compose_target_tmux = None;
         self.compose_target_name = None;
         self.compose_target_missing = false;
@@ -655,6 +685,7 @@ impl UiApp {
 
     /// Handle mouse events. Synchronous.
     pub fn handle_mouse(&mut self, mouse: MouseEvent, layout: &UiLayout) {
+        self.needs_redraw = true;
         let pos = Position::new(mouse.column, mouse.row);
         let sidebar = layout.sidebar;
         let preview = layout.preview;
@@ -1161,5 +1192,137 @@ mod tests {
             ..StateSnapshot::default()
         });
         assert_eq!(app.status_message.as_deref(), Some("backend msg"));
+    }
+
+    // ── Draft preservation ────────────────────────────────────────────
+
+    #[test]
+    fn esc_preserves_compose_draft() {
+        let (mut app, _cmd_rx) = make_app();
+        app.snapshot_mut().sessions = vec![make_session(AgentType::Claude)];
+        app.enter_compose();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.mode, Mode::Browse);
+        // Draft is preserved
+        assert_eq!(app.compose.text(), "hi");
+
+        // Re-entering compose restores the draft
+        app.enter_compose();
+        assert_eq!(app.compose.text(), "hi");
+    }
+
+    #[test]
+    fn successful_send_clears_compose_draft() {
+        let (mut app, mut cmd_rx) = make_app();
+        app.snapshot_mut().sessions = vec![make_session(AgentType::Claude)];
+        app.enter_compose();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(BackendCommand::SendCompose { .. })
+        ));
+        // Buffer is cleared after successful send
+        assert_eq!(app.compose.text(), "");
+    }
+
+    // ── Prompt history ────────────────────────────────────────────────
+
+    #[test]
+    fn sent_messages_are_added_to_history() {
+        let (mut app, _cmd_rx) = make_app();
+        app.snapshot_mut().sessions = vec![make_session(AgentType::Claude)];
+
+        app.enter_compose();
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        app.enter_compose();
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.compose.history.len(), 2);
+        assert_eq!(app.compose.history[0], "a");
+        assert_eq!(app.compose.history[1], "b");
+    }
+
+    #[test]
+    fn up_arrow_recalls_history_in_empty_compose() {
+        let (mut app, _cmd_rx) = make_app();
+        app.snapshot_mut().sessions = vec![make_session(AgentType::Claude)];
+
+        // Send two messages to build history
+        app.enter_compose();
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        app.enter_compose();
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // Enter compose with empty buffer, press Up
+        app.enter_compose();
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.compose.text(), "b"); // most recent
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.compose.text(), "a"); // older
+
+        // Down returns to "b"
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.compose.text(), "b");
+
+        // Down again returns to empty draft
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.compose.text(), "");
+    }
+
+    #[test]
+    fn history_stashes_and_restores_in_progress_draft() {
+        let (mut app, _cmd_rx) = make_app();
+        app.snapshot_mut().sessions = vec![make_session(AgentType::Claude)];
+
+        // Build history
+        app.enter_compose();
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // Start typing a new message
+        app.enter_compose();
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+
+        // Navigate up into history — draft is stashed
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.compose.text(), "x");
+
+        // Navigate back down — draft is restored
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.compose.text(), "draft");
+    }
+
+    #[test]
+    fn duplicate_history_entries_are_deduplicated() {
+        let (mut app, _cmd_rx) = make_app();
+        app.snapshot_mut().sessions = vec![make_session(AgentType::Claude)];
+
+        for _ in 0..3 {
+            app.enter_compose();
+            app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+
+        assert_eq!(app.compose.history.len(), 1);
     }
 }

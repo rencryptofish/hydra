@@ -25,4 +25,4 @@ expression: output
 │              │║                                                              ║
 │              │║Enter: send | Shift+Enter: newline | Esc: cancel              ║
 └──────────────┘╚══════════════════════════════════════════════════════════════╝
- Enter: send  Shift+Enter: newline  Esc: cancel
+ Enter: send  Shift+Enter: newline  Up/Dn: history  Esc: cancel (draft kept)

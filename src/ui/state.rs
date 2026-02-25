@@ -1,4 +1,8 @@
+use std::collections::VecDeque;
+
 use ratatui::text::Text;
+
+const MAX_HISTORY: usize = 50;
 
 /// State for the compose input area in Compose mode.
 pub struct ComposeState {
@@ -7,6 +11,12 @@ pub struct ComposeState {
     pub(crate) cursor_col: usize,
     /// Remembered column for vertical movement (ghost column).
     pub(crate) desired_col: usize,
+    /// Ring buffer of previously sent prompts (newest last).
+    pub(crate) history: VecDeque<String>,
+    /// Current position in history navigation (None = editing new text).
+    pub(crate) history_index: Option<usize>,
+    /// Stashed in-progress draft when navigating history.
+    pub(crate) history_draft: Option<String>,
 }
 
 impl ComposeState {
@@ -16,6 +26,9 @@ impl ComposeState {
             cursor_row: 0,
             cursor_col: 0,
             desired_col: 0,
+            history: VecDeque::new(),
+            history_index: None,
+            history_draft: None,
         }
     }
 
@@ -24,6 +37,74 @@ impl ComposeState {
         self.cursor_row = 0;
         self.cursor_col = 0;
         self.desired_col = 0;
+        self.history_index = None;
+        self.history_draft = None;
+    }
+
+    /// Record a sent message in the history ring buffer.
+    pub(crate) fn push_history(&mut self, text: String) {
+        // Don't store duplicates of the most recent entry.
+        if self.history.back().map(|s| s.as_str()) == Some(text.as_str()) {
+            return;
+        }
+        self.history.push_back(text);
+        if self.history.len() > MAX_HISTORY {
+            self.history.pop_front();
+        }
+    }
+
+    /// Navigate to the previous (older) history entry.
+    /// Returns true if the buffer changed.
+    pub(crate) fn history_prev(&mut self) -> bool {
+        if self.history.is_empty() {
+            return false;
+        }
+        let new_idx = match self.history_index {
+            None => {
+                // Stash current draft before entering history.
+                self.history_draft = Some(self.text());
+                self.history.len() - 1
+            }
+            Some(0) => return false, // already at oldest
+            Some(idx) => idx - 1,
+        };
+        self.history_index = Some(new_idx);
+        self.load_text(&self.history[new_idx].clone());
+        true
+    }
+
+    /// Navigate to the next (newer) history entry, or back to the draft.
+    /// Returns true if the buffer changed.
+    pub(crate) fn history_next(&mut self) -> bool {
+        let Some(idx) = self.history_index else {
+            return false; // not in history mode
+        };
+        if idx + 1 < self.history.len() {
+            self.history_index = Some(idx + 1);
+            self.load_text(&self.history[idx + 1].clone());
+        } else {
+            // Return to the stashed draft.
+            self.history_index = None;
+            let draft = self.history_draft.take().unwrap_or_default();
+            self.load_text(&draft);
+        }
+        true
+    }
+
+    /// Replace the buffer contents with the given text, placing cursor at end.
+    fn load_text(&mut self, text: &str) {
+        self.lines = if text.is_empty() {
+            vec![String::new()]
+        } else {
+            text.lines().map(String::from).collect()
+        };
+        // If text ends with newline, the last line is empty.
+        if text.ends_with('\n') {
+            self.lines.push(String::new());
+        }
+        self.cursor_row = self.lines.len() - 1;
+        self.cursor_col = self.lines[self.cursor_row].chars().count();
+        self.desired_col = self.cursor_col;
     }
 
     /// Get the full text content of the compose buffer.
