@@ -56,11 +56,7 @@ impl SessionStats {
     pub fn cost_usd(&self) -> f64 {
         let input = self.tokens_in as f64 * CLAUDE_INPUT_USD_PER_MTOK / 1_000_000.0;
         let output = self.tokens_out as f64 * CLAUDE_OUTPUT_USD_PER_MTOK / 1_000_000.0;
-        let cache_read =
-            self.tokens_cache_read as f64 * CLAUDE_CACHE_READ_USD_PER_MTOK / 1_000_000.0;
-        let cache_write =
-            self.tokens_cache_write as f64 * CLAUDE_CACHE_WRITE_USD_PER_MTOK / 1_000_000.0;
-        input + output + cache_read + cache_write
+        input + output
     }
 
     #[cfg(test)]
@@ -330,16 +326,14 @@ const FILE_DISCOVERY_INTERVAL_SECS: i64 = 30;
 
 // Claude Sonnet token pricing (USD per million tokens).
 // Update these when Anthropic changes pricing.
+// Cached tokens (read/write) are not charged to the user.
 const CLAUDE_INPUT_USD_PER_MTOK: f64 = 3.0;
 const CLAUDE_OUTPUT_USD_PER_MTOK: f64 = 15.0;
-const CLAUDE_CACHE_READ_USD_PER_MTOK: f64 = 0.30;
-const CLAUDE_CACHE_WRITE_USD_PER_MTOK: f64 = 3.75;
 
 // Uses OpenAI's published GPT-5 Codex token pricing as an estimate.
 // Update these when OpenAI changes pricing.
 const CODEX_INPUT_USD_PER_MTOK: f64 = 1.25;
 const CODEX_OUTPUT_USD_PER_MTOK: f64 = 10.0;
-const CODEX_CACHE_READ_USD_PER_MTOK: f64 = 0.125;
 
 #[derive(Debug, Clone, Default)]
 struct CodexFileState {
@@ -452,22 +446,14 @@ impl GlobalStats {
         if !self.has_provider_breakdown() {
             let input = self.tokens_in as f64 * CLAUDE_INPUT_USD_PER_MTOK / 1_000_000.0;
             let output = self.tokens_out as f64 * CLAUDE_OUTPUT_USD_PER_MTOK / 1_000_000.0;
-            let cache_read =
-                self.tokens_cache_read as f64 * CLAUDE_CACHE_READ_USD_PER_MTOK / 1_000_000.0;
-            let cache_write =
-                self.tokens_cache_write as f64 * CLAUDE_CACHE_WRITE_USD_PER_MTOK / 1_000_000.0;
-            return input + output + cache_read + cache_write;
+            return input + output;
         }
 
         let claude_input = self.claude_tokens_in as f64 * CLAUDE_INPUT_USD_PER_MTOK / 1_000_000.0;
         let claude_output =
             self.claude_tokens_out as f64 * CLAUDE_OUTPUT_USD_PER_MTOK / 1_000_000.0;
-        let claude_cache_read =
-            self.claude_tokens_cache_read as f64 * CLAUDE_CACHE_READ_USD_PER_MTOK / 1_000_000.0;
-        let claude_cache_write =
-            self.claude_tokens_cache_write as f64 * CLAUDE_CACHE_WRITE_USD_PER_MTOK / 1_000_000.0;
 
-        claude_input + claude_output + claude_cache_read + claude_cache_write
+        claude_input + claude_output
     }
 
     pub fn codex_cost_usd(&self) -> f64 {
@@ -475,16 +461,10 @@ impl GlobalStats {
             return 0.0;
         }
 
-        let codex_uncached_input_tokens = self
-            .codex_tokens_in
-            .saturating_sub(self.codex_tokens_cache_read);
-        let codex_input =
-            codex_uncached_input_tokens as f64 * CODEX_INPUT_USD_PER_MTOK / 1_000_000.0;
+        let codex_input = self.codex_tokens_in as f64 * CODEX_INPUT_USD_PER_MTOK / 1_000_000.0;
         let codex_output = self.codex_tokens_out as f64 * CODEX_OUTPUT_USD_PER_MTOK / 1_000_000.0;
-        let codex_cache_read =
-            self.codex_tokens_cache_read as f64 * CODEX_CACHE_READ_USD_PER_MTOK / 1_000_000.0;
 
-        codex_input + codex_output + codex_cache_read
+        codex_input + codex_output
     }
 
     pub fn gemini_cost_usd(&self) -> f64 {
@@ -492,21 +472,15 @@ impl GlobalStats {
             return 0.0;
         }
 
-        let gemini_uncached_input = self
-            .gemini_tokens_in
-            .saturating_sub(self.gemini_tokens_cached);
-        let gemini_input = gemini_uncached_input as f64 * GEMINI_INPUT_USD_PER_MTOK / 1_000_000.0;
+        let gemini_input = self.gemini_tokens_in as f64 * GEMINI_INPUT_USD_PER_MTOK / 1_000_000.0;
         let gemini_output =
             self.gemini_tokens_out as f64 * GEMINI_OUTPUT_USD_PER_MTOK / 1_000_000.0;
-        let gemini_cache_read =
-            self.gemini_tokens_cached as f64 * GEMINI_CACHE_READ_USD_PER_MTOK / 1_000_000.0;
 
-        gemini_input + gemini_output + gemini_cache_read
+        gemini_input + gemini_output
     }
 
     /// Estimated cost in USD using provider-specific pricing.
-    /// Claude: Sonnet ($3 in / $15 out / $0.30 cache-read / $3.75 cache-write per MTok).
-    /// Codex: GPT-5 Codex estimate ($1.25 in / $10 out / $0.125 cache-read per MTok).
+    /// Cached tokens are excluded — they are not charged to the user.
     pub fn cost_usd(&self) -> f64 {
         self.claude_cost_usd() + self.codex_cost_usd() + self.gemini_cost_usd()
     }
@@ -1857,7 +1831,6 @@ pub fn parse_codex_conversation_entries(
 // but Vertex AI / paid tier uses these rates.
 const GEMINI_INPUT_USD_PER_MTOK: f64 = 1.25;
 const GEMINI_OUTPUT_USD_PER_MTOK: f64 = 10.0;
-const GEMINI_CACHE_READ_USD_PER_MTOK: f64 = 0.3125;
 
 /// Parse lsof output to find a `.gemini/tmp/` session JSON path.
 pub fn parse_gemini_session_from_lsof(output: &str) -> Option<PathBuf> {
@@ -2636,14 +2609,14 @@ mod tests {
         let stats = SessionStats {
             tokens_in: 1_000_000,        // $3.00
             tokens_out: 100_000,         // $1.50
-            tokens_cache_read: 500_000,  // $0.15
-            tokens_cache_write: 200_000, // $0.75
+            tokens_cache_read: 500_000,  // free
+            tokens_cache_write: 200_000, // free
             ..Default::default()
         };
         let cost = stats.cost_usd();
         assert!(
-            (cost - 5.40).abs() < 0.01,
-            "expected ~$5.40, got ${cost:.2}"
+            (cost - 4.50).abs() < 0.01,
+            "expected ~$4.50, got ${cost:.2}"
         );
     }
 
@@ -3555,9 +3528,10 @@ mod tests {
             ..Default::default()
         };
         let cost = stats.cost_usd();
+        // Cached tokens are free — only input ($3) + output ($1.50)
         assert!(
-            (cost - 5.40).abs() < 0.01,
-            "expected ~$5.40, got ${cost:.2}"
+            (cost - 4.50).abs() < 0.01,
+            "expected ~$4.50, got ${cost:.2}"
         );
     }
 
@@ -3578,14 +3552,15 @@ mod tests {
             ..Default::default()
         };
         let cost = stats.cost_usd();
+        // Cached tokens are free — input ($1.25) + output ($1.00)
         assert!(
-            (cost - 2.025).abs() < 0.01,
-            "expected ~$2.03, got ${cost:.2}"
+            (cost - 2.25).abs() < 0.01,
+            "expected ~$2.25, got ${cost:.2}"
         );
     }
 
     #[test]
-    fn global_stats_codex_cost_saturates_when_cache_exceeds_input() {
+    fn global_stats_codex_cost_ignores_cache_tokens() {
         let stats = GlobalStats {
             codex_tokens_in: 100,
             codex_tokens_out: 0,
@@ -3593,8 +3568,8 @@ mod tests {
             ..Default::default()
         };
         let cost = stats.cost_usd();
-        // Uncached input should saturate at 0, so only cached pricing applies.
-        let expected = 200.0 * CODEX_CACHE_READ_USD_PER_MTOK / 1_000_000.0;
+        // Cached tokens are free — only input (100 * $1.25/M)
+        let expected = 100.0 * CODEX_INPUT_USD_PER_MTOK / 1_000_000.0;
         assert!((cost - expected).abs() < f64::EPSILON);
     }
 
@@ -3607,22 +3582,24 @@ mod tests {
             ..Default::default()
         };
         let cost = stats.cost_usd();
+        // Cached tokens are free — input ($1.25) + output ($1.00)
         assert!(
-            (cost - 2.0625).abs() < 0.01,
-            "expected ~$2.06, got ${cost:.2}"
+            (cost - 2.25).abs() < 0.01,
+            "expected ~$2.25, got ${cost:.2}"
         );
         assert!((stats.gemini_cost_usd() - cost).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn global_stats_gemini_cost_saturates_when_cache_exceeds_input() {
+    fn global_stats_gemini_cost_ignores_cache_tokens() {
         let stats = GlobalStats {
             gemini_tokens_in: 100,
             gemini_tokens_out: 0,
             gemini_tokens_cached: 200,
             ..Default::default()
         };
-        let expected = 200.0 * GEMINI_CACHE_READ_USD_PER_MTOK / 1_000_000.0;
+        // Cached tokens are free — only input (100 * $1.25/M)
+        let expected = 100.0 * GEMINI_INPUT_USD_PER_MTOK / 1_000_000.0;
         assert!((stats.gemini_cost_usd() - expected).abs() < f64::EPSILON);
         assert!((stats.cost_usd() - expected).abs() < f64::EPSILON);
     }
