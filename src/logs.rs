@@ -1900,8 +1900,6 @@ pub fn parse_gemini_session_from_lsof(output: &str) -> Option<PathBuf> {
 /// Find the Gemini chats directory for the given CWD.
 /// Reads ~/.gemini/projects.json to map cwd → project name, then looks
 /// in ~/.gemini/tmp/<project>/chats/.
-#[cfg(test)]
-#[allow(dead_code)]
 fn gemini_chats_dir(cwd: &str) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     let projects_path = PathBuf::from(&home).join(".gemini").join("projects.json");
@@ -1921,8 +1919,6 @@ fn gemini_chats_dir(cwd: &str) -> Option<PathBuf> {
     }
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
 async fn get_process_start_time(pid: u32) -> Option<std::time::SystemTime> {
     let output = tokio::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "lstart="])
@@ -1947,7 +1943,6 @@ async fn get_process_start_time(pid: u32) -> Option<std::time::SystemTime> {
 /// skipping files that are already claimed by other tmux Gemini sessions.
 /// Also ignores files modified before the tmux pane was created (to prevent
 /// new sessions from stealing old session files).
-#[cfg(test)]
 fn parse_gemini_session_start_from_filename(
     path: &std::path::Path,
 ) -> Option<std::time::SystemTime> {
@@ -1963,7 +1958,6 @@ fn parse_gemini_session_start_from_filename(
     Some(std::time::SystemTime::from(dt))
 }
 
-#[cfg(test)]
 fn find_latest_gemini_session(
     chats_dir: &std::path::Path,
     claimed_paths: &HashSet<String>,
@@ -2019,8 +2013,8 @@ fn find_latest_gemini_session(
 /// If no matching open session file is found, return None.
 pub async fn resolve_gemini_session_path(
     tmux_name: &str,
-    _cwd: &str,
-    _claimed_paths: &HashSet<String>,
+    cwd: &str,
+    claimed_paths: &HashSet<String>,
 ) -> Option<String> {
     let pid = get_pane_pid(tmux_name).await?;
     let all_pids = collect_descendant_pids(pid).await;
@@ -2037,6 +2031,13 @@ pub async fn resolve_gemini_session_path(
             if let Some(path) = parse_gemini_session_from_lsof(&stdout) {
                 return Some(path.to_string_lossy().to_string());
             }
+        }
+    }
+
+    if let Some(chats_dir) = gemini_chats_dir(cwd) {
+        let pane_start = get_process_start_time(pid).await;
+        if let Some(path) = find_latest_gemini_session(&chats_dir, claimed_paths, pane_start) {
+            return Some(path.to_string_lossy().to_string());
         }
     }
 
