@@ -327,14 +327,16 @@ async fn compute_message_refresh(
             let mut stats = session_stats.remove(tmux_name).unwrap_or_default();
             let previous_offset = conversation_offsets.remove(tmux_name).unwrap_or(0);
             let conv_offset = if log_path_changed { 0 } else { previous_offset };
-            
+
             let cwd_clone = cwd.clone();
             let agent_type_clone = agent_type.clone();
             let (update, stats) = tokio::task::spawn_blocking(move || {
                 let provider = provider_for(&agent_type_clone);
                 let update = provider.update_from_log(&log_id, &cwd_clone, conv_offset, &mut stats);
                 (update, stats)
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
 
             session_stats.insert(tmux_name.clone(), stats);
 
@@ -355,7 +357,9 @@ async fn compute_message_refresh(
     let mut global_stats = tokio::task::spawn_blocking(move || {
         crate::logs::update_global_stats(&mut global_stats);
         global_stats
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
     // Refresh per-file git diff stats.
     let diff_files = get_git_diff_numstat(&cwd).await;

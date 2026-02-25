@@ -45,7 +45,8 @@ impl SessionRuntime {
                 .unwrap_or(false);
 
             if is_dead {
-                session.process_state = self.apply_exited_debounce(&tmux_name, prev_statuses, session_stats);
+                session.process_state =
+                    self.apply_exited_debounce(&tmux_name, prev_statuses, session_stats);
                 continue;
             }
 
@@ -116,14 +117,20 @@ impl SessionRuntime {
                 .get(tmux_name)
                 .cloned()
                 .unwrap_or(VisualStatus::Idle);
-            
+
             if prev == VisualStatus::Exited {
-                ProcessState::Exited { exit_code: None, reason: None }
+                ProcessState::Exited {
+                    exit_code: None,
+                    reason: None,
+                }
             } else {
                 ProcessState::Alive
             }
         } else {
-            ProcessState::Exited { exit_code: None, reason: None }
+            ProcessState::Exited {
+                exit_code: None,
+                reason: None,
+            }
         }
     }
 }

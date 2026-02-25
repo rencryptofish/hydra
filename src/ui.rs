@@ -89,7 +89,7 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     use crate::app::{Mode, StateSnapshot, UiApp};
-    use crate::session::{AgentType, AgentState, ProcessState, Session, VisualStatus};
+    use crate::session::{AgentState, AgentType, ProcessState, Session, VisualStatus};
 
     fn make_app() -> UiApp {
         UiApp::new_test()
@@ -104,11 +104,21 @@ mod tests {
         make_session_with_status(name, agent, VisualStatus::Idle)
     }
 
-    fn make_session_with_status(name: &str, agent: AgentType, visual_status: VisualStatus) -> Session {
+    fn make_session_with_status(
+        name: &str,
+        agent: AgentType,
+        visual_status: VisualStatus,
+    ) -> Session {
         let (process_state, agent_state) = match visual_status {
             VisualStatus::Idle => (ProcessState::Alive, AgentState::Idle),
             VisualStatus::Running(_s) => (ProcessState::Alive, AgentState::Thinking),
-            VisualStatus::Exited => (ProcessState::Exited { exit_code: None, reason: None }, AgentState::Idle),
+            VisualStatus::Exited => (
+                ProcessState::Exited {
+                    exit_code: None,
+                    reason: None,
+                },
+                AgentState::Idle,
+            ),
             VisualStatus::Booting => (ProcessState::Booting, AgentState::Idle),
         };
         Session {
@@ -246,7 +256,11 @@ mod tests {
         let mut app = make_app();
         snap(&mut app).sessions = vec![
             make_session_with_status("idle-one", AgentType::Claude, VisualStatus::Idle),
-            make_session_with_status("running-one", AgentType::Codex, VisualStatus::Running("Thinking".to_string())),
+            make_session_with_status(
+                "running-one",
+                AgentType::Codex,
+                VisualStatus::Running("Thinking".to_string()),
+            ),
             make_session_with_status("exited-one", AgentType::Claude, VisualStatus::Exited),
         ];
         app.selected = 1;

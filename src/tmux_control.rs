@@ -572,7 +572,10 @@ impl SessionManager for ControlModeSessionManager {
         for (name, tmux_name, agent_type) in parsed {
             let dead = self.is_pane_dead(&tmux_name).await;
             let process_state = if dead {
-                crate::session::ProcessState::Exited { exit_code: None, reason: None }
+                crate::session::ProcessState::Exited {
+                    exit_code: None,
+                    reason: None,
+                }
             } else {
                 crate::session::ProcessState::Alive
             };

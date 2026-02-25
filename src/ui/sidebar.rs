@@ -176,13 +176,16 @@ pub fn draw_sidebar(frame: &mut Frame, app: &UiApp, area: Rect) {
 #[cfg(test)]
 mod tests {
 
-    use ratatui::style::Color;
     use crate::session::VisualStatus;
+    use ratatui::style::Color;
 
     #[test]
     fn status_color_maps_correctly() {
         assert_eq!(super::status_color(&VisualStatus::Idle), Color::Green);
-        assert_eq!(super::status_color(&VisualStatus::Running("".to_string())), Color::Red);
+        assert_eq!(
+            super::status_color(&VisualStatus::Running("".to_string())),
+            Color::Red
+        );
         assert_eq!(super::status_color(&VisualStatus::Exited), Color::Yellow);
     }
 }

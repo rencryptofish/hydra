@@ -104,10 +104,10 @@ impl Session {
                         VisualStatus::Idle
                     }
                 }
-            }
+            },
         }
     }
-    
+
     pub fn sort_order(&self) -> u8 {
         match self.visual_status() {
             VisualStatus::Idle => 0,
@@ -573,7 +573,10 @@ mod tests {
             name: "test".to_string(),
             tmux_name: "test".to_string(),
             agent_type: AgentType::Claude,
-            process_state: ProcessState::Exited { exit_code: None, reason: None },
+            process_state: ProcessState::Exited {
+                exit_code: None,
+                reason: None,
+            },
             agent_state: AgentState::Idle,
             last_activity_at: std::time::Instant::now(),
             task_elapsed: None,
@@ -588,7 +591,10 @@ mod tests {
             name: "a".to_string(),
             tmux_name: "a".to_string(),
             agent_type: AgentType::Claude,
-            process_state: ProcessState::Exited { exit_code: None, reason: None },
+            process_state: ProcessState::Exited {
+                exit_code: None,
+                reason: None,
+            },
             agent_state: AgentState::Idle,
             last_activity_at: std::time::Instant::now(),
             task_elapsed: None,

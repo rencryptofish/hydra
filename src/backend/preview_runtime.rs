@@ -268,7 +268,7 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
 
-    use crate::session::{AgentType, AgentState, ProcessState, Session};
+    use crate::session::{AgentState, AgentType, ProcessState, Session};
 
     struct SequenceManager {
         captures: Mutex<VecDeque<String>>,

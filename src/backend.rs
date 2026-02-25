@@ -7,7 +7,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::agent::provider_for;
 use crate::app::{BackendCommand, PreviewUpdate, StateSnapshot};
-use crate::session::{AgentType, Session, VisualStatus, ProcessState, AgentState};
+use crate::session::{AgentState, AgentType, ProcessState, Session, VisualStatus};
 use crate::tmux::SessionManager;
 use crate::tmux_control::{TmuxControlConnection, TmuxNotification};
 
@@ -152,7 +152,8 @@ impl Backend {
                     let mut changed = false;
                     for session in &mut self.sessions {
                         if session.tmux_name == session_name
-                            && session.visual_status() != VisualStatus::Running("Thinking".to_string())
+                            && session.visual_status()
+                                != VisualStatus::Running("Thinking".to_string())
                         {
                             session.process_state = ProcessState::Alive;
                             session.agent_state = AgentState::Thinking;
@@ -174,9 +175,16 @@ impl Backend {
                     let mut changed = false;
                     for session in &mut self.sessions {
                         if session.tmux_name == session_name
-                            && session.process_state != (ProcessState::Exited { exit_code: None, reason: None })
+                            && session.process_state
+                                != (ProcessState::Exited {
+                                    exit_code: None,
+                                    reason: None,
+                                })
                         {
-                            session.process_state = ProcessState::Exited { exit_code: None, reason: None };
+                            session.process_state = ProcessState::Exited {
+                                exit_code: None,
+                                reason: None,
+                            };
                             changed = true;
                             break;
                         }

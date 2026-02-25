@@ -188,7 +188,10 @@ impl SessionManager for TmuxSessionManager {
                     .map(|(is_dead, _)| *is_dead)
                     .unwrap_or(false);
                 let process_state = if dead {
-                    crate::session::ProcessState::Exited { exit_code: None, reason: None }
+                    crate::session::ProcessState::Exited {
+                        exit_code: None,
+                        reason: None,
+                    }
                 } else {
                     crate::session::ProcessState::Alive
                 };

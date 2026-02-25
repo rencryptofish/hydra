@@ -3,7 +3,7 @@ use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::sync::Arc;
 
 use hydra::app::{StateSnapshot, UiApp};
-use hydra::session::{AgentType, Session, VisualStatus, ProcessState, AgentState};
+use hydra::session::{AgentState, AgentType, ProcessState, Session, VisualStatus};
 use hydra::ui;
 use ratatui::layout::Rect;
 
@@ -13,7 +13,13 @@ fn make_session(name: &str, visual_status: VisualStatus) -> Session {
     let (process_state, agent_state) = match visual_status {
         VisualStatus::Idle => (ProcessState::Alive, AgentState::Idle),
         VisualStatus::Running(_s) => (ProcessState::Alive, AgentState::Thinking),
-        VisualStatus::Exited => (ProcessState::Exited { exit_code: None, reason: None }, AgentState::Idle),
+        VisualStatus::Exited => (
+            ProcessState::Exited {
+                exit_code: None,
+                reason: None,
+            },
+            AgentState::Idle,
+        ),
         VisualStatus::Booting => (ProcessState::Booting, AgentState::Idle),
     };
     Session {

@@ -189,10 +189,12 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
                     if app.mode != Mode::Compose {
                         app.refresh_preview_from_cache();
                     }
+                    app.needs_redraw = true;
                 }
             }
             Some(Event::Paste(text)) => {
                 app.handle_paste(text);
+                app.needs_redraw = true;
             }
             Some(Event::Mouse(mouse)) => {
                 if !matches!(mouse.kind, MouseEventKind::Moved) {
@@ -200,6 +202,7 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
                     let frame_area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
                     let layout = ui::compute_layout(frame_area);
                     app.handle_mouse(mouse, &layout);
+                    app.needs_redraw = true;
                 }
             }
             Some(Event::Tick) => {
