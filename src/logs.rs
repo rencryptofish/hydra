@@ -1939,6 +1939,11 @@ async fn get_process_start_time(pid: u32) -> Option<std::time::SystemTime> {
     if lstart_str.is_empty() {
         return None;
     }
+    
+    // Fix for single-digit days: `ps` pads with an extra space (e.g., "Feb  5"),
+    // which breaks chrono's exact space matching.
+    let lstart_str = lstart_str.replace("  ", " ");
+
     // Format: "Tue Feb 24 12:25:04 2026"
     // Note: timezone is local. chrono::NaiveDateTime::parse_from_str
     if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(&lstart_str, "%a %b %e %H:%M:%S %Y") {
@@ -1974,7 +1979,10 @@ fn find_latest_gemini_session(
     pane_start_time: Option<std::time::SystemTime>,
 ) -> Option<PathBuf> {
     let entries = std::fs::read_dir(chats_dir).ok()?;
-    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+    // Track both a creation-time match (strong) and an mtime match (fallback).
+    // Files created within 120s of pane start almost certainly belong to this pane.
+    let mut best_by_creation: Option<(PathBuf, std::time::Duration)> = None;
+    let mut best_by_mtime: Option<(PathBuf, std::time::SystemTime)> = None;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -2002,20 +2010,44 @@ fn find_latest_gemini_session(
 
                     // Ignore session files that started before the pane existed.
                     // This avoids binding new tmux sessions to unrelated older chats.
+                    // Use a 65-second grace for filename timestamps because they
+                    // only have minute precision (T15-59 could mean 15:59:00–15:59:59).
                     if let Some(file_start_time) = parse_gemini_session_start_from_filename(&path) {
-                        if file_start_time < threshold {
+                        let filename_threshold = start_time
+                            .checked_sub(std::time::Duration::from_secs(65))
+                            .unwrap_or(start_time);
+                        if file_start_time < filename_threshold {
                             continue;
+                        }
+                    }
+
+                    // Check file creation time (birthtime on macOS) for precise matching.
+                    // Files created within 120s of pane start are a strong match —
+                    // the Gemini CLI creates its session file shortly after launch.
+                    if let Ok(created) = meta.created() {
+                        if let Ok(diff) = created.duration_since(start_time) {
+                            if diff.as_secs() < 120 {
+                                if best_by_creation
+                                    .as_ref()
+                                    .is_none_or(|(_, d)| diff < *d)
+                                {
+                                    best_by_creation = Some((path.clone(), diff));
+                                }
+                            }
                         }
                     }
                 }
 
-                if best.as_ref().is_none_or(|(_, t)| modified > *t) {
-                    best = Some((path, modified));
+                if best_by_mtime.as_ref().is_none_or(|(_, t)| modified > *t) {
+                    best_by_mtime = Some((path, modified));
                 }
             }
         }
     }
-    best.map(|(p, _)| p)
+    // Prefer creation-time match (precise) over mtime match (heuristic).
+    best_by_creation
+        .map(|(p, _)| p)
+        .or(best_by_mtime.map(|(p, _)| p))
 }
 
 /// Resolve the Gemini session JSON file path for a tmux session.
@@ -6030,6 +6062,39 @@ mod tests {
             Some(std::time::SystemTime::from(now)),
         );
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn find_latest_gemini_session_accepts_same_minute_file() {
+        // Gemini filenames have minute precision: T15-59 means 15:59:00 UTC.
+        // A pane started at 15:59:37 should still match a file from T15-59,
+        // even though the parsed timestamp (15:59:00) is 37 seconds before
+        // the pane start. The 65s grace for filename timestamps covers this.
+        let dir = tempfile::tempdir().unwrap();
+        let chats_dir = dir.path().join("chats");
+        std::fs::create_dir_all(&chats_dir).unwrap();
+
+        // Use a fixed filename — T15-59 parses as 15:59:00 UTC
+        let session_file = chats_dir.join("session-2026-02-25T15-59-abc123.json");
+        std::fs::write(&session_file, "{}").unwrap();
+        // File mtime is `now` (just written) — always passes the mtime check.
+
+        // Pane started at 15:59:37 UTC — 37 seconds after the filename timestamp
+        let pane_start = chrono::NaiveDate::from_ymd_opt(2026, 2, 25)
+            .unwrap()
+            .and_hms_opt(15, 59, 37)
+            .unwrap();
+        let pane_start_utc =
+            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(pane_start, chrono::Utc);
+
+        let claimed = HashSet::new();
+        let resolved = find_latest_gemini_session(
+            &chats_dir,
+            &claimed,
+            Some(std::time::SystemTime::from(pane_start_utc)),
+        );
+        assert!(resolved.is_some(), "same-minute file should be accepted");
+        assert_eq!(resolved.unwrap(), session_file);
     }
 
     #[test]

@@ -260,6 +260,13 @@ async fn compute_message_refresh(
     let mut new_conversation_offsets: HashMap<String, u64> = HashMap::new();
     let mut conversation_replace = HashSet::new();
 
+    // Sort sessions reverse-alphabetically so newer Gemini sessions resolve first.
+    // NATO names (alpha→zulu) are assigned in creation order, so reverse-alpha ≈
+    // newest-first. This prevents older Gemini sessions from claiming files that
+    // belong to newer sessions (newer sessions have tighter filename filters).
+    let mut sessions = sessions.to_vec();
+    sessions.sort_by(|(a, _), (b, _)| b.cmp(a));
+
     for (tmux_name, agent_type) in &sessions {
         let provider = provider_for(agent_type);
         let cached_log_id = log_uuids.get(tmux_name).cloned();
