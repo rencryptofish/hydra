@@ -217,8 +217,9 @@ impl Backend {
                     self.set_status(format!("Failed to send message: {e}"));
                     self.send_snapshot();
                 } else {
-                    // In subprocess mode there are no output notifications.
-                    // Mark dirty so preview refreshes after user sends input.
+                    // Inject the user message immediately to prevent the UI from
+                    // falling back to raw pane capture before the next log poll.
+                    self.message_runtime.inject_user_message(&tmux_name, text);
                     self.preview_runtime.mark_dirty(&tmux_name);
                 }
             }

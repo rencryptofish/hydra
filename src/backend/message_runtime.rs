@@ -57,6 +57,14 @@ impl MessageRuntime {
             .collect()
     }
 
+    pub(crate) fn inject_user_message(&mut self, tmux_name: &str, text: String) {
+        let buf = self
+            .conversations
+            .entry(tmux_name.to_string())
+            .or_insert_with(ConversationBuffer::new);
+        buf.extend(vec![ConversationEntry::UserMessage { text }]);
+    }
+
     pub(crate) fn tick(
         &mut self,
         sessions: &[(String, AgentType)],
