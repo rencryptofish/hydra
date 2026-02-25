@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture, KeyEventKind, MouseEventKind},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyEventKind, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -122,7 +125,12 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let term_backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(term_backend)?;
 
@@ -183,6 +191,9 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
                     }
                 }
             }
+            Some(Event::Paste(text)) => {
+                app.handle_paste(text);
+            }
             Some(Event::Mouse(mouse)) => {
                 if !matches!(mouse.kind, MouseEventKind::Moved) {
                     let size = terminal.size()?;
@@ -218,7 +229,8 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
 

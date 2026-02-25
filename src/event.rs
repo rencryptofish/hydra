@@ -11,6 +11,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 2048;
 pub enum Event {
     Key(KeyEvent),
     Mouse(MouseEvent),
+    Paste(String),
     Tick,
     Resize,
 }
@@ -55,6 +56,11 @@ impl EventHandler {
                             }
                             Some(Ok(CrosstermEvent::Mouse(mouse))) => {
                                 if tx.send(Event::Mouse(mouse)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Some(Ok(CrosstermEvent::Paste(text))) => {
+                                if tx.send(Event::Paste(text)).await.is_err() {
                                     break;
                                 }
                             }
