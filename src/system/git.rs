@@ -31,10 +31,21 @@ const MAX_DIFF_FILES: usize = 200;
 
 /// Get per-file git diff stats for the working tree, including untracked files.
 pub(crate) async fn get_git_diff_numstat(cwd: &str) -> Vec<DiffFile> {
+    // Determine the diff target: HEAD if it exists, otherwise the empty tree hash.
+    let target = match tokio::process::Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => "HEAD".to_string(),
+        _ => "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string(),
+    };
+
     let git_future = async {
         tokio::join!(
             tokio::process::Command::new("git")
-                .args(["diff", "--numstat"])
+                .args(["diff", &target, "--numstat"])
                 .current_dir(cwd)
                 .output(),
             tokio::process::Command::new("git")

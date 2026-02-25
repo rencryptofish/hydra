@@ -85,28 +85,82 @@ impl PreviewRuntime {
             MAX_LIVE_CAPTURES_PER_TICK_SUBPROCESS_MODE
         };
 
+        // Phase 1: Classify candidates into already-resolved (conversation/cache)
+        // vs needing a live tmux capture. This lets us batch the I/O.
+        let mut resolved: Vec<PreviewUpdate> = Vec::new();
+        let mut to_capture: Vec<(String, bool)> = Vec::new(); // (tmux_name, wants_scrollback)
+
         for candidate in candidates {
             let was_dirty = self.dirty_preview_sessions.remove(&candidate.tmux_name);
             let allow_live_capture = candidate.wants_scrollback
                 || candidate.requested
                 || (was_dirty && take_budget(&mut live_capture_budget))
-                // In subprocess mode there are no output notifications, so we
-                // refresh one pane per tick even when cached.
                 || (!control_mode && take_budget(&mut live_capture_budget));
 
-            let Some(update) = self
-                .resolve_preview(
-                    manager,
-                    conversations,
-                    &candidate.tmux_name,
-                    candidate.wants_scrollback,
-                    allow_live_capture,
-                )
-                .await
-            else {
+            if candidate.wants_scrollback {
+                to_capture.push((candidate.tmux_name, true));
                 continue;
-            };
+            }
 
+            if let Some(update) =
+                Self::preview_from_conversation(conversations, &candidate.tmux_name)
+            {
+                resolved.push(update);
+                continue;
+            }
+
+            if allow_live_capture {
+                to_capture.push((candidate.tmux_name, false));
+                continue;
+            }
+
+            if let Some(content) = self.preview_capture_cache.get(&candidate.tmux_name) {
+                resolved.push(Self::build_preview_from_content(
+                    candidate.tmux_name,
+                    content.clone(),
+                    false,
+                ));
+            }
+        }
+
+        // Phase 2: Execute live captures concurrently.
+        if !to_capture.is_empty() {
+            let capture_futures: Vec<_> = to_capture
+                .into_iter()
+                .map(|(tmux_name, wants_scrollback)| async move {
+                    if wants_scrollback {
+                        let content = manager
+                            .capture_pane_scrollback(&tmux_name)
+                            .await
+                            .unwrap_or_else(|_| "[unable to capture pane]".to_string());
+                        (tmux_name, content, true)
+                    } else {
+                        let content = manager
+                            .capture_pane(&tmux_name)
+                            .await
+                            .unwrap_or_else(|_| "[unable to capture pane]".to_string());
+                        (tmux_name, content, false)
+                    }
+                })
+                .collect();
+
+            for (tmux_name, content, has_scrollback) in
+                futures::future::join_all(capture_futures).await
+            {
+                if !has_scrollback {
+                    self.preview_capture_cache
+                        .insert(tmux_name.clone(), content.clone());
+                }
+                resolved.push(Self::build_preview_from_content(
+                    tmux_name,
+                    content,
+                    has_scrollback,
+                ));
+            }
+        }
+
+        // Phase 3: Send all resolved previews to the UI.
+        for update in resolved {
             if preview_tx.try_send(update).is_err() {
                 break;
             }
@@ -167,53 +221,6 @@ impl PreviewRuntime {
         self.round_robin_cursor = (start + visited) % total;
 
         candidates
-    }
-
-    /// Resolve preview content using a single fallback chain:
-    /// 1. conversation entries
-    /// 2. cached pane capture
-    /// 3. live capture-pane (only when allowed)
-    async fn resolve_preview(
-        &mut self,
-        manager: &dyn SessionManager,
-        conversations: &HashMap<String, ConversationBuffer>,
-        tmux_name: &str,
-        wants_scrollback: bool,
-        allow_live_capture: bool,
-    ) -> Option<PreviewUpdate> {
-        if wants_scrollback {
-            let content = manager
-                .capture_pane_scrollback(tmux_name)
-                .await
-                .unwrap_or_else(|_| "[unable to capture pane]".to_string());
-            return Some(Self::build_preview_from_content(
-                tmux_name.to_string(),
-                content,
-                true,
-            ));
-        }
-
-        if let Some(update) = Self::preview_from_conversation(conversations, tmux_name) {
-            return Some(update);
-        }
-
-        if allow_live_capture {
-            let content = manager
-                .capture_pane(tmux_name)
-                .await
-                .unwrap_or_else(|_| "[unable to capture pane]".to_string());
-            self.preview_capture_cache
-                .insert(tmux_name.to_string(), content.clone());
-            return Some(Self::build_preview_from_content(
-                tmux_name.to_string(),
-                content,
-                false,
-            ));
-        }
-
-        self.preview_capture_cache.get(tmux_name).map(|content| {
-            Self::build_preview_from_content(tmux_name.to_string(), content.clone(), false)
-        })
     }
 
     fn preview_from_conversation(

@@ -206,7 +206,9 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
                 // Poll for backend state updates (non-blocking)
                 app.poll_state();
             }
-            Some(Event::Resize) => {}
+            Some(Event::Resize) => {
+                app.needs_redraw = true;
+            }
             None => break,
         }
 
@@ -220,8 +222,11 @@ async fn run_tui(project_id: String, cwd: String) -> Result<()> {
             prev_mouse_captured = app.mouse_captured;
         }
 
-        // Draw after event handling — user sees result immediately
-        terminal.draw(|frame| ui::draw(frame, &app))?;
+        // Only redraw when state has actually changed
+        if app.needs_redraw {
+            terminal.draw(|frame| ui::draw(frame, &app))?;
+            app.needs_redraw = false;
+        }
     }
 
     // Restore terminal
