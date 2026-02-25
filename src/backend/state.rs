@@ -74,10 +74,7 @@ impl OutputDetector {
 
     /// Get the status of a session based on its output history.
     pub(crate) fn has_recent_output(&self, session: &str) -> bool {
-        match self.last_output.get(session) {
-            Some(t) if t.elapsed() < Self::IDLE_THRESHOLD => true,
-            _ => false,
-        }
+        matches!(self.last_output.get(session), Some(t) if t.elapsed() < Self::IDLE_THRESHOLD)
     }
 
     /// Remove entries for sessions that no longer exist.
@@ -354,7 +351,7 @@ async fn compute_message_refresh(
     }
 
     // Refresh machine-wide stats for today.
-    let mut global_stats = tokio::task::spawn_blocking(move || {
+    let global_stats = tokio::task::spawn_blocking(move || {
         crate::logs::update_global_stats(&mut global_stats);
         global_stats
     })
