@@ -172,15 +172,9 @@ pub fn render_conversation(entries: &VecDeque<ConversationEntry>) -> ratatui::te
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::logs::ConversationEntry;
-    use std::collections::VecDeque;
-
-    #[test]
-    fn conversation_empty() {
-        let entries = VecDeque::new();
-        let text = super::render_conversation(&entries);
-        let rendered: String = text
+macro_rules! assert_text_snapshot {
+    ($text:expr) => {
+        let rendered: String = $text
             .lines
             .iter()
             .map(|l| {
@@ -192,6 +186,19 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         insta::assert_snapshot!(rendered);
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::logs::ConversationEntry;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn conversation_empty() {
+        let entries = VecDeque::new();
+        let text = super::render_conversation(&entries);
+        assert_text_snapshot!(text);
     }
 
     #[test]
@@ -215,18 +222,7 @@ mod tests {
             text: "Done! The bug is fixed.".to_string(),
         });
         let text = super::render_conversation(&entries);
-        let rendered: String = text
-            .lines
-            .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        insta::assert_snapshot!(rendered);
+        assert_text_snapshot!(text);
     }
 
     #[test]
@@ -266,18 +262,7 @@ mod tests {
             text: "Refactoring complete.".to_string(),
         });
         let text = super::render_conversation(&entries);
-        let rendered: String = text
-            .lines
-            .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        insta::assert_snapshot!(rendered);
+        assert_text_snapshot!(text);
     }
 
     #[test]
@@ -295,18 +280,7 @@ mod tests {
             task_id: Some("task-1".to_string()),
         });
         let text = super::render_conversation(&entries);
-        let rendered: String = text
-            .lines
-            .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        insta::assert_snapshot!(rendered);
+        assert_text_snapshot!(text);
     }
 
     #[test]

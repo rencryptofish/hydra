@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
@@ -104,13 +103,16 @@ pub struct UiApp {
     pub should_quit: bool,
     pub preview: PreviewState,
     pub compose: ComposeState,
+    compose_states: HashMap<String, ComposeState>,
     compose_target_tmux: Option<String>,
     compose_target_name: Option<String>,
     compose_target_missing: bool,
     pending_delete: Option<PendingDelete>,
     pub mouse_captured: bool,
     pub needs_redraw: bool,
-    pub diff_tree_cache: RefCell<(Vec<DiffFile>, usize, Vec<ratatui::text::Line<'static>>)>,
+    pub diff_scroll_offset: u16,
+    pub diff_tree_cache: (Vec<DiffFile>, usize, Vec<ratatui::text::Line<'static>>),
+    pub terminal_size: (u16, u16),
 
     // Preview cache (session → latest PreviewUpdate)
     preview_cache: HashMap<String, PreviewUpdate>,
@@ -138,13 +140,16 @@ impl UiApp {
             should_quit: false,
             preview: PreviewState::new(),
             compose: ComposeState::new(),
+            compose_states: HashMap::new(),
             compose_target_tmux: None,
             compose_target_name: None,
             compose_target_missing: false,
             pending_delete: None,
             mouse_captured: true,
             needs_redraw: true,
-            diff_tree_cache: RefCell::new((Vec::new(), 0, Vec::new())),
+            diff_scroll_offset: 0,
+            diff_tree_cache: (Vec::new(), 0, Vec::new()),
+            terminal_size: (80, 24),
             preview_cache: HashMap::new(),
             requested_preview: None,
             cmd_tx,
@@ -287,7 +292,10 @@ impl UiApp {
             self.compose_target_missing = false;
         }
 
-        self.preview_cache.retain(|k, _| live_keys.contains(k));
+        let active_tmux = self.active_preview_tmux();
+        self.preview_cache.retain(|k, _| {
+            live_keys.contains(k) && Some(k.as_str()) == active_tmux.as_deref()
+        });
         if self
             .requested_preview
             .as_ref()
@@ -434,6 +442,12 @@ impl UiApp {
                 self.queue_command(BackendCommand::Quit);
                 self.should_quit = true;
             }
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.diff_scroll_offset = self.diff_scroll_offset.saturating_add(1);
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.diff_scroll_offset = self.diff_scroll_offset.saturating_sub(1);
+            }
             KeyCode::Char('j') | KeyCode::Down => self.select_next(),
             KeyCode::Char('k') | KeyCode::Up => self.select_prev(),
             KeyCode::Enter => self.enter_compose(),
@@ -471,6 +485,12 @@ impl UiApp {
             KeyCode::Enter => self.send_compose_message(),
             KeyCode::Backspace => self.compose.backspace(),
             KeyCode::Delete => self.compose.delete_forward(),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => self.compose.clear_line(),
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => self.compose.delete_word_left(),
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => self.compose.move_word_left(),
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => self.compose.move_word_right(),
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) => self.compose.move_word_left(),
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) => self.compose.move_word_right(),
             KeyCode::Left => self.compose.move_left(),
             KeyCode::Right => self.compose.move_right(),
             KeyCode::Up => {
@@ -516,7 +536,14 @@ impl UiApp {
             return;
         };
 
-        let text = self.compose.text();
+        // Strip trailing newlines — the explicit Enter sent by send_text_enter
+        // is the submit trigger; trailing newlines from paste would cause the
+        // agent to see extra empty lines before the submit Enter arrives.
+        let text = self
+            .compose
+            .text()
+            .trim_end_matches(['\n', '\r'])
+            .to_string();
         let tmux_name = session.tmux_name.clone();
         let is_codex = session.agent_type == AgentType::Codex;
 
@@ -617,8 +644,12 @@ impl UiApp {
             return;
         }
         if let Some(session) = self.snapshot.sessions.get(self.selected) {
-            // Preserve draft across enter/exit cycles — only reset on successful send.
-            self.compose_target_tmux = Some(session.tmux_name.clone());
+            let tmux_name = session.tmux_name.clone();
+            self.compose = self
+                .compose_states
+                .remove(&tmux_name)
+                .unwrap_or_else(ComposeState::new);
+            self.compose_target_tmux = Some(tmux_name);
             self.compose_target_name = Some(session.name.clone());
             self.compose_target_missing = false;
             self.mode = Mode::Compose;
@@ -627,8 +658,11 @@ impl UiApp {
 
     pub fn exit_compose(&mut self) {
         self.mode = Mode::Browse;
-        // Draft is intentionally NOT cleared — preserved for the next enter_compose().
-        self.compose_target_tmux = None;
+        if let Some(tmux_name) = self.compose_target_tmux.take() {
+            let mut state = ComposeState::new();
+            std::mem::swap(&mut self.compose, &mut state);
+            self.compose_states.insert(tmux_name, state);
+        }
         self.compose_target_name = None;
         self.compose_target_missing = false;
     }
@@ -659,6 +693,19 @@ impl UiApp {
             self.pending_delete = None;
         }
         self.mode = Mode::Browse;
+    }
+
+    pub fn update_diff_tree(&mut self) {
+        let area = ratatui::layout::Rect::new(0, 0, self.terminal_size.0, self.terminal_size.1);
+        let layout = crate::ui::compute_layout(area);
+        let sidebar_width = layout.sidebar.width;
+        let width = sidebar_width.saturating_sub(2) as usize;
+        let files = &self.snapshot.diff_files;
+        if self.diff_tree_cache.0 != *files || self.diff_tree_cache.1 != width {
+            self.diff_tree_cache.2 = crate::ui::build_diff_tree_lines(files, width);
+            self.diff_tree_cache.0 = files.clone();
+            self.diff_tree_cache.1 = width;
+        }
     }
 
     pub fn agent_select_next(&mut self) {
@@ -1087,6 +1134,65 @@ mod tests {
         assert_eq!(app.mode, Mode::Browse);
     }
 
+    #[test]
+    fn paste_multiline_then_enter_strips_trailing_newlines() {
+        let (mut app, mut cmd_rx) = make_app();
+        app.snapshot_mut().sessions = vec![make_session(AgentType::Claude)];
+        app.enter_compose();
+
+        // Simulate pasting text that ends with a newline (common from terminals)
+        app.handle_paste("hello\nworld\n".to_string());
+        assert_eq!(app.compose.text(), "hello\nworld\n");
+
+        // Press Enter to submit
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Browse);
+
+        // The sent text should have trailing newlines stripped
+        match cmd_rx.try_recv() {
+            Ok(BackendCommand::SendCompose { text, .. }) => {
+                assert_eq!(text, "hello\nworld");
+            }
+            other => panic!("expected SendCompose, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paste_multiline_no_trailing_newline_sends_as_is() {
+        let (mut app, mut cmd_rx) = make_app();
+        app.snapshot_mut().sessions = vec![make_session(AgentType::Claude)];
+        app.enter_compose();
+
+        app.handle_paste("line1\nline2".to_string());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        match cmd_rx.try_recv() {
+            Ok(BackendCommand::SendCompose { text, .. }) => {
+                assert_eq!(text, "line1\nline2");
+            }
+            other => panic!("expected SendCompose, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paste_only_newlines_treated_as_empty() {
+        let (mut app, mut cmd_rx) = make_app();
+        app.snapshot_mut().sessions = vec![make_session(AgentType::Codex)];
+        app.enter_compose();
+
+        // Paste only newlines — after trimming, text is empty
+        app.handle_paste("\n\n\n".to_string());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // Codex empty submit sends bare Enter key
+        match cmd_rx.try_recv() {
+            Ok(BackendCommand::SendKeys { key, .. }) => {
+                assert_eq!(key, "Enter");
+            }
+            other => panic!("expected SendKeys Enter, got {other:?}"),
+        }
+    }
+
     // ── Feature 4: Compose editing ───────────────────────────────────
 
     #[test]
@@ -1210,7 +1316,7 @@ mod tests {
 
         assert_eq!(app.mode, Mode::Browse);
         // Draft is preserved
-        assert_eq!(app.compose.text(), "hi");
+        assert_eq!(app.compose_states.get("hydra-test-alpha").unwrap().text(), "hi");
 
         // Re-entering compose restores the draft
         app.enter_compose();
@@ -1251,6 +1357,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
+        app.enter_compose();
         assert_eq!(app.compose.history.len(), 2);
         assert_eq!(app.compose.history[0], "a");
         assert_eq!(app.compose.history[1], "b");
@@ -1325,6 +1432,7 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         }
 
+        app.enter_compose();
         assert_eq!(app.compose.history.len(), 1);
     }
 }

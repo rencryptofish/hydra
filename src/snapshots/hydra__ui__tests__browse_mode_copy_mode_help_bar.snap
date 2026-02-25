@@ -2,7 +2,7 @@
 source: src/ui.rs
 expression: output
 ---
-┌ Sessions (1) ┐┌ s1 ──────────────────────────────────────────────────────────┐
+┌ Sessions (1) ┐┌ s1 ────────────────────────────────────────────[ COPY MODE ]─┐
 │── ●  Idle    ││test output                                                   │
 │>> ● s1 [Claud││                                                              │
 │              ││                                                              │

@@ -64,6 +64,24 @@ pub fn draw(frame: &mut Frame, app: &UiApp) {
         Mode::ConfirmDelete => modals::draw_confirm_delete(frame, app),
         _ => {}
     }
+
+    if !app.mouse_captured {
+        let area = frame.area();
+        let copy_mode_area = Rect::new(
+            area.width.saturating_sub(15),
+            0,
+            13,
+            1,
+        );
+        let copy_badge = ratatui::widgets::Paragraph::new(ratatui::text::Span::styled(
+            "[ COPY MODE ]",
+            ratatui::style::Style::default()
+                .fg(ratatui::style::Color::Black)
+                .bg(ratatui::style::Color::Yellow)
+                .add_modifier(ratatui::style::Modifier::BOLD | ratatui::style::Modifier::SLOW_BLINK),
+        ));
+        frame.render_widget(copy_badge, copy_mode_area);
+    }
 }
 
 /// Truncate a string to at most `max` characters (Unicode-safe).
@@ -431,6 +449,7 @@ mod tests {
         }];
         app.selected = 0;
         app.preview.set_text("preview content".to_string());
+        app.update_diff_tree();
 
         terminal.draw(|f| super::draw(f, &app)).unwrap();
         let output = buffer_to_string(&terminal);
@@ -503,6 +522,7 @@ mod tests {
 
         app.selected = 0;
         app.preview.set_text("some preview content".to_string());
+        app.update_diff_tree();
 
         terminal.draw(|f| super::draw(f, &app)).unwrap();
         let output = buffer_to_string(&terminal);

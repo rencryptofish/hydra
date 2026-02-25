@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::app::UiApp;
 use crate::session::{format_duration, VisualStatus};
-use crate::ui::diff::{build_diff_tree_lines, draw_diff_tree};
+use crate::ui::diff::draw_diff_tree;
 use crate::ui::stats::draw_stats;
 use crate::ui::truncate_chars;
 
@@ -27,20 +27,7 @@ pub fn draw_sidebar(frame: &mut Frame, app: &UiApp, area: Rect) {
 
     let stats_height = if has_stats { 5 } else { 0 }; // 3 lines + top/bottom border
 
-    // Update diff tree cache if inputs changed (diff_files or sidebar width).
-    // Avoids recomputing sort + format on every frame (~4+ FPS) when data
-    // only changes every ~5 seconds.
-    let width = area.width.saturating_sub(2) as usize;
-    {
-        let mut cache = app.diff_tree_cache.borrow_mut();
-        if cache.0 != app.snapshot.diff_files || cache.1 != width {
-            cache.2 = build_diff_tree_lines(&app.snapshot.diff_files, width);
-            cache.0 = app.snapshot.diff_files.clone();
-            cache.1 = width;
-        }
-    }
-    let cache = app.diff_tree_cache.borrow();
-    let tree_lines = &cache.2;
+    let tree_lines = &app.diff_tree_cache.2;
 
     let max_tree_rows: u16 = 8;
     let tree_height = if tree_lines.is_empty() {
@@ -169,7 +156,7 @@ pub fn draw_sidebar(frame: &mut Frame, app: &UiApp, area: Rect) {
 
     // Draw diff tree
     if !tree_lines.is_empty() {
-        draw_diff_tree(frame, tree_lines, tree_area);
+        draw_diff_tree(frame, app, tree_lines, tree_area);
     }
 }
 

@@ -254,7 +254,12 @@ fn format_compact_diff(ins: u32, del: u32) -> String {
     }
 }
 
-pub(crate) fn draw_diff_tree(frame: &mut Frame, lines: &[Line], area: Rect) {
+pub(crate) fn draw_diff_tree(
+    frame: &mut Frame,
+    app: &crate::app::UiApp,
+    lines: &[Line],
+    area: Rect,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Changes ")
@@ -263,10 +268,14 @@ pub(crate) fn draw_diff_tree(frame: &mut Frame, lines: &[Line], area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Show the tail that fits (most relevant files at bottom)
     let max_rows = inner.height as usize;
-    let start = lines.len().saturating_sub(max_rows);
-    let visible: Vec<Line> = lines[start..].to_vec();
+    let total_lines = lines.len();
+    let max_offset = total_lines.saturating_sub(max_rows);
+    let capped_offset = (app.diff_scroll_offset as usize).min(max_offset);
+
+    let start = total_lines.saturating_sub(max_rows).saturating_sub(capped_offset);
+    let end = (start + max_rows).min(total_lines);
+    let visible: Vec<Line> = lines[start..end].to_vec();
 
     let paragraph = Paragraph::new(visible);
     frame.render_widget(paragraph, inner);

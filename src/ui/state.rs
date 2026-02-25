@@ -207,6 +207,63 @@ impl ComposeState {
         self.desired_col = self.cursor_col;
     }
 
+    pub(crate) fn move_word_left(&mut self) {
+        let line = &self.lines[self.cursor_row];
+        let chars: Vec<char> = line.chars().collect();
+        let mut idx = self.cursor_col;
+
+        // Skip spaces backward
+        while idx > 0 && chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+        // Skip non-spaces backward
+        while idx > 0 && !chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+
+        self.cursor_col = idx;
+        self.desired_col = self.cursor_col;
+    }
+
+    pub(crate) fn move_word_right(&mut self) {
+        let line = &self.lines[self.cursor_row];
+        let chars: Vec<char> = line.chars().collect();
+        let mut idx = self.cursor_col;
+        let len = chars.len();
+
+        // Skip non-spaces forward
+        while idx < len && !chars[idx].is_whitespace() {
+            idx += 1;
+        }
+        // Skip spaces forward
+        while idx < len && chars[idx].is_whitespace() {
+            idx += 1;
+        }
+
+        self.cursor_col = idx;
+        self.desired_col = self.cursor_col;
+    }
+
+    pub(crate) fn clear_line(&mut self) {
+        let line = &mut self.lines[self.cursor_row];
+        let end_idx = char_to_byte_index(line, self.cursor_col);
+        line.replace_range(..end_idx, "");
+        self.cursor_col = 0;
+        self.desired_col = 0;
+    }
+
+    pub(crate) fn delete_word_left(&mut self) {
+        let end_col = self.cursor_col;
+        self.move_word_left();
+        let start_col = self.cursor_col;
+        if start_col < end_col {
+            let line = &mut self.lines[self.cursor_row];
+            let byte_start = char_to_byte_index(line, start_col);
+            let byte_end = char_to_byte_index(line, end_col);
+            line.replace_range(byte_start..byte_end, "");
+        }
+    }
+
     /// Insert text from a paste event. Handles embedded newlines.
     pub(crate) fn insert_text(&mut self, text: &str) {
         let mut chars = text.chars().peekable();
@@ -433,5 +490,63 @@ mod tests {
         assert_eq!(p.scroll_offset, u16::MAX);
         p.scroll_to_bottom();
         assert_eq!(p.scroll_offset, 0);
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn compose_state_fuzzing(
+            ops in prop::collection::vec(
+                prop_oneof![
+                    any::<char>().prop_map(|c| c.to_string()),
+                    Just("\n".to_string()),
+                    Just("backspace".to_string()),
+                    Just("delete".to_string()),
+                    Just("left".to_string()),
+                    Just("right".to_string()),
+                    Just("up".to_string()),
+                    Just("down".to_string()),
+                    Just("home".to_string()),
+                    Just("end".to_string()),
+                    Just("word_left".to_string()),
+                    Just("word_right".to_string()),
+                    Just("clear_line".to_string()),
+                    Just("delete_word_left".to_string()),
+                ],
+                0..100
+            )
+        ) {
+            let mut c = ComposeState::new();
+            for op in ops {
+                match op.as_str() {
+                    "\n" => c.insert_newline(),
+                    "backspace" => c.backspace(),
+                    "delete" => c.delete_forward(),
+                    "left" => c.move_left(),
+                    "right" => c.move_right(),
+                    "up" => c.move_up(),
+                    "down" => c.move_down(),
+                    "home" => c.move_home(),
+                    "end" => c.move_end(),
+                    "word_left" => c.move_word_left(),
+                    "word_right" => c.move_word_right(),
+                    "clear_line" => c.clear_line(),
+                    "delete_word_left" => c.delete_word_left(),
+                    s => {
+                        let ch = s.chars().next().unwrap();
+                        if !ch.is_control() {
+                            c.insert_char(ch);
+                        }
+                    }
+                }
+                assert!(c.cursor_row < c.lines.len(), "cursor_row out of bounds");
+                assert!(c.cursor_col <= c.lines[c.cursor_row].chars().count(), "cursor_col out of bounds");
+            }
+        }
     }
 }
