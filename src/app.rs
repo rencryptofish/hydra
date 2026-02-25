@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
@@ -19,6 +20,12 @@ pub enum Mode {
     Compose,
     NewSessionAgent,
     ConfirmDelete,
+}
+
+#[derive(Debug, Clone)]
+struct PendingDelete {
+    tmux_name: String,
+    name: String,
 }
 
 /// Command from UI → Backend.
@@ -84,14 +91,11 @@ pub struct PreviewUpdate {
 /// UI-only application state, separated from I/O.
 /// Receives state snapshots from the Backend actor via channels.
 pub struct UiApp {
-    // Snapshot-derived fields (updated via poll_state)
-    pub sessions: Vec<Session>,
-    pub last_messages: HashMap<String, String>,
-    pub session_stats: HashMap<String, SessionStats>,
-    pub global_stats: GlobalStats,
-    pub diff_files: Vec<DiffFile>,
-    pub conversations: HashMap<String, VecDeque<ConversationEntry>>,
+    // Backend state (shared via Arc — no per-field cloning)
+    pub snapshot: Arc<StateSnapshot>,
+    // Local copy of status_message (needs local mutation)
     pub status_message: Option<String>,
+    status_message_set_at: Option<Instant>,
 
     // Local UI state
     pub selected: usize,
@@ -100,6 +104,10 @@ pub struct UiApp {
     pub should_quit: bool,
     pub preview: PreviewState,
     pub compose: ComposeState,
+    compose_target_tmux: Option<String>,
+    compose_target_name: Option<String>,
+    compose_target_missing: bool,
+    pending_delete: Option<PendingDelete>,
     pub mouse_captured: bool,
     pub diff_tree_cache: RefCell<(Vec<DiffFile>, usize, Vec<ratatui::text::Line<'static>>)>,
 
@@ -120,19 +128,19 @@ impl UiApp {
         cmd_tx: tokio::sync::mpsc::Sender<BackendCommand>,
     ) -> Self {
         Self {
-            sessions: Vec::new(),
-            last_messages: HashMap::new(),
-            session_stats: HashMap::new(),
-            global_stats: GlobalStats::default(),
-            diff_files: Vec::new(),
-            conversations: HashMap::new(),
+            snapshot: Arc::new(StateSnapshot::default()),
             status_message: None,
+            status_message_set_at: None,
             selected: 0,
             mode: Mode::Browse,
             agent_selection: 0,
             should_quit: false,
             preview: PreviewState::new(),
             compose: ComposeState::new(),
+            compose_target_tmux: None,
+            compose_target_name: None,
+            compose_target_missing: false,
+            pending_delete: None,
             mouse_captured: true,
             diff_tree_cache: RefCell::new((Vec::new(), 0, Vec::new())),
             preview_cache: HashMap::new(),
@@ -152,11 +160,23 @@ impl UiApp {
         Self::new(state_rx, preview_rx, cmd_tx)
     }
 
+    /// Set a status message with auto-clear timer.
+    fn set_status(&mut self, msg: String) {
+        self.status_message = Some(msg);
+        self.status_message_set_at = Some(Instant::now());
+    }
+
+    /// Clear the status message and its timer.
+    fn clear_status(&mut self) {
+        self.status_message = None;
+        self.status_message_set_at = None;
+    }
+
     /// Poll for new state from the backend. Call once per tick.
     pub fn poll_state(&mut self) {
         if self.state_rx.has_changed().unwrap_or(false) {
             let snapshot = self.state_rx.borrow_and_update().clone();
-            self.apply_full_snapshot(&snapshot);
+            self.apply_snapshot(snapshot);
         }
 
         while let Ok(update) = self.preview_rx.try_recv() {
@@ -167,35 +187,102 @@ impl UiApp {
         }
 
         self.refresh_preview_from_cache();
+
+        // Auto-clear status messages after 5 seconds
+        if let Some(set_at) = self.status_message_set_at {
+            if set_at.elapsed() > std::time::Duration::from_secs(5) {
+                self.clear_status();
+            }
+        }
     }
 
-    fn apply_full_snapshot(&mut self, snapshot: &StateSnapshot) {
-        self.sessions = snapshot.sessions.clone();
-        self.last_messages = snapshot.last_messages.clone();
-        self.session_stats = snapshot.session_stats.clone();
-        self.global_stats = snapshot.global_stats.clone();
-        self.diff_files = snapshot.diff_files.clone();
-        self.conversations = snapshot.conversations.clone();
-        self.status_message = snapshot.status_message.clone();
-        self.prune_non_live_state();
+    fn apply_snapshot(&mut self, snapshot: Arc<StateSnapshot>) {
+        let previous_selected_tmux = self
+            .snapshot
+            .sessions
+            .get(self.selected)
+            .map(|session| session.tmux_name.clone());
+
+        // Only accept backend status when it has a new message.
+        // Let the timer handle clearing (don't let backend's None stomp local messages).
+        if let Some(msg) = &snapshot.status_message {
+            if self.status_message.as_ref() != Some(msg) {
+                self.set_status(msg.clone());
+            }
+        }
+        self.snapshot = snapshot;
+        self.prune_non_live_state(previous_selected_tmux.as_deref());
     }
 
-    fn prune_non_live_state(&mut self) {
-        if self.sessions.is_empty() {
+    fn prune_non_live_state(&mut self, previous_selected_tmux: Option<&str>) {
+        // Own the keys so we don't hold an immutable borrow on self.snapshot
+        // across the mutable self.set_status() calls below.
+        let live_keys: HashSet<String> = self
+            .snapshot
+            .sessions
+            .iter()
+            .map(|s| s.tmux_name.clone())
+            .collect();
+        let session_count = self.snapshot.sessions.len();
+        let preferred_tmux = match self.mode {
+            Mode::Compose => self.compose_target_tmux.as_deref(),
+            Mode::ConfirmDelete => self
+                .pending_delete
+                .as_ref()
+                .map(|target| target.tmux_name.as_str()),
+            Mode::Browse | Mode::NewSessionAgent => previous_selected_tmux,
+        };
+
+        if let Some(tmux_name) = preferred_tmux {
+            if let Some(idx) = self
+                .snapshot
+                .sessions
+                .iter()
+                .position(|session| session.tmux_name == tmux_name)
+            {
+                self.selected = idx;
+            } else if session_count == 0 {
+                self.selected = 0;
+            } else if self.selected >= session_count {
+                self.selected = session_count - 1;
+            }
+        } else if session_count == 0 {
             self.selected = 0;
-        } else if self.selected >= self.sessions.len() {
-            self.selected = self.sessions.len() - 1;
+        } else if self.selected >= session_count {
+            self.selected = session_count - 1;
         }
 
-        let live_keys: HashSet<&String> = self.sessions.iter().map(|s| &s.tmux_name).collect();
-        self.last_messages.retain(|k, _| live_keys.contains(k));
-        self.session_stats.retain(|k, _| live_keys.contains(k));
-        self.conversations.retain(|k, _| live_keys.contains(k));
+        if let Some(target) = self.pending_delete.as_ref() {
+            if !live_keys.contains(&target.tmux_name) {
+                self.pending_delete = None;
+                if self.mode == Mode::ConfirmDelete {
+                    self.mode = Mode::Browse;
+                    self.set_status("Delete target no longer exists".to_string());
+                }
+            }
+        }
+
+        if self.mode == Mode::Compose {
+            if let Some(target_tmux) = self.compose_target_tmux.as_deref() {
+                if live_keys.contains(target_tmux) {
+                    self.compose_target_missing = false;
+                } else if !self.compose_target_missing {
+                    let name = self.compose_target_name.as_deref().unwrap_or(target_tmux);
+                    self.set_status(format!(
+                        "Compose target '{name}' is no longer available; draft preserved"
+                    ));
+                    self.compose_target_missing = true;
+                }
+            }
+        } else {
+            self.compose_target_missing = false;
+        }
+
         self.preview_cache.retain(|k, _| live_keys.contains(k));
         if self
             .requested_preview
             .as_ref()
-            .is_some_and(|tmux_name| !live_keys.iter().any(|live| *live == tmux_name))
+            .is_some_and(|tmux_name| !live_keys.contains(tmux_name))
         {
             self.requested_preview = None;
         }
@@ -203,13 +290,19 @@ impl UiApp {
 
     /// Update preview from cached data for the currently selected session.
     pub fn refresh_preview_from_cache(&mut self) {
-        if let Some(session) = self.sessions.get(self.selected) {
-            if let Some(update) = self.preview_cache.get(&session.tmux_name).cloned() {
+        if let Some(tmux_name) = self.active_preview_tmux() {
+            if let Some(update) = self.preview_cache.get(&tmux_name).cloned() {
                 self.apply_preview_update(&update);
             } else {
-                let tmux_name = session.tmux_name.clone();
                 self.clear_preview();
-                self.request_preview(&tmux_name, false);
+                if self
+                    .snapshot
+                    .sessions
+                    .iter()
+                    .any(|session| session.tmux_name == tmux_name)
+                {
+                    self.request_preview(&tmux_name, false);
+                }
             }
         } else {
             self.clear_preview();
@@ -238,6 +331,43 @@ impl UiApp {
         self.preview.line_count = 0;
     }
 
+    fn active_preview_tmux(&self) -> Option<String> {
+        match self.mode {
+            Mode::Compose => self.compose_target_tmux.clone(),
+            Mode::Browse | Mode::NewSessionAgent | Mode::ConfirmDelete => self
+                .snapshot
+                .sessions
+                .get(self.selected)
+                .map(|s| s.tmux_name.clone()),
+        }
+    }
+
+    pub fn active_preview_name(&self) -> Option<&str> {
+        if self.mode == Mode::Compose {
+            if let Some(tmux_name) = self.compose_target_tmux.as_deref() {
+                return self
+                    .snapshot
+                    .sessions
+                    .iter()
+                    .find(|session| session.tmux_name == tmux_name)
+                    .map(|session| session.name.as_str())
+                    .or(self.compose_target_name.as_deref());
+            }
+            return self.compose_target_name.as_deref();
+        }
+
+        self.snapshot
+            .sessions
+            .get(self.selected)
+            .map(|session| session.name.as_str())
+    }
+
+    pub fn confirm_delete_target_name(&self) -> Option<&str> {
+        self.pending_delete
+            .as_ref()
+            .map(|target| target.name.as_str())
+    }
+
     fn request_preview(&mut self, tmux_name: &str, wants_scrollback: bool) {
         if !wants_scrollback && self.requested_preview.as_deref() == Some(tmux_name) {
             return;
@@ -263,7 +393,7 @@ impl UiApp {
                 });
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                self.status_message = Some("Backend disconnected".to_string());
+                self.set_status("Backend disconnected".to_string());
                 self.should_quit = true;
             }
         }
@@ -276,6 +406,13 @@ impl UiApp {
             Mode::Compose => self.handle_compose_key(key),
             Mode::NewSessionAgent => self.handle_agent_select_key(key.code),
             Mode::ConfirmDelete => self.handle_confirm_delete_key(key.code),
+        }
+    }
+
+    /// Handle a bracketed paste event. Only active in Compose mode.
+    pub fn handle_paste(&mut self, text: String) {
+        if self.mode == Mode::Compose {
+            self.compose.insert_text(&text);
         }
     }
 
@@ -295,11 +432,17 @@ impl UiApp {
                 self.mouse_captured = !self.mouse_captured;
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(session) = self.sessions.get(self.selected) {
+                if let Some(session) = self.snapshot.sessions.get(self.selected) {
                     let tmux_name = session.tmux_name.clone();
                     self.queue_command(BackendCommand::SendInterrupt { tmux_name });
+                } else {
+                    self.set_status("No sessions".to_string());
                 }
             }
+            KeyCode::PageUp => self.preview.scroll_page_up(),
+            KeyCode::PageDown => self.preview.scroll_page_down(),
+            KeyCode::Home => self.preview.scroll_to_top(),
+            KeyCode::End => self.preview.scroll_to_bottom(),
             _ => {}
         }
     }
@@ -311,35 +454,58 @@ impl UiApp {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.exit_compose();
             }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.compose.insert_newline();
+            }
             KeyCode::Enter => self.send_compose_message(),
             KeyCode::Backspace => self.compose.backspace(),
+            KeyCode::Delete => self.compose.delete_forward(),
             KeyCode::Left => self.compose.move_left(),
             KeyCode::Right => self.compose.move_right(),
+            KeyCode::Up => self.compose.move_up(),
+            KeyCode::Down => self.compose.move_down(),
+            KeyCode::Home => self.compose.move_home(),
+            KeyCode::End => self.compose.move_end(),
+            KeyCode::PageUp => self.preview.scroll_page_up(),
+            KeyCode::PageDown => self.preview.scroll_page_down(),
             KeyCode::Char(ch) => self.compose.insert_char(ch),
             _ => {}
         }
     }
 
     fn send_compose_message(&mut self) {
-        if let Some(session) = self.sessions.get(self.selected) {
-            let text = self.compose.text();
-            let tmux_name = session.tmux_name.clone();
-            let is_codex = session.agent_type == AgentType::Codex;
+        let Some(target_tmux) = self.compose_target_tmux.as_deref() else {
+            self.set_status("Compose target is unavailable; draft preserved".to_string());
+            return;
+        };
+        let Some(session) = self
+            .snapshot
+            .sessions
+            .iter()
+            .find(|session| session.tmux_name == target_tmux)
+        else {
+            self.set_status("Compose target is no longer available; draft preserved".to_string());
+            self.compose_target_missing = true;
+            return;
+        };
 
-            if text.trim().is_empty() {
-                // Codex startup and resume flows can require a bare Enter key.
-                if is_codex {
-                    self.queue_command(BackendCommand::SendKeys {
-                        tmux_name,
-                        key: "Enter".to_string(),
-                    });
-                }
-                self.exit_compose();
-                return;
+        let text = self.compose.text();
+        let tmux_name = session.tmux_name.clone();
+        let is_codex = session.agent_type == AgentType::Codex;
+
+        if text.trim().is_empty() {
+            // Codex startup and resume flows can require a bare Enter key.
+            if is_codex {
+                self.queue_command(BackendCommand::SendKeys {
+                    tmux_name,
+                    key: "Enter".to_string(),
+                });
             }
-
-            self.queue_command(BackendCommand::SendCompose { tmux_name, text });
+            self.exit_compose();
+            return;
         }
+
+        self.queue_command(BackendCommand::SendCompose { tmux_name, text });
         self.exit_compose();
     }
 
@@ -364,27 +530,35 @@ impl UiApp {
     fn handle_confirm_delete_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('y') => {
-                if let Some(session) = self.sessions.get(self.selected) {
-                    let tmux_name = session.tmux_name.clone();
-                    let name = session.name.clone();
-                    self.queue_command(BackendCommand::DeleteSession { tmux_name, name });
+                if let Some(target) = self.pending_delete.take() {
+                    self.queue_command(BackendCommand::DeleteSession {
+                        tmux_name: target.tmux_name,
+                        name: target.name,
+                    });
+                } else {
+                    self.set_status("Delete target no longer exists".to_string());
                 }
                 self.mode = Mode::Browse;
-                if self.selected > 0 && self.selected >= self.sessions.len().saturating_sub(1) {
-                    self.selected = self.sessions.len().saturating_sub(2);
+                if self.selected > 0
+                    && self.selected >= self.snapshot.sessions.len().saturating_sub(1)
+                {
+                    self.selected = self.snapshot.sessions.len().saturating_sub(2);
                 }
             }
-            KeyCode::Esc | KeyCode::Char('n') => self.cancel_mode(),
+            KeyCode::Esc | KeyCode::Char('n') => {
+                self.pending_delete = None;
+                self.cancel_mode();
+            }
             _ => {}
         }
     }
 
     pub fn select_next(&mut self) {
-        if !self.sessions.is_empty() {
-            self.selected = (self.selected + 1) % self.sessions.len();
+        if !self.snapshot.sessions.is_empty() {
+            self.selected = (self.selected + 1) % self.snapshot.sessions.len();
             self.preview.reset_on_selection_change();
             self.refresh_preview_from_cache();
-            if let Some(session) = self.sessions.get(self.selected) {
+            if let Some(session) = self.snapshot.sessions.get(self.selected) {
                 let tmux_name = session.tmux_name.clone();
                 self.request_preview(&tmux_name, false);
             }
@@ -392,15 +566,15 @@ impl UiApp {
     }
 
     pub fn select_prev(&mut self) {
-        if !self.sessions.is_empty() {
+        if !self.snapshot.sessions.is_empty() {
             self.selected = if self.selected == 0 {
-                self.sessions.len() - 1
+                self.snapshot.sessions.len() - 1
             } else {
                 self.selected - 1
             };
             self.preview.reset_on_selection_change();
             self.refresh_preview_from_cache();
-            if let Some(session) = self.sessions.get(self.selected) {
+            if let Some(session) = self.snapshot.sessions.get(self.selected) {
                 let tmux_name = session.tmux_name.clone();
                 self.request_preview(&tmux_name, false);
             }
@@ -408,8 +582,15 @@ impl UiApp {
     }
 
     pub fn enter_compose(&mut self) {
-        if !self.sessions.is_empty() {
+        if self.snapshot.sessions.is_empty() {
+            self.set_status("No sessions. Press 'n' to create one.".to_string());
+            return;
+        }
+        if let Some(session) = self.snapshot.sessions.get(self.selected) {
             self.compose.reset();
+            self.compose_target_tmux = Some(session.tmux_name.clone());
+            self.compose_target_name = Some(session.name.clone());
+            self.compose_target_missing = false;
             self.mode = Mode::Compose;
         }
     }
@@ -417,22 +598,36 @@ impl UiApp {
     pub fn exit_compose(&mut self) {
         self.mode = Mode::Browse;
         self.compose.reset();
+        self.compose_target_tmux = None;
+        self.compose_target_name = None;
+        self.compose_target_missing = false;
     }
 
     pub fn start_new_session(&mut self) {
         self.mode = Mode::NewSessionAgent;
         self.agent_selection = 0;
-        self.status_message = None;
+        self.clear_status();
     }
 
     pub fn request_delete(&mut self) {
-        if !self.sessions.is_empty() {
+        if self.snapshot.sessions.is_empty() {
+            self.set_status("No sessions to delete".to_string());
+            return;
+        }
+        if let Some(session) = self.snapshot.sessions.get(self.selected) {
             self.mode = Mode::ConfirmDelete;
-            self.status_message = None;
+            self.pending_delete = Some(PendingDelete {
+                tmux_name: session.tmux_name.clone(),
+                name: session.name.clone(),
+            });
+            self.clear_status();
         }
     }
 
     pub fn cancel_mode(&mut self) {
+        if self.mode == Mode::ConfirmDelete {
+            self.pending_delete = None;
+        }
         self.mode = Mode::Browse;
     }
 
@@ -481,7 +676,7 @@ impl UiApp {
                         let mut cumulative = 0usize;
                         let mut target_idx = None;
                         let mut current_group: Option<u8> = None;
-                        for (i, session) in self.sessions.iter().enumerate() {
+                        for (i, session) in self.snapshot.sessions.iter().enumerate() {
                             let group = session.status.sort_order();
                             if current_group != Some(group) {
                                 current_group = Some(group);
@@ -490,12 +685,12 @@ impl UiApp {
                                 }
                                 cumulative += 1;
                             }
-                            let item_height = if self.last_messages.contains_key(&session.tmux_name)
-                            {
-                                2
-                            } else {
-                                1
-                            };
+                            let item_height =
+                                if self.snapshot.last_messages.contains_key(&session.tmux_name) {
+                                    2
+                                } else {
+                                    1
+                                };
                             if row_offset < cumulative + item_height {
                                 target_idx = Some(i);
                                 break;
@@ -507,7 +702,7 @@ impl UiApp {
                                 self.selected = idx;
                                 self.preview.reset_on_selection_change();
                                 self.refresh_preview_from_cache();
-                                if let Some(session) = self.sessions.get(self.selected) {
+                                if let Some(session) = self.snapshot.sessions.get(self.selected) {
                                     let tmux_name = session.tmux_name.clone();
                                     self.request_preview(&tmux_name, false);
                                 }
@@ -547,19 +742,26 @@ impl UiApp {
                 MouseEventKind::Down(MouseButton::Left) => {
                     if inner(preview).contains(pos) {
                         self.preview.scroll_offset = 0;
-                    } else {
-                        self.exit_compose();
                     }
                 }
-                MouseEventKind::Down(_) => {
-                    if !inner(preview).contains(pos) {
-                        self.exit_compose();
-                    }
-                }
+                MouseEventKind::Down(_) => {}
                 _ => {}
             },
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+impl UiApp {
+    /// Test helper: get mutable access to the inner StateSnapshot.
+    /// Only works when there's a single owner (always true in tests).
+    pub fn snapshot_mut(&mut self) -> &mut StateSnapshot {
+        Arc::make_mut(&mut self.snapshot)
+    }
+
+    pub fn apply_full_snapshot(&mut self, snapshot: &StateSnapshot) {
+        self.apply_snapshot(Arc::new(snapshot.clone()));
     }
 }
 
@@ -576,9 +778,13 @@ mod tests {
     }
 
     fn make_session(agent_type: AgentType) -> Session {
+        make_named_session("alpha", "hydra-test-alpha", agent_type)
+    }
+
+    fn make_named_session(name: &str, tmux_name: &str, agent_type: AgentType) -> Session {
         Session {
-            name: "alpha".to_string(),
-            tmux_name: "hydra-test-alpha".to_string(),
+            name: name.to_string(),
+            tmux_name: tmux_name.to_string(),
             agent_type,
             status: crate::session::SessionStatus::Idle,
             task_elapsed: None,
@@ -589,7 +795,7 @@ mod tests {
     #[test]
     fn compose_enter_empty_codex_sends_enter_key() {
         let (mut app, mut cmd_rx) = make_app();
-        app.sessions = vec![make_session(AgentType::Codex)];
+        app.snapshot_mut().sessions = vec![make_session(AgentType::Codex)];
         app.enter_compose();
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -607,7 +813,7 @@ mod tests {
     #[test]
     fn compose_enter_with_text_sends_compose_command() {
         let (mut app, mut cmd_rx) = make_app();
-        app.sessions = vec![make_session(AgentType::Codex)];
+        app.snapshot_mut().sessions = vec![make_session(AgentType::Codex)];
         app.enter_compose();
 
         app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
@@ -627,7 +833,7 @@ mod tests {
     #[test]
     fn preview_cache_miss_clears_preview_and_requests_update() {
         let (mut app, mut cmd_rx) = make_app();
-        app.sessions = vec![make_session(AgentType::Claude)];
+        app.snapshot_mut().sessions = vec![make_session(AgentType::Claude)];
         app.preview.set_text("stale preview".to_string());
 
         app.refresh_preview_from_cache();
@@ -675,5 +881,285 @@ mod tests {
         state_tx.send(Arc::new(StateSnapshot::default())).unwrap();
         app.poll_state();
         assert!(!app.preview_cache.contains_key(&session.tmux_name));
+    }
+
+    #[test]
+    fn selection_tracks_same_session_when_order_changes() {
+        let (mut app, _cmd_rx) = make_app();
+        let alpha = make_named_session("alpha", "hydra-test-alpha", AgentType::Codex);
+        let bravo = make_named_session("bravo", "hydra-test-bravo", AgentType::Claude);
+
+        app.snapshot_mut().sessions = vec![alpha.clone(), bravo.clone()];
+        app.selected = 1;
+
+        app.apply_full_snapshot(&StateSnapshot {
+            sessions: vec![bravo.clone(), alpha.clone()],
+            ..StateSnapshot::default()
+        });
+
+        assert_eq!(app.selected, 0);
+        assert_eq!(
+            app.snapshot.sessions[app.selected].tmux_name,
+            "hydra-test-bravo"
+        );
+    }
+
+    #[test]
+    fn compose_target_stays_bound_when_order_changes() {
+        let (mut app, mut cmd_rx) = make_app();
+        let alpha = make_named_session("alpha", "hydra-test-alpha", AgentType::Codex);
+        let bravo = make_named_session("bravo", "hydra-test-bravo", AgentType::Claude);
+
+        app.snapshot_mut().sessions = vec![alpha.clone(), bravo.clone()];
+        app.selected = 1;
+        app.enter_compose();
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+
+        app.apply_full_snapshot(&StateSnapshot {
+            sessions: vec![bravo.clone(), alpha.clone()],
+            ..StateSnapshot::default()
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        match cmd_rx.try_recv() {
+            Ok(BackendCommand::SendCompose { tmux_name, text }) => {
+                assert_eq!(tmux_name, "hydra-test-bravo");
+                assert_eq!(text, "hi");
+            }
+            other => panic!("expected SendCompose, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirm_delete_target_stays_bound_when_order_changes() {
+        let (mut app, mut cmd_rx) = make_app();
+        let alpha = make_named_session("alpha", "hydra-test-alpha", AgentType::Codex);
+        let bravo = make_named_session("bravo", "hydra-test-bravo", AgentType::Claude);
+
+        app.snapshot_mut().sessions = vec![alpha.clone(), bravo.clone()];
+        app.selected = 1;
+        app.request_delete();
+        assert_eq!(app.confirm_delete_target_name(), Some("bravo"));
+
+        app.apply_full_snapshot(&StateSnapshot {
+            sessions: vec![bravo.clone(), alpha.clone()],
+            ..StateSnapshot::default()
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        match cmd_rx.try_recv() {
+            Ok(BackendCommand::DeleteSession { tmux_name, name }) => {
+                assert_eq!(tmux_name, "hydra-test-bravo");
+                assert_eq!(name, "bravo");
+            }
+            other => panic!("expected DeleteSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compose_shift_enter_inserts_newline() {
+        let (mut app, _cmd_rx) = make_app();
+        app.snapshot_mut().sessions = vec![make_session(AgentType::Codex)];
+        app.enter_compose();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+
+        assert_eq!(app.compose.text(), "a\nb");
+        assert_eq!(app.mode, Mode::Compose);
+    }
+
+    #[test]
+    fn compose_send_preserves_draft_when_target_disappears() {
+        let (mut app, mut cmd_rx) = make_app();
+        app.snapshot_mut().sessions = vec![make_session(AgentType::Codex)];
+        app.enter_compose();
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+
+        app.apply_full_snapshot(&StateSnapshot::default());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.mode, Mode::Compose);
+        assert_eq!(app.compose.text(), "hi");
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(app
+            .status_message
+            .as_deref()
+            .is_some_and(|msg| msg.contains("draft preserved")));
+    }
+
+    // ── Feature 1: Keyboard preview scrolling ────────────────────────
+
+    #[test]
+    fn browse_page_up_down_scrolls_preview() {
+        let (mut app, _cmd_rx) = make_app();
+        app.snapshot_mut().sessions = vec![make_session(AgentType::Claude)];
+
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.preview.scroll_offset, 15);
+
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.preview.scroll_offset, 0);
+    }
+
+    #[test]
+    fn browse_home_end_scrolls_preview() {
+        let (mut app, _cmd_rx) = make_app();
+        app.snapshot_mut().sessions = vec![make_session(AgentType::Claude)];
+
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.preview.scroll_offset, u16::MAX);
+
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.preview.scroll_offset, 0);
+    }
+
+    #[test]
+    fn compose_page_up_down_scrolls_preview() {
+        let (mut app, _cmd_rx) = make_app();
+        app.snapshot_mut().sessions = vec![make_session(AgentType::Claude)];
+        app.enter_compose();
+
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.preview.scroll_offset, 15);
+
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.preview.scroll_offset, 0);
+    }
+
+    // ── Feature 2: Bracketed paste ───────────────────────────────────
+
+    #[test]
+    fn paste_in_compose_inserts_text() {
+        let (mut app, _cmd_rx) = make_app();
+        app.snapshot_mut().sessions = vec![make_session(AgentType::Claude)];
+        app.enter_compose();
+
+        app.handle_paste("hello\nworld".to_string());
+        assert_eq!(app.compose.text(), "hello\nworld");
+        assert_eq!(app.compose.cursor_row, 1);
+        assert_eq!(app.compose.cursor_col, 5);
+    }
+
+    #[test]
+    fn paste_in_browse_mode_ignored() {
+        let (mut app, _cmd_rx) = make_app();
+        app.handle_paste("should be ignored".to_string());
+        assert_eq!(app.mode, Mode::Browse);
+    }
+
+    // ── Feature 4: Compose editing ───────────────────────────────────
+
+    #[test]
+    fn compose_delete_key() {
+        let (mut app, _cmd_rx) = make_app();
+        app.snapshot_mut().sessions = vec![make_session(AgentType::Claude)];
+        app.enter_compose();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(app.compose.text(), "a");
+    }
+
+    #[test]
+    fn compose_home_end_keys() {
+        let (mut app, _cmd_rx) = make_app();
+        app.snapshot_mut().sessions = vec![make_session(AgentType::Claude)];
+        app.enter_compose();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.compose.cursor_col, 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.compose.cursor_col, 2);
+    }
+
+    // ── Feature 5: Empty session feedback ────────────────────────────
+
+    #[test]
+    fn enter_compose_empty_sessions_shows_status() {
+        let (mut app, _cmd_rx) = make_app();
+        // No sessions
+
+        app.enter_compose();
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app
+            .status_message
+            .as_deref()
+            .is_some_and(|msg| msg.contains("No sessions")));
+    }
+
+    #[test]
+    fn request_delete_empty_sessions_shows_status() {
+        let (mut app, _cmd_rx) = make_app();
+        // No sessions
+
+        app.request_delete();
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app
+            .status_message
+            .as_deref()
+            .is_some_and(|msg| msg.contains("No sessions")));
+    }
+
+    #[test]
+    fn ctrl_c_empty_sessions_shows_status() {
+        let (mut app, _cmd_rx) = make_app();
+        // No sessions
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app
+            .status_message
+            .as_deref()
+            .is_some_and(|msg| msg.contains("No sessions")));
+    }
+
+    // ── Feature 3: Status auto-clear ─────────────────────────────────
+
+    #[test]
+    fn set_status_records_timestamp() {
+        let (mut app, _cmd_rx) = make_app();
+        assert!(app.status_message_set_at.is_none());
+
+        app.set_status("test".to_string());
+        assert!(app.status_message.is_some());
+        assert!(app.status_message_set_at.is_some());
+    }
+
+    #[test]
+    fn clear_status_clears_both() {
+        let (mut app, _cmd_rx) = make_app();
+        app.set_status("test".to_string());
+
+        app.clear_status();
+        assert!(app.status_message.is_none());
+        assert!(app.status_message_set_at.is_none());
+    }
+
+    #[test]
+    fn apply_snapshot_only_accepts_new_backend_status() {
+        let (mut app, _cmd_rx) = make_app();
+        app.set_status("local message".to_string());
+
+        // Backend snapshot with None status should NOT clear local message
+        app.apply_full_snapshot(&StateSnapshot::default());
+        assert_eq!(app.status_message.as_deref(), Some("local message"));
+
+        // Backend snapshot with new status should override
+        app.apply_full_snapshot(&StateSnapshot {
+            status_message: Some("backend msg".to_string()),
+            ..StateSnapshot::default()
+        });
+        assert_eq!(app.status_message.as_deref(), Some("backend msg"));
     }
 }

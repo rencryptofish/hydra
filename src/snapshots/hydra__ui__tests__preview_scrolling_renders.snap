@@ -25,4 +25,4 @@ expression: output
 │              ││line 38                                                       │
 │              ││line 39                                                       │
 └──────────────┘└──────────────────────────────────────────────────────────────┘
- j/k: navigate  Enter: attach  n: new  d: delete  c: copy  q: quit
+ j/k: nav  PgUp/Dn: scroll  Enter: compose  n: new  d: del  c: copy  q: quit

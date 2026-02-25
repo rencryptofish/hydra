@@ -2,7 +2,7 @@
 source: src/ui.rs
 expression: output
 ---
-┌ Sessions (1) ┐┏ active-session ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┌ Sessions (1) ┐┏ Preview ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
 │── ●  Idle    │┃$ claude                                                      ┃
 │>> ● active-se│┃Hello, how can I help?                                        ┃
 │              │┃                                                              ┃
@@ -23,6 +23,6 @@ expression: output
 │              │┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 │              │╔ Compose ═════════════════════════════════════════════════════╗
 │              │║                                                              ║
-│              │║Enter: send | Esc: cancel                                     ║
+│              │║Enter: send | Shift+Enter: newline | Esc: cancel              ║
 └──────────────┘╚══════════════════════════════════════════════════════════════╝
- Enter: send  Esc: cancel
+ Enter: send  Shift+Enter: newline  Esc: cancel

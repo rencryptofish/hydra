@@ -48,7 +48,8 @@ fn make_app_with_n_sessions(n: usize) -> UiApp {
     let (_state_tx, state_rx) = tokio::sync::watch::channel(Arc::new(StateSnapshot::default()));
     let (_preview_tx, preview_rx) = tokio::sync::mpsc::channel(1);
     let mut app = UiApp::new(state_rx, preview_rx, cmd_tx);
-    app.sessions = sessions;
+    let snap = Arc::make_mut(&mut app.snapshot);
+    snap.sessions = sessions;
 
     // Add last messages for each session
     #[allow(clippy::needless_range_loop)]
@@ -58,7 +59,7 @@ fn make_app_with_n_sessions(n: usize) -> UiApp {
         } else {
             format!("agent-{}", i + 1)
         };
-        app.last_messages
+        snap.last_messages
             .insert(name, "Working on implementing the feature...".to_string());
     }
 
@@ -179,7 +180,7 @@ fn bench_draw_large_terminal(c: &mut Criterion) {
         group.bench_function(format!("{w}x{h}"), |b| {
             let mut app = make_app_with_n_sessions(10);
             app.preview.set_text(generate_preview_lines(200));
-            app.diff_files = make_diff_files(20);
+            Arc::make_mut(&mut app.snapshot).diff_files = make_diff_files(20);
             let backend = TestBackend::new(w, h);
             let mut terminal = Terminal::new(backend).unwrap();
 
@@ -201,8 +202,9 @@ fn bench_draw_stats(c: &mut Criterion) {
 
     group.bench_function("with_stats", |b| {
         let mut app = make_app_with_n_sessions(5);
-        app.global_stats = GlobalStats::default();
-        app.diff_files = make_diff_files(10);
+        let snap = Arc::make_mut(&mut app.snapshot);
+        snap.global_stats = GlobalStats::default();
+        snap.diff_files = make_diff_files(10);
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let area = Rect::new(0, 20, 20, 3);

@@ -47,7 +47,7 @@ fn make_app_with_n_sessions(n: usize) -> UiApp {
     let (_state_tx, state_rx) = tokio::sync::watch::channel(Arc::new(StateSnapshot::default()));
     let (_preview_tx, preview_rx) = tokio::sync::mpsc::channel(1);
     let mut app = UiApp::new(state_rx, preview_rx, cmd_tx);
-    app.sessions = sessions;
+    Arc::make_mut(&mut app.snapshot).sessions = sessions;
     app
 }
 
