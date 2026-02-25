@@ -428,7 +428,11 @@ impl GlobalStats {
 
     pub fn codex_display_tokens(&self) -> u64 {
         if self.has_provider_breakdown() {
-            self.codex_tokens_in + self.codex_tokens_out
+            // codex_tokens_in includes cached; subtract them out.
+            let uncached_in = self
+                .codex_tokens_in
+                .saturating_sub(self.codex_tokens_cache_read);
+            uncached_in + self.codex_tokens_out
         } else {
             0
         }
@@ -436,7 +440,11 @@ impl GlobalStats {
 
     pub fn gemini_display_tokens(&self) -> u64 {
         if self.has_provider_breakdown() {
-            self.gemini_tokens_in + self.gemini_tokens_out
+            // gemini_tokens_in includes cached; subtract them out.
+            let uncached_in = self
+                .gemini_tokens_in
+                .saturating_sub(self.gemini_tokens_cached);
+            uncached_in + self.gemini_tokens_out
         } else {
             0
         }
@@ -461,7 +469,11 @@ impl GlobalStats {
             return 0.0;
         }
 
-        let codex_input = self.codex_tokens_in as f64 * CODEX_INPUT_USD_PER_MTOK / 1_000_000.0;
+        // codex_tokens_in includes cached; subtract them out.
+        let uncached_input = self
+            .codex_tokens_in
+            .saturating_sub(self.codex_tokens_cache_read);
+        let codex_input = uncached_input as f64 * CODEX_INPUT_USD_PER_MTOK / 1_000_000.0;
         let codex_output = self.codex_tokens_out as f64 * CODEX_OUTPUT_USD_PER_MTOK / 1_000_000.0;
 
         codex_input + codex_output
@@ -472,7 +484,11 @@ impl GlobalStats {
             return 0.0;
         }
 
-        let gemini_input = self.gemini_tokens_in as f64 * GEMINI_INPUT_USD_PER_MTOK / 1_000_000.0;
+        // gemini_tokens_in includes cached; subtract them out.
+        let uncached_input = self
+            .gemini_tokens_in
+            .saturating_sub(self.gemini_tokens_cached);
+        let gemini_input = uncached_input as f64 * GEMINI_INPUT_USD_PER_MTOK / 1_000_000.0;
         let gemini_output =
             self.gemini_tokens_out as f64 * GEMINI_OUTPUT_USD_PER_MTOK / 1_000_000.0;
 
@@ -3546,46 +3562,45 @@ mod tests {
     #[test]
     fn global_stats_cost_calculation_with_codex_breakdown() {
         let stats = GlobalStats {
-            codex_tokens_in: 1_000_000,
+            codex_tokens_in: 1_000_000,  // includes 200k cached
             codex_tokens_out: 100_000,
             codex_tokens_cache_read: 200_000,
             ..Default::default()
         };
         let cost = stats.cost_usd();
-        // Cached tokens are free — input ($1.25) + output ($1.00)
+        // Uncached input (800k * $1.25/M = $1.00) + output (100k * $10/M = $1.00)
         assert!(
-            (cost - 2.25).abs() < 0.01,
-            "expected ~$2.25, got ${cost:.2}"
+            (cost - 2.00).abs() < 0.01,
+            "expected ~$2.00, got ${cost:.2}"
         );
     }
 
     #[test]
     fn global_stats_codex_cost_ignores_cache_tokens() {
         let stats = GlobalStats {
-            codex_tokens_in: 100,
+            codex_tokens_in: 100,   // all cached
             codex_tokens_out: 0,
             codex_tokens_cache_read: 200,
             ..Default::default()
         };
         let cost = stats.cost_usd();
-        // Cached tokens are free — only input (100 * $1.25/M)
-        let expected = 100.0 * CODEX_INPUT_USD_PER_MTOK / 1_000_000.0;
-        assert!((cost - expected).abs() < f64::EPSILON);
+        // Uncached input saturates at 0, output is 0 — cost is $0
+        assert!((cost - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn global_stats_cost_calculation_with_gemini_breakdown() {
         let stats = GlobalStats {
-            gemini_tokens_in: 1_000_000,
+            gemini_tokens_in: 1_000_000,  // includes 200k cached
             gemini_tokens_out: 100_000,
             gemini_tokens_cached: 200_000,
             ..Default::default()
         };
         let cost = stats.cost_usd();
-        // Cached tokens are free — input ($1.25) + output ($1.00)
+        // Uncached input (800k * $1.25/M = $1.00) + output (100k * $10/M = $1.00)
         assert!(
-            (cost - 2.25).abs() < 0.01,
-            "expected ~$2.25, got ${cost:.2}"
+            (cost - 2.00).abs() < 0.01,
+            "expected ~$2.00, got ${cost:.2}"
         );
         assert!((stats.gemini_cost_usd() - cost).abs() < f64::EPSILON);
     }
@@ -3593,15 +3608,14 @@ mod tests {
     #[test]
     fn global_stats_gemini_cost_ignores_cache_tokens() {
         let stats = GlobalStats {
-            gemini_tokens_in: 100,
+            gemini_tokens_in: 100,   // all cached
             gemini_tokens_out: 0,
             gemini_tokens_cached: 200,
             ..Default::default()
         };
-        // Cached tokens are free — only input (100 * $1.25/M)
-        let expected = 100.0 * GEMINI_INPUT_USD_PER_MTOK / 1_000_000.0;
-        assert!((stats.gemini_cost_usd() - expected).abs() < f64::EPSILON);
-        assert!((stats.cost_usd() - expected).abs() < f64::EPSILON);
+        // Uncached input saturates at 0, output is 0 — cost is $0
+        assert!((stats.gemini_cost_usd() - 0.0).abs() < f64::EPSILON);
+        assert!((stats.cost_usd() - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -3643,8 +3657,10 @@ mod tests {
 
         assert!(stats.has_usage());
         assert_eq!(stats.claude_display_tokens(), 1_100);
-        assert_eq!(stats.codex_display_tokens(), 2_200);
-        assert_eq!(stats.gemini_display_tokens(), 3_300);
+        // codex_tokens_in (2000) includes cached (400) → display = 1600 + 200
+        assert_eq!(stats.codex_display_tokens(), 1_800);
+        // gemini_tokens_in (3000) includes cached (600) → display = 2400 + 300
+        assert_eq!(stats.gemini_display_tokens(), 2_700);
         let combined = stats.claude_cost_usd() + stats.codex_cost_usd() + stats.gemini_cost_usd();
         assert!((stats.cost_usd() - combined).abs() < f64::EPSILON);
     }
